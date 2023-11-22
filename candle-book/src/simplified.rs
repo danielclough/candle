@@ -17,8 +17,10 @@
 #[rustfmt::skip]
 mod tests {
 
+// ANCHOR: book_training_simplified0
 use candle::{DType, Result, Tensor, D, Device};
 use candle_nn::{loss, ops, Linear, Module, VarBuilder, VarMap, Optimizer};
+// ANCHOR_END: book_training_simplified0
 
 // ANCHOR: book_training_simplified1
 const VOTE_DIM: usize = 2;
@@ -63,9 +65,10 @@ impl MultiLevelPerceptron {
 
 
 
-// ANCHOR: book_training_simplified3
 #[tokio::test]
-async fn simplified() -> anyhow::Result<()> {
+// ANCHOR: book_training_simplified3
+// Remove `async` from function (used in testing).
+async fn main() -> anyhow::Result<()> {
 
     let dev = Device::cuda_if_available(0)?;
 

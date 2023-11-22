@@ -1,6 +1,6 @@
 # Simplified
 
-## How its works
+## How it works
 
 This program implements a neural network to predict the winner of the second round of elections based on the results of the first round.
 
@@ -17,6 +17,10 @@ Basic moments:
 
 Thus, this neural network learns to find hidden relationships between the results of the first and second rounds of voting in order to make predictions for new data.
 
+
+```rust,ignore
+{{#include ../simplified.rs:book_training_simplified0}}
+```
 
 ```rust,ignore
 {{#include ../simplified.rs:book_training_simplified1}}
