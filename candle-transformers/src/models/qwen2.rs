@@ -608,6 +608,50 @@ impl Model {
         self.forward_from_embeds_with_cache_position(embeds, seqlen_offset, attn_mask, None)
     }
 
+    /// Forward pass from embeddings without applying final RMSNorm.
+    ///
+    /// This is used for split-LLM architectures (e.g., VibeVoice Realtime) where
+    /// the lower layers feed directly into upper layers without intermediate normalization.
+    /// Python equivalent: `self.language_model.norm = nn.Identity()`
+    pub fn forward_from_embeds_no_norm(
+        &mut self,
+        embeds: &Tensor,
+        seqlen_offset: usize,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_from_embeds_no_norm_with_cache_position(embeds, seqlen_offset, attn_mask, None)
+    }
+
+    /// Forward pass from embeddings without final norm, with explicit cache_position.
+    pub fn forward_from_embeds_no_norm_with_cache_position(
+        &mut self,
+        embeds: &Tensor,
+        seqlen_offset: usize,
+        attn_mask: Option<&Tensor>,
+        cache_position: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, _hidden_size) = embeds.dims3()?;
+        let key_length = seqlen_offset + seq_len;
+
+        let attention_mask: Option<Tensor> = match cache_position {
+            Some(cache_pos) => Some(self.prepare_4d_causal_attention_mask_with_cache_position(
+                attn_mask, seq_len, key_length, cache_pos, b_size,
+            )?),
+            None => match attn_mask {
+                Some(mask) => Some(self.prepare_attention_mask(mask)?),
+                None => Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?),
+            },
+        };
+
+        let mut xs = embeds.clone();
+
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?;
+        }
+        // Skip self.norm - return raw hidden states for split-LLM architectures
+        Ok(xs)
+    }
+
     /// Forward pass from embeddings with explicit cache_position tracking.
     /// See `forward_with_cache_position` for details on the cache_position parameter.
     pub fn forward_from_embeds_with_cache_position(
