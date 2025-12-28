@@ -41,6 +41,9 @@ tokenizers = { workspace = true, features = ["onig"] }
 cpal = { version = "0.15.2", optional = true }
 pdf2image = { version = "0.1.2", optional = true }
 tekken-rs = { version = "0.1.1", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1.0", optional = true }
+tempfile = { version = "3.14", optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -92,6 +95,7 @@ mimi = ["cpal", "symphonia", "rubato"]
 snac = ["cpal", "symphonia", "rubato"]
 depth_anything_v2 = ["palette", "enterpolation"]
 tekken = ["tekken-rs"]
+parakeet = ["symphonia", "rubato", "tar", "flate2"]
 buildtime-download = []
 
 [[example]]
@@ -161,3 +165,7 @@ required-features = ["symphonia"]
 [[example]]
 name = "bert_single_file_binary"
 required-features = ["buildtime-download"]
+
+[[example]]
+name = "parakeet"
+required-features = ["parakeet"]

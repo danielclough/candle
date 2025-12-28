@@ -112,12 +112,19 @@ pub fn pcm_decode<P: AsRef<std::path::Path>>(path: P) -> Result<(Vec<f32>, u32)>
 pub fn resample(pcm_in: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
     use rubato::Resampler;
 
-    let mut pcm_out =
-        Vec::with_capacity((pcm_in.len() as f64 * sr_out as f64 / sr_in as f64) as usize + 1024);
+    // Calculate expected output length
+    let expected_len = (pcm_in.len() as f64 * sr_out as f64 / sr_in as f64).round() as usize;
 
     let mut resampler = rubato::FftFixedInOut::<f32>::new(sr_in as usize, sr_out as usize, 1024, 1)
         .map_err(candle::Error::wrap)?;
+
+    // Get the resampler delay (number of output frames to skip)
+    let delay = resampler.output_delay();
+
+    // Allocate buffer with room for delay + expected output
+    let mut pcm_out = Vec::with_capacity(expected_len + delay + 1024);
     let mut output_buffer = resampler.output_buffer_allocate(true);
+
     let mut pos_in = 0;
     while pos_in + resampler.input_frames_next() < pcm_in.len() {
         let (in_len, out_len) = resampler
@@ -127,6 +134,7 @@ pub fn resample(pcm_in: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
         pcm_out.extend_from_slice(&output_buffer[0][..out_len]);
     }
 
+    // Process remaining samples
     if pos_in < pcm_in.len() {
         let (_in_len, out_len) = resampler
             .process_partial_into_buffer(Some(&[&pcm_in[pos_in..]]), &mut output_buffer, None)
@@ -134,5 +142,21 @@ pub fn resample(pcm_in: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
         pcm_out.extend_from_slice(&output_buffer[0][..out_len]);
     }
 
-    Ok(pcm_out)
+    // Flush any remaining samples from internal buffers
+    let (_in_len, out_len) = resampler
+        .process_partial_into_buffer(None::<&[&[f32]]>, &mut output_buffer, None)
+        .map_err(candle::Error::wrap)?;
+    pcm_out.extend_from_slice(&output_buffer[0][..out_len]);
+
+    // Skip the first `delay` frames and take exactly `expected_len` frames
+    // This compensates for the resampler's internal latency
+    if pcm_out.len() >= delay + expected_len {
+        Ok(pcm_out[delay..delay + expected_len].to_vec())
+    } else if pcm_out.len() > delay {
+        // Not enough samples, return what we have after delay
+        Ok(pcm_out[delay..].to_vec())
+    } else {
+        // Edge case: very short input
+        Ok(pcm_out)
+    }
 }

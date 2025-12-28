@@ -75,6 +75,7 @@ pub mod olmo;
 pub mod olmo2;
 pub mod openclip;
 pub mod paligemma;
+pub mod parakeet;
 pub mod parler_tts;
 pub mod persimmon;
 pub mod phi;

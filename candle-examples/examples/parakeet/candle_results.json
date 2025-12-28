@@ -1,0 +1,192 @@
+{
+  "tool": "candle",
+  "models": {
+    "tdt-v2": {
+      "transcriptions": {
+        "en-Carter_man": {
+          "expected": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processing.",
+          "transcription": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processes.",
+          "match": "PARTIAL",
+          "word_accuracy": 94
+        }
+,
+        "en-Davis_man": {
+          "expected": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "transcription": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "match": "EXACT",
+          "word_accuracy": 91
+        }
+,
+        "en-Emma_woman": {
+          "expected": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "transcription": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "match": "EXACT",
+          "word_accuracy": 90
+        }
+,
+        "en-Frank_man": {
+          "expected": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "transcription": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "match": "EXACT",
+          "word_accuracy": 92
+        }
+,
+        "en-Grace_woman": {
+          "expected": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "transcription": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "match": "EXACT",
+          "word_accuracy": 95
+        }
+,
+        "en-Mike_man": {
+          "expected": "Good morning everyone! I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "transcription": "Good morning, everyone. I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "match": "PARTIAL",
+          "word_accuracy": 90
+        }
+
+      }
+    }
+,
+    "tdt-v3": {
+      "transcriptions": {
+        "en-Carter_man": {
+          "expected": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processing.",
+          "transcription": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processes.",
+          "match": "PARTIAL",
+          "word_accuracy": 94
+        }
+,
+        "en-Davis_man": {
+          "expected": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "transcription": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "match": "EXACT",
+          "word_accuracy": 91
+        }
+,
+        "en-Emma_woman": {
+          "expected": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "transcription": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "match": "EXACT",
+          "word_accuracy": 90
+        }
+,
+        "en-Frank_man": {
+          "expected": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "transcription": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "match": "EXACT",
+          "word_accuracy": 92
+        }
+,
+        "en-Grace_woman": {
+          "expected": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "transcription": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "match": "EXACT",
+          "word_accuracy": 95
+        }
+,
+        "en-Mike_man": {
+          "expected": "Good morning everyone! I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "transcription": "Good morning everyone. I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "match": "PARTIAL",
+          "word_accuracy": 95
+        }
+
+      }
+    }
+,
+    "rnnt1b": {
+      "transcriptions": {
+        "en-Carter_man": {
+          "expected": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processing.",
+          "transcription": "welcome to the future of artificial intelligence today we're witnessing remarkable breakthroughs in machine learning and natural language processing",
+          "match": "DIFFERENT",
+          "word_accuracy": 89
+        }
+,
+        "en-Davis_man": {
+          "expected": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "transcription": "in the realm of technology innovation never sleeps every day brings new opportunities to push the boundaries of what we thought was possible",
+          "match": "DIFFERENT",
+          "word_accuracy": 78
+        }
+,
+        "en-Emma_woman": {
+          "expected": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "transcription": "nature has always been our greatest teacher the patterns we observe in the natural world inspire countless innovations in science and engineering",
+          "match": "DIFFERENT",
+          "word_accuracy": 81
+        }
+,
+        "en-Frank_man": {
+          "expected": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "transcription": "the quick brown fox jumps over the lazy dog this sentence contains every letter of the alphabet making it perfect for testing voice synthesis systems",
+          "match": "DIFFERENT",
+          "word_accuracy": 80
+        }
+,
+        "en-Grace_woman": {
+          "expected": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "transcription": "the art of communication has evolved tremendously over the centuries from handwritten letters to instant messaging we've come a long way",
+          "match": "DIFFERENT",
+          "word_accuracy": 80
+        }
+,
+        "en-Mike_man": {
+          "expected": "Good morning everyone! I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "transcription": "good morning everyone i hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis",
+          "match": "PARTIAL",
+          "word_accuracy": 90
+        }
+
+      }
+    }
+,
+    "ctc1b": {
+      "transcriptions": {
+        "en-Carter_man": {
+          "expected": "Welcome to the future of artificial intelligence. Today we're witnessing remarkable breakthroughs in machine learning and natural language processing.",
+          "transcription": "welcome to the future of artificial intelligence today we're witnessing remarkable breakthroughs in machine learning and natural language processive",
+          "match": "DIFFERENT",
+          "word_accuracy": 89
+        }
+,
+        "en-Davis_man": {
+          "expected": "In the realm of technology, innovation never sleeps. Every day brings new opportunities to push the boundaries of what we thought was possible.",
+          "transcription": "in the realm of technology innovation never sleeps every day brings new opportunities to push the boundaries of what we thought was possible",
+          "match": "DIFFERENT",
+          "word_accuracy": 78
+        }
+,
+        "en-Emma_woman": {
+          "expected": "Nature has always been our greatest teacher. The patterns we observe in the natural world inspire countless innovations in science and engineering.",
+          "transcription": "nature has always been our greatest teacher the patterns we observe in the natural world inspire countless innovations in science and engineering",
+          "match": "DIFFERENT",
+          "word_accuracy": 81
+        }
+,
+        "en-Frank_man": {
+          "expected": "The quick brown fox jumps over the lazy dog. This sentence contains every letter of the alphabet, making it perfect for testing voice synthesis systems.",
+          "transcription": "the quick brown fox jumps over the lazy dog this sentence contains every letter of the alphabet making it perfect for testing voice synthesis systems",
+          "match": "DIFFERENT",
+          "word_accuracy": 80
+        }
+,
+        "en-Grace_woman": {
+          "expected": "The art of communication has evolved tremendously over the centuries. From handwritten letters to instant messaging, we've come a long way.",
+          "transcription": "the art of communication has evolved tremendously over the centuries from handwritten letters to instant messaging we've come a long way",
+          "match": "DIFFERENT",
+          "word_accuracy": 80
+        }
+,
+        "en-Mike_man": {
+          "expected": "Good morning everyone! I hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis.",
+          "transcription": "good morning everyone i hope you're ready for an exciting presentation about the latest developments in voice technology and speech synthesis",
+          "match": "PARTIAL",
+          "word_accuracy": 90
+        }
+
+      }
+    }
+  }
+}
