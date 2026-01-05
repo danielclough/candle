@@ -261,6 +261,78 @@ impl Map1 for Im2Col {
     }
 }
 
+#[allow(unused)]
+struct Im2Col3D {
+    d_k: usize,
+    h_k: usize,
+    w_k: usize,
+    padding_d: usize,
+    padding_h: usize,
+    padding_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+    dilation_d: usize,
+    dilation_h: usize,
+    dilation_w: usize,
+}
+
+impl Im2Col3D {
+    #[allow(unused)]
+    fn dhw_out(&self, d: usize, h: usize, w: usize) -> (usize, usize, usize) {
+        let d_out =
+            (d + 2 * self.padding_d - self.dilation_d * (self.d_k - 1) - 1) / self.stride_d + 1;
+        let h_out =
+            (h + 2 * self.padding_h - self.dilation_h * (self.h_k - 1) - 1) / self.stride_h + 1;
+        let w_out =
+            (w + 2 * self.padding_w - self.dilation_w * (self.w_k - 1) - 1) / self.stride_w + 1;
+        (d_out, h_out, w_out)
+    }
+}
+
+impl Map1 for Im2Col3D {
+    fn f<T: DeviceRepr + WithDType>(
+        &self,
+        src: &CudaSlice<T>,
+        dev: &CudaDevice,
+        layout: &Layout,
+    ) -> Result<CudaSlice<T>> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let (d_out, h_out, w_out) = self.dhw_out(dims[2], dims[3], dims[4]);
+        let dst_el = dims[0] * d_out * h_out * w_out * dims[1] * self.d_k * self.h_k * self.w_k;
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let src = &src.slice(layout.start_offset()..);
+        let func = dev.get_or_load_func(&kernel_name::<T>("im2col3d"), &kernels::CONV)?;
+        // SAFETY: Set later by running the kernel.
+        let dst = unsafe { dev.alloc::<T>(dst_el)? };
+        let mut builder = func.builder();
+        barg!(builder, dst_el);
+        barg!(builder, d_out);
+        barg!(builder, h_out);
+        barg!(builder, w_out);
+        barg!(builder, self.d_k);
+        barg!(builder, self.h_k);
+        barg!(builder, self.w_k);
+        barg!(builder, self.stride_d);
+        barg!(builder, self.stride_h);
+        barg!(builder, self.stride_w);
+        barg!(builder, self.padding_d);
+        barg!(builder, self.padding_h);
+        barg!(builder, self.padding_w);
+        barg!(builder, self.dilation_d);
+        barg!(builder, self.dilation_h);
+        barg!(builder, self.dilation_w);
+        builder.arg(&ds);
+        builder.arg(src);
+        builder.arg(&dst);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(dst)
+    }
+}
+
 struct Powf(f64);
 impl Map1 for Powf {
     fn f<T: DeviceRepr + WithDType>(
@@ -873,6 +945,64 @@ impl Map2 for ConvTranspose2D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
+        builder.arg(&ds);
+        builder.arg(inp);
+        builder.arg(k);
+        builder.arg(&out);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(out)
+    }
+}
+
+struct ConvTranspose3D<'a>(&'a crate::conv::ParamsConvTranspose3D);
+impl Map2 for ConvTranspose3D<'_> {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        inp_l: &Layout,
+        k: &CudaSlice<T>,
+        k_l: &Layout,
+        dev: &CudaDevice,
+    ) -> Result<CudaSlice<T>> {
+        // Kernel shape: (c_in_k, c_out, k_d, k_h, k_w)
+        // Input shape: (b_size, c_in, d_in, h_in, w_in)
+        let p = &self.0;
+        let (out_d, out_h, out_w) = (p.out_d(), p.out_h(), p.out_w());
+        let dst_el = p.c_out * out_d * out_h * out_w * p.b_size;
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let k = &k.slice(k_l.start_offset()..);
+        let shape = inp_l.shape();
+        let dims = shape.dims();
+        let el = shape.elem_count();
+
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func = dev.get_or_load_func(&kernel_name::<T>("conv_transpose3d"), &kernels::CONV)?;
+        let ds = if dims.len() == 5 {
+            [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
+        } else {
+            crate::bail!("unexpected input shape for conv_transpose3d {dims:?}")
+        };
+        let ds = dev.clone_htod(&ds)?;
+        let mut builder = func.builder();
+        barg!(builder, el);
+        barg!(builder, out_d);
+        barg!(builder, out_w);
+        barg!(builder, out_h);
+        barg!(builder, p.stride_d);
+        barg!(builder, p.stride_h);
+        barg!(builder, p.stride_w);
+        barg!(builder, p.padding_d);
+        barg!(builder, p.padding_h);
+        barg!(builder, p.padding_w);
+        barg!(builder, p.output_padding_d);
+        barg!(builder, p.output_padding_h);
+        barg!(builder, p.output_padding_w);
+        barg!(builder, p.dilation_d);
+        barg!(builder, p.dilation_h);
+        barg!(builder, p.dilation_w);
         builder.arg(&ds);
         builder.arg(inp);
         builder.arg(k);
@@ -1984,6 +2114,65 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    fn conv3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+
+        // Use im2col + matmul approach
+        let col = Im2Col3D {
+            d_k: params.k_d,
+            h_k: params.k_h,
+            w_k: params.k_w,
+            padding_d: params.padding_d,
+            padding_h: params.padding_h,
+            padding_w: params.padding_w,
+            stride_d: params.stride_d,
+            stride_h: params.stride_h,
+            stride_w: params.stride_w,
+            dilation_d: params.dilation_d,
+            dilation_h: params.dilation_h,
+            dilation_w: params.dilation_w,
+        }
+        .map(&self.slice, &device, l)?;
+        let col = Self { slice: col, device };
+        let d_out = params.out_d();
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_d * params.k_h * params.k_w * params.c_in;
+        let m = d_out * h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+        } else {
+            // Make the kernel contiguous if not already the case.
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+        };
+        // Transpose result from [b, d_out*h_out*w_out, c_out] to [b, c_out, d_out, h_out, w_out]
+        let res_l = Layout::contiguous((b, d_out, h_out, w_out, n))
+            .transpose(1, 4)? // [b, c_out, h, w, d]
+            .transpose(2, 4)? // [b, c_out, d, w, h]
+            .transpose(3, 4)?; // [b, c_out, d, h, w]
+        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
+    }
+
     fn conv_transpose2d(
         &self,
         l: &Layout,
@@ -1994,6 +2183,19 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         let slice =
             ConvTranspose2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice, device })
+    }
+
+    fn conv_transpose3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let slice =
+            ConvTranspose3D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
         Ok(Self { slice, device })
     }
 

@@ -87,7 +87,6 @@ pub enum Op {
     IndexAdd(Tensor, Tensor, Tensor, usize),
     WhereCond(Tensor, Tensor, Tensor),
 
-    #[allow(dead_code)]
     Conv1D {
         arg: Tensor,
         kernel: Tensor,
@@ -96,7 +95,6 @@ pub enum Op {
         dilation: usize,
     },
 
-    #[allow(dead_code)]
     ConvTranspose1D {
         arg: Tensor,
         kernel: Tensor,
@@ -106,7 +104,6 @@ pub enum Op {
         dilation: usize,
     },
 
-    #[allow(dead_code)]
     Conv2D {
         arg: Tensor,
         kernel: Tensor,
@@ -115,7 +112,6 @@ pub enum Op {
         dilation: usize,
     },
 
-    #[allow(dead_code)]
     ConvTranspose2D {
         arg: Tensor,
         kernel: Tensor,
@@ -123,6 +119,38 @@ pub enum Op {
         output_padding: usize,
         stride: usize,
         dilation: usize,
+    },
+
+    Conv3D {
+        arg: Tensor,
+        kernel: Tensor,
+        padding_d: usize,
+        padding_h: usize,
+        padding_w: usize,
+        stride_d: usize,
+        stride_h: usize,
+        stride_w: usize,
+        dilation_d: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+    },
+
+    ConvTranspose3D {
+        arg: Tensor,
+        kernel: Tensor,
+        padding_d: usize,
+        padding_h: usize,
+        padding_w: usize,
+        output_padding_d: usize,
+        output_padding_h: usize,
+        output_padding_w: usize,
+        stride_d: usize,
+        stride_h: usize,
+        stride_w: usize,
+        dilation_d: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        groups: usize,
     },
 
     AvgPool2D {
@@ -155,7 +183,6 @@ pub enum Op {
 
     Cat(Vec<Tensor>, usize),
 
-    #[allow(dead_code)] // add is currently unused.
     Affine {
         arg: Tensor,
         mul: f64,

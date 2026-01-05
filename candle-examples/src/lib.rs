@@ -121,23 +121,44 @@ pub fn save_image_resize<P: AsRef<std::path::Path>>(
 }
 
 /// Loads the safetensors files for a model from the hub based on a json index file.
+///
+/// The `json_file` parameter can include a subdirectory path (e.g., "transformer/model.safetensors.index.json").
+/// Shard filenames in the index are assumed to be relative to that same directory.
 pub fn hub_load_safetensors(
     repo: &hf_hub::api::sync::ApiRepo,
     json_file: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let json_file = repo.get(json_file).map_err(candle::Error::wrap)?;
-    let json_file = std::fs::File::open(json_file)?;
+    // Extract the directory prefix from the json_file path (if any)
+    let dir_prefix = std::path::Path::new(json_file)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{}/", s));
+
+    let json_file_path = repo.get(json_file).map_err(candle::Error::wrap)?;
+    let json_file_handle = std::fs::File::open(&json_file_path)?;
     let json: serde_json::Value =
-        serde_json::from_reader(&json_file).map_err(candle::Error::wrap)?;
+        serde_json::from_reader(&json_file_handle).map_err(candle::Error::wrap)?;
     let weight_map = match json.get("weight_map") {
-        None => candle::bail!("no weight map in {json_file:?}"),
+        None => candle::bail!("no weight map in {json_file_path:?}"),
         Some(serde_json::Value::Object(map)) => map,
-        Some(_) => candle::bail!("weight map in {json_file:?} is not a map"),
+        Some(_) => candle::bail!("weight map in {json_file_path:?} is not a map"),
     };
     let mut safetensors_files = std::collections::HashSet::new();
     for value in weight_map.values() {
         if let Some(file) = value.as_str() {
-            safetensors_files.insert(file.to_string());
+            // Prepend directory prefix if the shard path is not already absolute/prefixed
+            let full_path = if let Some(ref prefix) = dir_prefix {
+                if file.contains('/') {
+                    // File already has a path component, use as-is
+                    file.to_string()
+                } else {
+                    format!("{}{}", prefix, file)
+                }
+            } else {
+                file.to_string()
+            };
+            safetensors_files.insert(full_path);
         }
     }
     let safetensors_files = safetensors_files

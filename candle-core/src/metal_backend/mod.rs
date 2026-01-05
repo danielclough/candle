@@ -1,12 +1,15 @@
 //! Implementation of Backend traits for Metal
 //!
 use crate::backend::{BackendDevice, BackendStorage};
-use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
+use crate::conv::{
+    ParamsConv1D, ParamsConv2D, ParamsConv3D, ParamsConvTranspose1D, ParamsConvTranspose2D,
+    ParamsConvTranspose3D,
+};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device},
-    BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
+    BufferOffset, CallConvTranspose2dCfg, CallConvTranspose3dCfg, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
 use std::collections::HashMap;
@@ -1152,6 +1155,108 @@ impl BackendStorage for MetalStorage {
         Ok(res_t)
     }
 
+    fn conv3d(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &ParamsConv3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let shape = layout.shape();
+        let dims = shape.dims();
+
+        let d = dims[2];
+        let h = dims[3];
+        let w = dims[4];
+        let d_out = params.out_d();
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let dst_el = dims[0]
+            * d_out
+            * h_out
+            * w_out
+            * dims[1]
+            * params.k_d
+            * params.k_h
+            * params.k_w;
+
+        let dst = self
+            .device
+            .new_buffer(dst_el, self.dtype, "conv3d_im2col")?;
+        let encoder = self.device.command_encoder()?;
+        encoder.set_label("conv3d_im2col");
+        let name = match self.dtype {
+            DType::F32 => "im2col3d_f32",
+            DType::F16 => "im2col3d_f16",
+            DType::BF16 => "im2col3d_bf16",
+            DType::U8 => "im2col3d_u8",
+            DType::U32 => "im2col3d_u32",
+            dtype => crate::bail!("Metal conv3d {dtype:?} not implemented"),
+        };
+        let src = buffer_o(&self.buffer, layout, self.dtype);
+        let im2col_params = candle_metal_kernels::Im2Col3DParams {
+            d_k: params.k_d,
+            h_k: params.k_h,
+            w_k: params.k_w,
+            stride_d: params.stride_d,
+            stride_h: params.stride_h,
+            stride_w: params.stride_w,
+            padding_d: params.padding_d,
+            padding_h: params.padding_h,
+            padding_w: params.padding_w,
+            dilation_d: params.dilation_d,
+            dilation_h: params.dilation_h,
+            dilation_w: params.dilation_w,
+        };
+        candle_metal_kernels::call_im2col3d_strided(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            name,
+            layout.shape().dims(),
+            layout.stride(),
+            &im2col_params,
+            src,
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        drop(encoder);
+        let col = Self {
+            buffer: dst,
+            device,
+            count: dst_el,
+            dtype: self.dtype,
+        };
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_d * params.k_h * params.k_w * params.c_in;
+        let m = d_out * h_out * w_out;
+        let col_l = Layout::contiguous((b, m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+                .transpose(1, 2)?
+                .broadcast_as((b, k, n))?;
+            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+        } else {
+            // Make the kernel contiguous if not already the case.
+            let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+                .transpose(1, 2)?
+                .broadcast_as((b, k, n))?;
+            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+        };
+        // Transpose result from [b, d_out*h_out*w_out, c_out] to [b, c_out, d_out, h_out, w_out]
+        let res_l = Layout::contiguous((b, d_out, h_out, w_out, n))
+            .transpose(1, 4)? // [b, c_out, h, w, d]
+            .transpose(2, 4)? // [b, c_out, d, w, h]
+            .transpose(3, 4)?; // [b, c_out, d, h, w]
+        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
+    }
+
     fn conv_transpose2d(
         &self,
         l: &Layout,
@@ -1199,6 +1304,70 @@ impl BackendStorage for MetalStorage {
                 padding: params.padding,
                 output_padding: params.output_padding,
                 c_out: params.c_out,
+                out_h,
+                out_w,
+                b_size: params.b_size,
+                input_dims: l.dims(),
+                input_stride: l.stride(),
+                kernel_dims: kernel_l.dims(),
+                kernel_stride: kernel_l.stride(),
+                input_offset: l.start_offset() * self.dtype.size_in_bytes(),
+                kernel_offset: kernel_l.start_offset() * kernel.dtype.size_in_bytes(),
+            },
+            &self.buffer,
+            &kernel.buffer,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+    }
+
+    fn conv_transpose3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        let out_d = params.out_d();
+        let out_h = params.out_h();
+        let out_w = params.out_w();
+        let dst_el = params.b_size * params.c_out * out_d * out_h * out_w;
+
+        let buffer = self
+            .device
+            .new_buffer(dst_el, self.dtype, "conv_transpose3d")?;
+
+        let encoder = self.device.command_encoder()?;
+        encoder.set_label("conv_transpose3d");
+
+        let name = match self.dtype {
+            DType::F32 => "conv_transpose3d_f32",
+            DType::F16 => "conv_transpose3d_f16",
+            DType::BF16 => "conv_transpose3d_bf16",
+            dtype => crate::bail!("Metal conv_transpose3d {dtype:?} not implemented"),
+        };
+
+        candle_metal_kernels::call_conv_transpose3d(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            name,
+            CallConvTranspose3dCfg {
+                dilation_d: params.dilation_d,
+                dilation_h: params.dilation_h,
+                dilation_w: params.dilation_w,
+                stride_d: params.stride_d,
+                stride_h: params.stride_h,
+                stride_w: params.stride_w,
+                padding_d: params.padding_d,
+                padding_h: params.padding_h,
+                padding_w: params.padding_w,
+                output_padding_d: params.output_padding_d,
+                output_padding_h: params.output_padding_h,
+                output_padding_w: params.output_padding_w,
+                c_out: params.c_out,
+                out_d,
                 out_h,
                 out_w,
                 b_size: params.b_size,

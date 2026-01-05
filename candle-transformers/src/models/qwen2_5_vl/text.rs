@@ -1235,4 +1235,198 @@ impl Qwen25VLTextModel {
             layer.clear_kv_cache();
         }
     }
+
+    /// Forward pass with vision embeddings, returning hidden states for diffusion.
+    ///
+    /// This is used by Qwen-Image Edit and Layered pipelines for encoding prompts
+    /// with both text and image understanding. The vision embeddings are inserted
+    /// at image placeholder token positions.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs with image placeholders, shape (batch, seq_len)
+    /// * `vision_embeds` - Vision embeddings from the vision encoder, shape (total_vision_tokens, hidden_size)
+    /// * `image_grid_thw` - Grid dimensions for each image, shape (num_images, 3) containing [temporal, height, width]
+    /// * `attention_mask` - Optional attention mask of shape (batch, seq_len)
+    /// * `spatial_merge_size` - Spatial merge factor from vision config (typically 2)
+    /// * `image_token_id` - Token ID for image placeholders (typically 151655)
+    ///
+    /// # Returns
+    /// Hidden states tensor of shape (batch, seq_len, hidden_size) for use as diffusion conditioning
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_vision(
+        &mut self,
+        input_ids: &Tensor,
+        vision_embeds: &Tensor,
+        image_grid_thw: &Tensor,
+        attention_mask: Option<&Tensor>,
+        spatial_merge_size: usize,
+        image_token_id: u32,
+    ) -> Result<Tensor> {
+        // Clear KV cache to ensure fresh forward pass (no stale state from previous calls)
+        self.clear_kv_cache();
+
+        let (batch_size, seq_len) = input_ids.dims2()?;
+        let hidden_dim = self.hidden_size;
+
+        // 1. Get base token embeddings
+        let mut input_embeds = self.embed_tokens(input_ids)?;
+
+        // 2. Replace image placeholder tokens with vision embeddings
+        let input_ids_flat: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        let vision_embeds = vision_embeds.to_dtype(self.dtype)?;
+        let mut vision_offset = 0usize;
+
+        for batch_idx in 0..batch_size {
+            let batch_start = batch_idx * seq_len;
+            let mut token_idx = 0usize;
+
+            while token_idx < seq_len {
+                if input_ids_flat[batch_start + token_idx] == image_token_id {
+                    // Find contiguous image tokens
+                    let start = token_idx;
+                    while token_idx < seq_len
+                        && input_ids_flat[batch_start + token_idx] == image_token_id
+                    {
+                        token_idx += 1;
+                    }
+                    let len = token_idx - start;
+
+                    // Replace with vision embeddings
+                    let vision_chunk = vision_embeds.narrow(0, vision_offset, len)?;
+                    input_embeds = input_embeds.slice_assign(
+                        &[batch_idx..batch_idx + 1, start..start + len, 0..hidden_dim],
+                        &vision_chunk.unsqueeze(0)?,
+                    )?;
+                    vision_offset += len;
+                } else {
+                    token_idx += 1;
+                }
+            }
+        }
+
+        // 3. Compute M-RoPE position IDs from image grid dimensions
+        let grid_thw_vec = image_grid_thw.to_vec2::<u32>()?;
+        let image_grids: Vec<ImageGrid> = grid_thw_vec
+            .iter()
+            .map(|g| {
+                let h = g[1] as usize;
+                let w = g[2] as usize;
+                ImageGrid {
+                    grid_h: h / spatial_merge_size,
+                    grid_w: w / spatial_merge_size,
+                }
+            })
+            .collect();
+
+        let position_ids =
+            compute_mrope_position_ids_multi(input_ids, image_token_id, &image_grids, &self.device)?;
+
+        // 4. Create causal attention mask if sequence length > 1
+        let causal_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(self.prepare_causal_attention_mask(batch_size, seq_len, 0)?)
+        };
+
+        // Combine with provided attention mask if any
+        let attention_mask = match (causal_mask, attention_mask) {
+            (Some(causal), Some(mask)) => {
+                let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
+                let mask = mask.to_dtype(causal.dtype())?;
+                let mask = ((1.0 - mask)? * f32::NEG_INFINITY as f64)?;
+                let mask = mask.broadcast_as(causal.dims())?;
+                Some((&causal + &mask)?)
+            }
+            (Some(causal), None) => Some(causal),
+            (None, Some(mask)) => {
+                let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
+                let mask = mask.to_dtype(self.dtype)?;
+                Some(((1.0 - mask)? * f32::NEG_INFINITY as f64)?)
+            }
+            (None, None) => None,
+        };
+
+        // 5. Forward through all transformer layers
+        let mut hidden_states = input_embeds;
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+        }
+
+        // 6. Apply final layer norm (but NOT lm_head - we want hidden states)
+        hidden_states.apply(&self.norm)
+    }
+
+    /// Forward pass for text-only input, returning hidden states.
+    ///
+    /// This is used by Qwen-Image for text encoding, where we need the raw hidden
+    /// states from the transformer (not logits from lm_head).
+    ///
+    /// Unlike `forward_with_mrope`, this method:
+    /// - Uses simple sequential position IDs (no vision token handling)
+    /// - Returns all hidden states, not just the last token's logits
+    /// - Skips the lm_head projection
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs of shape (batch, seq_len)
+    /// * `attention_mask` - Optional attention mask of shape (batch, seq_len)
+    ///
+    /// # Returns
+    /// Hidden states tensor of shape (batch, seq_len, hidden_size)
+    pub fn forward_text_only(
+        &mut self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        // Clear KV cache to ensure fresh forward pass (no stale state from previous calls)
+        self.clear_kv_cache();
+
+        let (b_sz, seq_len) = input_ids.dims2()?;
+
+        // Get token embeddings
+        let mut hidden_states = self.embed_tokens(input_ids)?;
+
+        // Create simple sequential position IDs: [3, batch, seq_len]
+        // For text-only, all three M-RoPE dimensions use the same sequential positions
+        let positions: Vec<i64> = (0..seq_len as i64).collect();
+        let pos_tensor = Tensor::from_vec(positions.clone(), seq_len, &self.device)?;
+        let pos_tensor = pos_tensor.unsqueeze(0)?.expand((b_sz, seq_len))?;
+        let position_ids = Tensor::stack(&[&pos_tensor, &pos_tensor, &pos_tensor], 0)?;
+
+        // Create causal attention mask if sequence length > 1
+        let causal_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(self.prepare_causal_attention_mask(b_sz, seq_len, 0)?)
+        };
+
+        // Combine with provided attention mask if any
+        let attention_mask = match (causal_mask, attention_mask) {
+            (Some(causal), Some(mask)) => {
+                // Expand mask to match causal mask shape: [batch, 1, 1, seq_len]
+                let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
+                // Convert 0/1 mask to -inf/0 additive mask
+                let mask = mask.to_dtype(causal.dtype())?;
+                let mask = ((1.0 - mask)? * f32::NEG_INFINITY as f64)?;
+                let mask = mask.broadcast_as(causal.dims())?;
+                Some((&causal + &mask)?)
+            }
+            (Some(causal), None) => Some(causal),
+            (None, Some(mask)) => {
+                let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
+                let mask = mask.to_dtype(self.dtype)?;
+                Some(((1.0 - mask)? * f32::NEG_INFINITY as f64)?)
+            }
+            (None, None) => None,
+        };
+
+        // Forward through all transformer layers
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+        }
+
+        // Return hidden states WITHOUT final layer norm
+        // This matches HuggingFace's output_hidden_states behavior where hidden_states[-1]
+        // is the raw output of the last transformer layer, not normalized
+        Ok(hidden_states)
+    }
 }

@@ -142,6 +142,93 @@ __device__ void col2im1d(
 }
 
 template <typename T>
+__device__ void im2col3d(
+    const size_t dst_numel,
+    const size_t d_out,
+    const size_t h_out,
+    const size_t w_out,
+    const size_t d_k,
+    const size_t h_k,
+    const size_t w_k,
+    const size_t stride_d,
+    const size_t stride_h,
+    const size_t stride_w,
+    const size_t padding_d,
+    const size_t padding_h,
+    const size_t padding_w,
+    const size_t dilation_d,
+    const size_t dilation_h,
+    const size_t dilation_w,
+    const size_t *info,
+    const T *src,
+    T *dst
+) {
+  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  // dst: (b_size, d_out, h_out, w_out, c_in, d_k, h_k, w_k)
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  if (dst_i >= dst_numel) {
+    return;
+  }
+  const size_t *src_dims = info;
+  const size_t *src_s = info + 5;
+  const size_t c_in = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+
+  const size_t dst_s6 = w_k;
+  const size_t dst_s5 = h_k * dst_s6;
+  const size_t dst_s4 = d_k * dst_s5;
+  const size_t dst_s3 = c_in * dst_s4;
+  const size_t dst_s2 = w_out * dst_s3;
+  const size_t dst_s1 = h_out * dst_s2;
+  const size_t dst_s0 = d_out * dst_s1;
+
+  size_t tmp_dst_i = dst_i;
+  const size_t b_idx = tmp_dst_i / dst_s0;
+  tmp_dst_i -= b_idx * dst_s0;
+  const size_t d_idx = tmp_dst_i / dst_s1;
+  tmp_dst_i -= d_idx * dst_s1;
+  const size_t h_idx = tmp_dst_i / dst_s2;
+  tmp_dst_i -= h_idx * dst_s2;
+  const size_t w_idx = tmp_dst_i / dst_s3;
+  tmp_dst_i -= w_idx * dst_s3;
+  const size_t c_idx = tmp_dst_i / dst_s4;
+  tmp_dst_i -= c_idx * dst_s4;
+  const size_t d_k_idx = tmp_dst_i / dst_s5;
+  tmp_dst_i -= d_k_idx * dst_s5;
+  const size_t h_k_idx = tmp_dst_i / dst_s6;
+  tmp_dst_i -= h_k_idx * dst_s6;
+  const size_t w_k_idx = tmp_dst_i;
+
+  size_t src_d_idx = d_idx * stride_d + d_k_idx * dilation_d;
+  size_t src_h_idx = h_idx * stride_h + h_k_idx * dilation_h;
+  size_t src_w_idx = w_idx * stride_w + w_k_idx * dilation_w;
+
+  if (src_d_idx < padding_d || src_d_idx >= d_in + padding_d) {
+    dst[dst_i] = static_cast<T>(0);
+  }
+  else if (src_h_idx < padding_h || src_h_idx >= h_in + padding_h) {
+    dst[dst_i] = static_cast<T>(0);
+  }
+  else if (src_w_idx < padding_w || src_w_idx >= w_in + padding_w) {
+    dst[dst_i] = static_cast<T>(0);
+  }
+  else {
+    src_d_idx -= padding_d;
+    src_h_idx -= padding_h;
+    src_w_idx -= padding_w;
+    const size_t src_i =
+      b_idx * src_s[0]
+      + c_idx * src_s[1]
+      + src_d_idx * src_s[2]
+      + src_h_idx * src_s[3]
+      + src_w_idx * src_s[4];
+    dst[dst_i] = src[src_i];
+  }
+}
+
+template <typename T>
 __device__ void im2col(
     const size_t dst_numel,
     const size_t h_out,
@@ -381,6 +468,89 @@ __device__ void conv_transpose2d(
               const size_t src_idx = src_idx0 + src_c_idx * src_s[1] + inp_y * src_s[2] + inp_x * src_s[3];
               const size_t k_idx = src_c_idx * k_s[0] + dst_c_idx * k_s[1] + k_y * k_s[2] + k_x * k_s[3];
               d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
+          }
+      }
+  }
+  dst[dst_i] = static_cast<T>(d);
+}
+
+// Naive implementation of conv_transpose3d.
+template <typename T, typename A>
+__device__ void conv_transpose3d(
+    const size_t src_numel,
+    const size_t d_out,
+    const size_t w_out,
+    const size_t h_out,
+    const size_t stride_d,
+    const size_t stride_h,
+    const size_t stride_w,
+    const size_t padding_d,
+    const size_t padding_h,
+    const size_t padding_w,
+    const size_t out_padding_d,
+    const size_t out_padding_h,
+    const size_t out_padding_w,
+    const size_t dilation_d,
+    const size_t dilation_h,
+    const size_t dilation_w,
+    const size_t *info,
+    const T *src,
+    const T *kernel,
+    T *dst
+) {
+  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  // k: (c_in, c_out, k_d, k_h, k_w)
+  const size_t *src_dims = info;
+  const size_t *src_s = info + 5;
+  const size_t *k_dims = info + 10;
+  const size_t *k_s = info + 15;
+  const size_t k_d = k_dims[2];
+  const size_t k_h = k_dims[3];
+  const size_t k_w = k_dims[4];
+  const size_t c_out = k_dims[1];
+  const size_t c_in = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+  if (dst_i >= src_dims[0] * c_out * d_out * h_out * w_out) {
+    return;
+  }
+
+  const size_t b_idx = dst_i / (d_out * h_out * w_out * c_out);
+  const size_t dst_c_idx = (dst_i / (d_out * h_out * w_out)) % c_out;
+  const size_t out_z = (dst_i / (h_out * w_out)) % d_out;
+  const size_t out_y = (dst_i / w_out) % h_out;
+  const size_t out_x = dst_i % w_out;
+
+  const size_t src_idx0 = b_idx * src_s[0];
+  A d = 0;
+  for (int k_z = 0; k_z < (int)k_d; ++k_z) {
+      int inp_z_stride = (int)(out_z + padding_d) - k_z * dilation_d;
+      if (inp_z_stride < 0 || inp_z_stride % stride_d) {
+          continue;
+      }
+      int inp_z = inp_z_stride / stride_d;
+      if (inp_z >= d_in) continue;
+      for (int k_y = 0; k_y < (int)k_h; ++k_y) {
+          int inp_y_stride = (int)(out_y + padding_h) - k_y * dilation_h;
+          if (inp_y_stride < 0 || inp_y_stride % stride_h) {
+              continue;
+          }
+          int inp_y = inp_y_stride / stride_h;
+          if (inp_y >= h_in) continue;
+          for (int k_x = 0; k_x < (int)k_w; ++k_x) {
+              int inp_x_stride = (int)(out_x + padding_w) - k_x * dilation_w;
+              if (inp_x_stride < 0 || inp_x_stride % stride_w) {
+                  continue;
+              }
+              int inp_x = inp_x_stride / stride_w;
+              if (inp_x >= w_in) continue;
+              for (size_t src_c_idx = 0; src_c_idx < c_in; ++src_c_idx) {
+                  const size_t src_idx = src_idx0 + src_c_idx * src_s[1] + inp_z * src_s[2] + inp_y * src_s[3] + inp_x * src_s[4];
+                  const size_t k_idx = src_c_idx * k_s[0] + dst_c_idx * k_s[1] + k_z * k_s[2] + k_y * k_s[3] + k_x * k_s[4];
+                  d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
+              }
           }
       }
   }
@@ -710,6 +880,31 @@ extern "C" __global__ void FN_NAME(  \
   im2col<TYPENAME>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info, src, dst); \
 } \
 
+#define IM2COL3D_OP(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t dst_numel, \
+    const size_t d_out, \
+    const size_t h_out, \
+    const size_t w_out, \
+    const size_t d_k, \
+    const size_t h_k, \
+    const size_t w_k, \
+    const size_t stride_d, \
+    const size_t stride_h, \
+    const size_t stride_w, \
+    const size_t padding_d, \
+    const size_t padding_h, \
+    const size_t padding_w, \
+    const size_t dilation_d, \
+    const size_t dilation_h, \
+    const size_t dilation_w, \
+    const size_t *info, \
+    const TYPENAME *src, \
+    TYPENAME *dst \
+) {  \
+  im2col3d<TYPENAME>(dst_numel, d_out, h_out, w_out, d_k, h_k, w_k, stride_d, stride_h, stride_w, padding_d, padding_h, padding_w, dilation_d, dilation_h, dilation_w, info, src, dst); \
+} \
+
 #define CONVT1D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t src_numel, \
@@ -741,6 +936,32 @@ extern "C" __global__ void FN_NAME(  \
     TYPENAME *dst \
 ) {  \
   conv_transpose2d<TYPENAME, TYPEACC>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info, src, kernel, dst); \
+} \
+
+#define CONVT3D_OP(TYPENAME, TYPEACC, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t src_numel, \
+    const size_t d_out, \
+    const size_t w_out, \
+    const size_t h_out, \
+    const size_t stride_d, \
+    const size_t stride_h, \
+    const size_t stride_w, \
+    const size_t padding_d, \
+    const size_t padding_h, \
+    const size_t padding_w, \
+    const size_t out_padding_d, \
+    const size_t out_padding_h, \
+    const size_t out_padding_w, \
+    const size_t dilation_d, \
+    const size_t dilation_h, \
+    const size_t dilation_w, \
+    const size_t *info, \
+    const TYPENAME *src, \
+    const TYPENAME *kernel, \
+    TYPENAME *dst \
+) {  \
+  conv_transpose3d<TYPENAME, TYPEACC>(src_numel, d_out, w_out, h_out, stride_d, stride_h, stride_w, padding_d, padding_h, padding_w, out_padding_d, out_padding_h, out_padding_w, dilation_d, dilation_h, dilation_w, info, src, kernel, dst); \
 } \
 
 #define AVG_POOL2D_OP(TYPENAME, TYPEACC, FN_NAME) \
@@ -805,11 +1026,13 @@ CONV1D_OP(__nv_bfloat16, float, conv1d_bf16)
 CONV2D_OP(__nv_bfloat16, float, conv2d_bf16)
 CONVT1D_OP(__nv_bfloat16, float, conv_transpose1d_bf16)
 CONVT2D_OP(__nv_bfloat16, float, conv_transpose2d_bf16)
+CONVT3D_OP(__nv_bfloat16, float, conv_transpose3d_bf16)
 AVG_POOL2D_OP(__nv_bfloat16, float, avg_pool2d_bf16)
 MAX_POOL2D_OP(__nv_bfloat16, max_pool2d_bf16)
 UPSAMPLE_NEAREST2D_OP(__nv_bfloat16, upsample_nearest2d_bf16)
 UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, upsample_bilinear2d_bf16)
 IM2COL_OP(__nv_bfloat16, im2col_bf16)
+IM2COL3D_OP(__nv_bfloat16, im2col3d_bf16)
 IM2COL1D_OP(__nv_bfloat16, im2col1d_bf16)
 COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 
@@ -831,11 +1054,13 @@ CONV1D_OP(__half, float, conv1d_f16)
 CONV2D_OP(__half, float, conv2d_f16)
 CONVT1D_OP(__half, float, conv_transpose1d_f16)
 CONVT2D_OP(__half, float, conv_transpose2d_f16)
+CONVT3D_OP(__half, float, conv_transpose3d_f16)
 AVG_POOL2D_OP(__half, float, avg_pool2d_f16)
 MAX_POOL2D_OP(__half, max_pool2d_f16)
 UPSAMPLE_NEAREST2D_OP(__half, upsample_nearest2d_f16)
 UPSAMPLE_BILINEAR2D_OP(__half, upsample_bilinear2d_f16)
 IM2COL_OP(__half, im2col_f16)
+IM2COL3D_OP(__half, im2col3d_f16)
 IM2COL1D_OP(__half, im2col1d_f16)
 COL2IM1D_OP(__half, col2im1d_f16)
 #endif
@@ -859,6 +1084,11 @@ CONVT2D_OP(float, float, conv_transpose2d_f32)
 CONVT2D_OP(double, double, conv_transpose2d_f64)
 CONVT2D_OP(uint8_t, uint8_t, conv_transpose2d_u8)
 CONVT2D_OP(uint32_t, uint32_t, conv_transpose2d_u32)
+
+CONVT3D_OP(float, float, conv_transpose3d_f32)
+CONVT3D_OP(double, double, conv_transpose3d_f64)
+CONVT3D_OP(uint8_t, uint8_t, conv_transpose3d_u8)
+CONVT3D_OP(uint32_t, uint32_t, conv_transpose3d_u32)
 
 AVG_POOL2D_OP(float, float, avg_pool2d_f32)
 AVG_POOL2D_OP(double, double, avg_pool2d_f64)
@@ -884,6 +1114,11 @@ IM2COL_OP(float, im2col_f32)
 IM2COL_OP(double, im2col_f64)
 IM2COL_OP(uint8_t, im2col_u8)
 IM2COL_OP(uint32_t, im2col_u32)
+
+IM2COL3D_OP(float, im2col3d_f32)
+IM2COL3D_OP(double, im2col3d_f64)
+IM2COL3D_OP(uint8_t, im2col3d_u8)
+IM2COL3D_OP(uint32_t, im2col3d_u32)
 
 IM2COL1D_OP(float, im2col1d_f32)
 IM2COL1D_OP(double, im2col1d_f64)

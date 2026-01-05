@@ -161,3 +161,19 @@ required-features = ["symphonia"]
 [[example]]
 name = "bert_single_file_binary"
 required-features = ["buildtime-download"]
+
+[[example]]
+name = "qwen_image_inpaint"
+path = "examples/qwen_image/inpaint.rs"
+
+[[example]]
+name = "qwen_image_controlnet"
+path = "examples/qwen_image/controlnet_example.rs"
+
+[[example]]
+name = "qwen_image_edit"
+path = "examples/qwen_image/edit.rs"
+
+[[example]]
+name = "qwen_image_layered"
+path = "examples/qwen_image/layered.rs"

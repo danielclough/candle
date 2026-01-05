@@ -471,3 +471,277 @@ pub fn conv_transpose2d_no_bias(
     )?;
     Ok(ConvTranspose2d::new(ws, None, cfg))
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Conv3dConfig {
+    /// Padding to apply on all spatial dimensions.
+    pub padding: usize,
+    /// Stride for all spatial dimensions.
+    pub stride: usize,
+    /// Dilation factor for all spatial dimensions.
+    pub dilation: usize,
+    /// Number of groups for grouped convolution.
+    pub groups: usize,
+}
+
+impl Default for Conv3dConfig {
+    fn default() -> Self {
+        Self {
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            groups: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Conv3d {
+    weight: Tensor,
+    bias: Option<Tensor>,
+    config: Conv3dConfig,
+}
+
+impl Conv3d {
+    pub fn new(weight: Tensor, bias: Option<Tensor>, config: Conv3dConfig) -> Self {
+        Self {
+            weight,
+            bias,
+            config,
+        }
+    }
+
+    pub fn config(&self) -> &Conv3dConfig {
+        &self.config
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+}
+
+impl crate::Module for Conv3d {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let padding = (self.config.padding, self.config.padding, self.config.padding);
+        let stride = (self.config.stride, self.config.stride, self.config.stride);
+        let dilation = (self.config.dilation, self.config.dilation, self.config.dilation);
+        let x = x.conv3d(&self.weight, padding, stride, dilation, self.config.groups)?;
+        match &self.bias {
+            None => Ok(x),
+            Some(bias) => {
+                let b = bias.dims1()?;
+                let bias = bias.reshape((1, b, 1, 1, 1))?;
+                Ok(x.broadcast_add(&bias)?)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvTranspose3dConfig {
+    /// Padding to apply on all spatial dimensions.
+    pub padding: usize,
+    /// Output padding to add on all spatial dimensions.
+    pub output_padding: usize,
+    /// Stride for all spatial dimensions.
+    pub stride: usize,
+    /// Dilation factor for all spatial dimensions.
+    pub dilation: usize,
+    /// Number of groups for grouped convolution.
+    pub groups: usize,
+}
+
+impl Default for ConvTranspose3dConfig {
+    fn default() -> Self {
+        Self {
+            padding: 0,
+            output_padding: 0,
+            stride: 1,
+            dilation: 1,
+            groups: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConvTranspose3d {
+    weight: Tensor,
+    bias: Option<Tensor>,
+    config: ConvTranspose3dConfig,
+}
+
+impl ConvTranspose3d {
+    pub fn new(weight: Tensor, bias: Option<Tensor>, config: ConvTranspose3dConfig) -> Self {
+        Self {
+            weight,
+            bias,
+            config,
+        }
+    }
+
+    pub fn config(&self) -> &ConvTranspose3dConfig {
+        &self.config
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+}
+
+impl crate::Module for ConvTranspose3d {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let padding = (self.config.padding, self.config.padding, self.config.padding);
+        let output_padding = (
+            self.config.output_padding,
+            self.config.output_padding,
+            self.config.output_padding,
+        );
+        let stride = (self.config.stride, self.config.stride, self.config.stride);
+        let dilation = (self.config.dilation, self.config.dilation, self.config.dilation);
+        let x = x.conv_transpose3d(
+            &self.weight,
+            padding,
+            output_padding,
+            stride,
+            dilation,
+            self.config.groups,
+        )?;
+        match &self.bias {
+            None => Ok(x),
+            Some(bias) => {
+                let b = bias.dims1()?;
+                let bias = bias.reshape((1, b, 1, 1, 1))?;
+                Ok(x.broadcast_add(&bias)?)
+            }
+        }
+    }
+}
+
+/// Creates a Conv3d layer with bias.
+///
+/// # Arguments
+/// * `in_channels` - Number of input channels
+/// * `out_channels` - Number of output channels
+/// * `kernel_size` - Size of the convolution kernel (applied to all spatial dimensions)
+/// * `cfg` - Convolution configuration
+/// * `vb` - Variable builder for weight initialization
+pub fn conv3d(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: Conv3dConfig,
+    vb: crate::VarBuilder,
+) -> Result<Conv3d> {
+    let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
+    let ws = vb.get_with_hints(
+        (
+            out_channels,
+            in_channels / cfg.groups,
+            kernel_size,
+            kernel_size,
+            kernel_size,
+        ),
+        "weight",
+        init_ws,
+    )?;
+    let bound = 1. / (in_channels as f64).sqrt();
+    let init_bs = crate::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    };
+    let bs = vb.get_with_hints(out_channels, "bias", init_bs)?;
+    Ok(Conv3d::new(ws, Some(bs), cfg))
+}
+
+/// Creates a Conv3d layer without bias.
+pub fn conv3d_no_bias(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: Conv3dConfig,
+    vb: crate::VarBuilder,
+) -> Result<Conv3d> {
+    let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
+    let ws = vb.get_with_hints(
+        (
+            out_channels,
+            in_channels / cfg.groups,
+            kernel_size,
+            kernel_size,
+            kernel_size,
+        ),
+        "weight",
+        init_ws,
+    )?;
+    Ok(Conv3d::new(ws, None, cfg))
+}
+
+/// Creates a ConvTranspose3d layer with bias.
+///
+/// # Arguments
+/// * `in_channels` - Number of input channels
+/// * `out_channels` - Number of output channels
+/// * `kernel_size` - Size of the convolution kernel (applied to all spatial dimensions)
+/// * `cfg` - Transposed convolution configuration
+/// * `vb` - Variable builder for weight initialization
+pub fn conv_transpose3d(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: ConvTranspose3dConfig,
+    vb: crate::VarBuilder,
+) -> Result<ConvTranspose3d> {
+    let bound = 1. / (out_channels as f64).sqrt() / kernel_size as f64;
+    let init = crate::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    };
+    let ws = vb.get_with_hints(
+        (
+            in_channels,
+            out_channels / cfg.groups,
+            kernel_size,
+            kernel_size,
+            kernel_size,
+        ),
+        "weight",
+        init,
+    )?;
+    let bs = vb.get_with_hints(out_channels, "bias", init)?;
+    Ok(ConvTranspose3d::new(ws, Some(bs), cfg))
+}
+
+/// Creates a ConvTranspose3d layer without bias.
+pub fn conv_transpose3d_no_bias(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: ConvTranspose3dConfig,
+    vb: crate::VarBuilder,
+) -> Result<ConvTranspose3d> {
+    let bound = 1. / (out_channels as f64).sqrt() / kernel_size as f64;
+    let init = crate::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    };
+    let ws = vb.get_with_hints(
+        (
+            in_channels,
+            out_channels / cfg.groups,
+            kernel_size,
+            kernel_size,
+            kernel_size,
+        ),
+        "weight",
+        init,
+    )?;
+    Ok(ConvTranspose3d::new(ws, None, cfg))
+}

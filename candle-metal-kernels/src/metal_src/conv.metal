@@ -69,6 +69,92 @@ METAL_FUNC void im2col(
 }
 
 template <typename T>
+METAL_FUNC void im2col3d(
+    constant size_t &dst_numel,
+    constant size_t &d_out,
+    constant size_t &h_out,
+    constant size_t &w_out,
+    constant size_t &d_k,
+    constant size_t &h_k,
+    constant size_t &w_k,
+    constant size_t &stride_d,
+    constant size_t &stride_h,
+    constant size_t &stride_w,
+    constant size_t &padding_d,
+    constant size_t &padding_h,
+    constant size_t &padding_w,
+    constant size_t &dilation_d,
+    constant size_t &dilation_h,
+    constant size_t &dilation_w,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  // dst: (b_size, d_out, h_out, w_out, c_in, d_k, h_k, w_k)
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  if (tid >= dst_numel) {
+    return;
+  }
+  const size_t c_in = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+
+  const size_t dst_s6 = w_k;
+  const size_t dst_s5 = h_k * dst_s6;
+  const size_t dst_s4 = d_k * dst_s5;
+  const size_t dst_s3 = c_in * dst_s4;
+  const size_t dst_s2 = w_out * dst_s3;
+  const size_t dst_s1 = h_out * dst_s2;
+  const size_t dst_s0 = d_out * dst_s1;
+
+  size_t tmp_tid = tid;
+  const size_t b_idx = tmp_tid / dst_s0;
+  tmp_tid -= b_idx * dst_s0;
+  const size_t d_idx = tmp_tid / dst_s1;
+  tmp_tid -= d_idx * dst_s1;
+  const size_t h_idx = tmp_tid / dst_s2;
+  tmp_tid -= h_idx * dst_s2;
+  const size_t w_idx = tmp_tid / dst_s3;
+  tmp_tid -= w_idx * dst_s3;
+  const size_t c_idx = tmp_tid / dst_s4;
+  tmp_tid -= c_idx * dst_s4;
+  const size_t d_k_idx = tmp_tid / dst_s5;
+  tmp_tid -= d_k_idx * dst_s5;
+  const size_t h_k_idx = tmp_tid / dst_s6;
+  tmp_tid -= h_k_idx * dst_s6;
+  const size_t w_k_idx = tmp_tid;
+
+  size_t src_d_idx = d_idx * stride_d + d_k_idx * dilation_d;
+  size_t src_h_idx = h_idx * stride_h + h_k_idx * dilation_h;
+  size_t src_w_idx = w_idx * stride_w + w_k_idx * dilation_w;
+
+  if (src_d_idx < padding_d || src_d_idx >= d_in + padding_d) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else if (src_h_idx < padding_h || src_h_idx >= h_in + padding_h) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else if (src_w_idx < padding_w || src_w_idx >= w_in + padding_w) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else {
+    src_d_idx -= padding_d;
+    src_h_idx -= padding_h;
+    src_w_idx -= padding_w;
+    const size_t src_i =
+      b_idx * src_strides[0]
+      + c_idx * src_strides[1]
+      + src_d_idx * src_strides[2]
+      + src_h_idx * src_strides[3]
+      + src_w_idx * src_strides[4];
+    dst[tid] = src[src_i];
+  }
+}
+
+template <typename T>
 METAL_FUNC void col2im1d(
     constant size_t &dst_el,
     constant size_t &l_out,
@@ -317,6 +403,33 @@ kernel void FN_NAME(  \
     uint tid [[ thread_position_in_grid ]] \
 ) {  \
   im2col1d<T>(dst_numel, l_out, l_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
+} \
+
+#define IM2COL3D_OP(T, FN_NAME) \
+kernel void FN_NAME(  \
+    constant size_t &dst_numel, \
+    constant size_t &d_out, \
+    constant size_t &h_out, \
+    constant size_t &w_out, \
+    constant size_t &d_k, \
+    constant size_t &h_k, \
+    constant size_t &w_k, \
+    constant size_t &stride_d, \
+    constant size_t &stride_h, \
+    constant size_t &stride_w, \
+    constant size_t &padding_d, \
+    constant size_t &padding_h, \
+    constant size_t &padding_w, \
+    constant size_t &dilation_d, \
+    constant size_t &dilation_h, \
+    constant size_t &dilation_w, \
+    constant size_t *src_dims, \
+    constant size_t *src_strides, \
+    device const T *src, \
+    device T *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) {  \
+  im2col3d<T>(dst_numel, d_out, h_out, w_out, d_k, h_k, w_k, stride_d, stride_h, stride_w, padding_d, padding_h, padding_w, dilation_d, dilation_h, dilation_w, src_dims, src_strides, src, dst, tid); \
 } \
 
 #define COL2IM1D_OP(T, FN_NAME) \
@@ -646,12 +759,152 @@ kernel void FN_NAME(  \
   conv_transpose2d<TYPENAME, TYPEACC>(w_out, h_out, stride, padding, out_padding, dilation, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid); \
 } \
 
+// 3D Transposed Convolution
+// Input: [batch, c_in, d_in, h_in, w_in]
+// Kernel: [c_in, c_out, k_d, k_h, k_w]
+// Output: [batch, c_out, d_out, h_out, w_out]
+template <typename T, typename A>
+METAL_FUNC void conv_transpose3d(
+  constant size_t &d_out,
+  constant size_t &h_out,
+  constant size_t &w_out,
+  constant size_t &stride_d,
+  constant size_t &stride_h,
+  constant size_t &stride_w,
+  constant size_t &padding_d,
+  constant size_t &padding_h,
+  constant size_t &padding_w,
+  constant size_t &out_padding_d,
+  constant size_t &out_padding_h,
+  constant size_t &out_padding_w,
+  constant size_t &dilation_d,
+  constant size_t &dilation_h,
+  constant size_t &dilation_w,
+  constant size_t *input_dims,
+  constant size_t *input_stride,
+  constant size_t *k_dims,
+  constant size_t *k_stride,
+  device const T *src,
+  device const T *k,
+  device T *dst,
+  uint tid [[ thread_position_in_grid ]]
+) {
+  // Kernel shape: [c_in, c_out, k_d, k_h, k_w]
+  const size_t k_d = k_dims[2];
+  const size_t k_h = k_dims[3];
+  const size_t k_w = k_dims[4];
+  const size_t c_out = k_dims[1];
+  const size_t c_in = input_dims[1];
+  const size_t d_in = input_dims[2];
+  const size_t h_in = input_dims[3];
+  const size_t w_in = input_dims[4];
+
+  // Total output elements: batch * c_out * d_out * h_out * w_out
+  if (tid >= input_dims[0] * c_out * d_out * h_out * w_out) {
+    return;
+  }
+
+  // Decompose tid into output position
+  const size_t b_idx = tid / (d_out * h_out * w_out * c_out);
+  const size_t dst_c_idx = (tid / (d_out * h_out * w_out)) % c_out;
+  const size_t out_z = (tid / (h_out * w_out)) % d_out;
+  const size_t out_y = (tid / w_out) % h_out;
+  const size_t out_x = tid % w_out;
+
+  const size_t src_idx0 = b_idx * input_stride[0];
+
+  A d = 0;
+
+  // Iterate over kernel depth
+  for (int kz = 0; kz < (int)k_d; ++kz) {
+    const int inp_z_stride = (int)(out_z + padding_d) - kz * (int)dilation_d;
+    if (inp_z_stride < 0 || inp_z_stride % (int)stride_d) {
+      continue;
+    }
+    const int inp_z = inp_z_stride / (int)stride_d;
+    if (inp_z >= (int)d_in) continue;
+
+    // Iterate over kernel height
+    for (int ky = 0; ky < (int)k_h; ++ky) {
+      const int inp_y_stride = (int)(out_y + padding_h) - ky * (int)dilation_h;
+      if (inp_y_stride < 0 || inp_y_stride % (int)stride_h) {
+        continue;
+      }
+      const int inp_y = inp_y_stride / (int)stride_h;
+      if (inp_y >= (int)h_in) continue;
+
+      // Iterate over kernel width
+      for (int kx = 0; kx < (int)k_w; ++kx) {
+        const int inp_x_stride = (int)(out_x + padding_w) - kx * (int)dilation_w;
+        if (inp_x_stride < 0 || inp_x_stride % (int)stride_w) {
+          continue;
+        }
+        const int inp_x = inp_x_stride / (int)stride_w;
+        if (inp_x >= (int)w_in) continue;
+
+        // Sum over all input channels
+        for (size_t src_c_idx = 0; src_c_idx < c_in; ++src_c_idx) {
+          const size_t src_idx = src_idx0
+              + src_c_idx * input_stride[1]
+              + inp_z * input_stride[2]
+              + inp_y * input_stride[3]
+              + inp_x * input_stride[4];
+          const size_t k_idx = src_c_idx * k_stride[0]
+              + dst_c_idx * k_stride[1]
+              + kz * k_stride[2]
+              + ky * k_stride[3]
+              + kx * k_stride[4];
+          d += static_cast<A>(src[src_idx]) * static_cast<A>(k[k_idx]);
+        }
+      }
+    }
+  }
+  dst[tid] = static_cast<T>(d);
+}
+
+#define CONVT3D_OP(TYPENAME, TYPEACC, FN_NAME) \
+kernel void FN_NAME(  \
+    constant size_t &d_out, \
+    constant size_t &h_out, \
+    constant size_t &w_out, \
+    constant size_t &stride_d, \
+    constant size_t &stride_h, \
+    constant size_t &stride_w, \
+    constant size_t &padding_d, \
+    constant size_t &padding_h, \
+    constant size_t &padding_w, \
+    constant size_t &out_padding_d, \
+    constant size_t &out_padding_h, \
+    constant size_t &out_padding_w, \
+    constant size_t &dilation_d, \
+    constant size_t &dilation_h, \
+    constant size_t &dilation_w, \
+    constant size_t *input_dims, \
+    constant size_t *input_stride, \
+    constant size_t *k_dims, \
+    constant size_t *k_stride, \
+    device const TYPENAME *src, \
+    device const TYPENAME *k, \
+    device TYPENAME *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) {  \
+  conv_transpose3d<TYPENAME, TYPEACC>(d_out, h_out, w_out, stride_d, stride_h, stride_w, padding_d, padding_h, padding_w, out_padding_d, out_padding_h, out_padding_w, dilation_d, dilation_h, dilation_w, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid); \
+} \
+
 IM2COL_OP(float, im2col_f32)
 IM2COL_OP(half, im2col_f16)
 IM2COL_OP(uint8_t, im2col_u8)
 IM2COL_OP(uint32_t, im2col_u32)
 #if defined(__HAVE_BFLOAT__)
 IM2COL_OP(bfloat, im2col_bf16)
+#endif
+
+IM2COL3D_OP(float, im2col3d_f32)
+IM2COL3D_OP(half, im2col3d_f16)
+IM2COL3D_OP(uint8_t, im2col3d_u8)
+IM2COL3D_OP(uint32_t, im2col3d_u32)
+#if defined(__HAVE_BFLOAT__)
+IM2COL3D_OP(bfloat, im2col3d_bf16)
 #endif
 
 COL2IM1D_OP(float, col2im1d_f32)
@@ -713,5 +966,11 @@ CONVT1D_OP(bfloat, float, conv_transpose1d_bf16)
 CONVT2D_OP(float, float, conv_transpose2d_f32)
 CONVT2D_OP(half, float, conv_transpose2d_f16)
 #if defined(__HAVE_BFLOAT__)
-CONVT1D_OP(bfloat, float, conv_transpose2d_bf16)
+CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
+#endif
+
+CONVT3D_OP(float, float, conv_transpose3d_f32)
+CONVT3D_OP(half, float, conv_transpose3d_f16)
+#if defined(__HAVE_BFLOAT__)
+CONVT3D_OP(bfloat, float, conv_transpose3d_bf16)
 #endif
