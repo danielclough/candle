@@ -139,6 +139,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_window_layers: usize,
 
+    /// Chunk size for prefill to reduce peak memory (for long sequences on Metal).
+    /// Recommended: 2048 for Metal, 4096 for CUDA. 0 or omitted = disabled.
+    #[arg(long)]
+    prefill_chunk_size: Option<usize>,
+
     // === Sampling parameters ===
     /// Sampling temperature (0.0 = greedy/argmax, higher = more random)
     #[arg(long)]
@@ -626,6 +631,13 @@ fn main() -> Result<()> {
         config.max_window_layers = args.max_window_layers;
     }
 
+    // Apply chunked prefill setting (reduces memory for long sequences)
+    if let Some(chunk_size) = args.prefill_chunk_size {
+        if chunk_size > 0 {
+            config.prefill_chunk_size = Some(chunk_size);
+        }
+    }
+
     // Validate flash attention settings
     if config.use_flash_attn {
         if args.cpu {
@@ -655,6 +667,9 @@ fn main() -> Result<()> {
             "Using Sliding Window Attention (size: {}, layers >= {})",
             config.sliding_window, config.max_window_layers
         );
+    }
+    if let Some(chunk_size) = config.prefill_chunk_size {
+        println!("Using Chunked Prefill (chunk size: {} tokens)", chunk_size);
     }
 
     // Load tokenizer

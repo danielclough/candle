@@ -65,6 +65,7 @@ Qwen2.5-VL combines:
 | `--sliding-window` | Enable sliding window attention | false |
 | `--sliding-window-size <N>` | Sliding window size | 4096 |
 | `--max-window-layers <N>` | Layers using sliding window | 0 (all) |
+| `--prefill-chunk-size <N>` | Process prefill in chunks to reduce memory | None |
 
 ### Video Options
 
@@ -101,20 +102,6 @@ cargo run --example qwen2_5_vl --release -- \
 cargo run --example qwen2_5_vl --release -- \
     --image page1.png --image page2.png \
     --prompt "Compare these two pages"
-```
-
-### Video Understanding
-
-```bash
-# Requires ffmpeg installed
-cargo run --example qwen2_5_vl --release -- \
-    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 \
-    --prompt "Describe what happens in this video"
-
-# With custom frame rate
-cargo run --example qwen2_5_vl --release -- \
-    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 --video-fps 4.0 --max-frames 64 \
-    --prompt "What actions are shown?"
 ```
 
 ### Creative Generation with Sampling
@@ -180,6 +167,53 @@ cargo run --example qwen2_5_vl --release -- \
     --image /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/dice.png \
     --prompt "What is this?"
 ```
+
+### Video Understanding
+
+```bash
+# Requires ffmpeg installed
+cargo run --example qwen2_5_vl --release -- \
+    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 \
+    --prompt "Describe what happens in this video"
+
+# With custom frame rate
+cargo run --example qwen2_5_vl --release -- \
+    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 --video-fps 4.0 --max-frames 64 \
+    --prompt "What actions are shown?"
+```
+
+### Memory Optimization (Chunked Prefill)
+
+For long sequences (images or video) that exceed GPU memory, use chunked prefill
+to process tokens in smaller batches:
+
+```bash
+# Chunked prefill for video (recommended: 2048 for Metal, 4096 for CUDA)
+cargo run --example qwen2_5_vl --release -- \
+    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 --video-fps 4.0 --max-frames 32 \
+    --prefill-chunk-size 2048 \
+    --prompt "Describe what happens in this video"
+
+# For very long sequences, combine multiple optimizations
+cargo run --example qwen2_5_vl --release -- \
+    --video /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/bunny_10s.mp4 --video-fps 1.0 \
+    --prefill-chunk-size 2048 --bf16 --sliding-window \
+    --prompt "What topics are covered in this presentation?"
+```
+
+**How it works**: Instead of processing all tokens at once (which requires a
+`seq_len × seq_len` attention matrix), chunked prefill processes tokens in
+smaller batches while maintaining full causal attention via KV cache accumulation.
+For a 4,800 token sequence with chunk size 2048, peak memory is reduced by ~64%.
+
+##### The Trade-off
+
+| Chunk Size | Memory Savings | Overhead              |
+|------------|----------------|-----------------------|
+| 1024       | Best           | Highest (many chunks) |
+| 2048       | Good           | Moderate              |
+| 4096       | Moderate       | Lower                 |
+| 8192       | Minimal        | Lowest                |
 
 ### Precision Options
 

@@ -57,6 +57,8 @@ pub struct Qwen25VLModel {
     video_token_id: u32,
     spatial_merge_size: usize,
     tokens_per_second: usize,
+    /// Chunk size for prefill to reduce peak memory (None = disabled).
+    prefill_chunk_size: Option<usize>,
 }
 
 impl Qwen25VLModel {
@@ -73,6 +75,7 @@ impl Qwen25VLModel {
             video_token_id: cfg.video_token_id,
             spatial_merge_size: cfg.vision_config.spatial_merge_size,
             tokens_per_second: cfg.vision_config.tokens_per_second,
+            prefill_chunk_size: cfg.prefill_chunk_size,
         })
     }
 
@@ -154,8 +157,13 @@ impl Qwen25VLModel {
             }
         }
 
-        // 5. Forward through text model
-        self.text.forward_with_mrope(input_embeds, &position_ids)
+        // 5. Forward through text model (use chunked prefill if configured)
+        match self.prefill_chunk_size {
+            Some(chunk_size) => self
+                .text
+                .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size),
+            None => self.text.forward_with_mrope(input_embeds, &position_ids),
+        }
     }
 
     /// Forward pass for video understanding.
@@ -230,8 +238,13 @@ impl Qwen25VLModel {
             }
         }
 
-        // 5. Forward through text model
-        self.text.forward_with_mrope(input_embeds, &position_ids)
+        // 5. Forward through text model (use chunked prefill if configured)
+        match self.prefill_chunk_size {
+            Some(chunk_size) => self
+                .text
+                .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size),
+            None => self.text.forward_with_mrope(input_embeds, &position_ids),
+        }
     }
 
     /// Generate tokens autoregressively with a custom sampler.

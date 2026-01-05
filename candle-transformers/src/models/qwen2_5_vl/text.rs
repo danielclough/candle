@@ -1157,6 +1157,78 @@ impl Qwen25VLTextModel {
             .contiguous()
     }
 
+    /// Forward pass with M-RoPE using chunked prefill for reduced memory.
+    ///
+    /// Processes the input in chunks to reduce peak memory usage, which is essential
+    /// for long sequences on memory-constrained devices (e.g., Metal GPUs).
+    ///
+    /// # Arguments
+    /// * `xs` - Input embeddings [batch, seq_len, hidden_dim]
+    /// * `position_ids` - M-RoPE position IDs [3, batch, seq_len]
+    /// * `chunk_size` - Number of tokens to process per chunk
+    ///
+    /// # Memory Savings
+    /// For seq_len=4808 with chunk_size=2048:
+    /// - Without chunking: attention matrix = 4808² elements
+    /// - With chunking: peak = 2048×4096 elements (64% reduction)
+    pub fn forward_with_mrope_chunked(
+        &mut self,
+        xs: Tensor,
+        position_ids: &Tensor,
+        chunk_size: usize,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _) = xs.dims3()?;
+
+        // For small sequences, use standard path (no benefit from chunking)
+        if seq_len <= chunk_size {
+            return self.forward_with_mrope(xs, position_ids);
+        }
+
+        // Clear KV cache to start fresh prefill
+        self.clear_kv_cache();
+
+        let num_chunks = seq_len.div_ceil(chunk_size);
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * chunk_size;
+            let end = ((chunk_idx + 1) * chunk_size).min(seq_len);
+            let chunk_len = end - start;
+
+            // Extract chunk of embeddings: [batch, chunk_len, hidden_dim]
+            let chunk_embeds = xs.narrow(1, start, chunk_len)?;
+
+            // Extract chunk of position IDs: [3, batch, chunk_len]
+            // M-RoPE uses absolute positions, so slicing gives correct positions
+            let chunk_positions = position_ids.narrow(2, start, chunk_len)?;
+
+            // Create attention mask for this chunk:
+            // - Can attend to all cached tokens (positions 0..start)
+            // - Causal attention within the chunk
+            let attention_mask = if chunk_len <= 1 && start == 0 {
+                None
+            } else {
+                Some(self.prepare_causal_attention_mask(b_sz, chunk_len, start)?)
+            };
+
+            // Forward through all layers (KV cache accumulates automatically)
+            let mut hidden = chunk_embeds;
+            for layer in self.layers.iter_mut() {
+                hidden = layer.forward(&hidden, attention_mask.as_ref(), &chunk_positions)?;
+            }
+
+            // On the final chunk, apply norm and compute logits
+            if chunk_idx == num_chunks - 1 {
+                hidden = hidden.apply(&self.norm)?;
+                return self.lm_head
+                    .forward(&hidden)?
+                    .i((.., chunk_len - 1, ..))?
+                    .contiguous();
+            }
+        }
+
+        unreachable!("Should have returned in the last chunk iteration")
+    }
+
     /// Clear all KV caches.
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {

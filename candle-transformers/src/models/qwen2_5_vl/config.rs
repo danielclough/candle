@@ -325,6 +325,13 @@ pub struct Config {
     /// Whether to use flash attention (requires flash-attn feature and CUDA).
     #[serde(default)]
     pub use_flash_attn: bool,
+
+    /// Chunk size for prefill to reduce peak memory usage.
+    /// When set, processes the input in chunks during prefill phase.
+    /// Recommended: 2048 for Metal, 4096 for CUDA.
+    /// None means disabled (process full sequence at once).
+    #[serde(default)]
+    pub prefill_chunk_size: Option<usize>,
 }
 
 impl Default for Config {
@@ -352,6 +359,7 @@ impl Default for Config {
             sliding_window: default_sliding_window(),
             max_window_layers: default_max_window_layers(),
             use_flash_attn: false,
+            prefill_chunk_size: None,
         }
     }
 }
