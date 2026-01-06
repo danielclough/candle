@@ -8,10 +8,6 @@
 //! 2. Compute timestep embeddings and RoPE positional encodings
 //! 3. Process through 60 dual-stream transformer blocks
 //! 4. Apply final normalization and project to output channels
-//!
-//! # Debug Mode
-//!
-//! Set `QWEN_DEBUG=1` to enable detailed tensor statistics at key checkpoints.
 
 use candle::{DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};

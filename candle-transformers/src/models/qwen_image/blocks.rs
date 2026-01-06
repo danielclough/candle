@@ -203,14 +203,12 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let logits_flat = attn_logits.flatten_all()?;
     let logits_mean = logits_flat.mean_all()?.to_scalar::<f32>()?;
     let logits_var = logits_flat.broadcast_sub(&logits_flat.mean_all()?)?.sqr()?.mean_all()?.to_scalar::<f32>()?;
-    eprintln!("[SDPA] logits: mean={:.4}, std={:.4}", logits_mean, logits_var.sqrt());
 
     let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
     // Entropy: lower = more peaked attention
     let log_probs = attn_probs.clamp(1e-10, 1.0)?.log()?;
     let entropy = ((&attn_probs * &log_probs)? * -1.0)?.sum(D::Minus1)?.mean_all()?;
-    eprintln!("[SDPA] entropy={:.4}", entropy.to_scalar::<f32>()?);
 
     let attn_output = attn_probs.matmul(&v)?;
 

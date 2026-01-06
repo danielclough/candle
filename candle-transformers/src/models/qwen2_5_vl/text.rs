@@ -1421,16 +1421,10 @@ impl Qwen25VLTextModel {
         // Clear KV cache to ensure fresh forward pass (no stale state from previous calls)
         self.clear_kv_cache();
 
-        let debug_mode = std::env::var("QWEN_DEBUG").is_ok();
         let (b_sz, seq_len) = input_ids.dims2()?;
 
         // Get token embeddings
         let mut hidden_states = self.embed_tokens(input_ids)?;
-
-        // Debug: Check embeddings for NaN
-        if debug_mode {
-            Self::check_tensor_health("embed_tokens output", &hidden_states)?;
-        }
 
         // Create simple sequential position IDs: [3, batch, seq_len]
         // For text-only, all three M-RoPE dimensions use the same sequential positions
@@ -1449,10 +1443,6 @@ impl Qwen25VLTextModel {
         // Combine with provided attention mask if any
         let attention_mask = match (causal_mask, attention_mask) {
             (Some(causal), Some(mask)) => {
-                // Debug: Check input mask before conversion
-                if debug_mode {
-                    Self::check_tensor_health("input_attention_mask (before conversion)", mask)?;
-                }
 
                 // Expand mask to match causal mask shape: [batch, 1, 1, seq_len]
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
@@ -1463,25 +1453,12 @@ impl Qwen25VLTextModel {
                 let mask = ((1.0 - mask)? * -1e9)?;
                 let mask = mask.to_dtype(causal.dtype())?;
 
-                // Debug: Check mask after conversion
-                if debug_mode {
-                    Self::check_tensor_health("attention_mask (after -1e9 conversion)", &mask)?;
-                }
-
                 let mask = mask.broadcast_as(causal.dims())?;
                 let combined = (&causal + &mask)?;
-
-                // Debug: Check final combined mask
-                if debug_mode {
-                    Self::check_tensor_health("attention_mask (combined)", &combined)?;
-                }
 
                 Some(combined)
             }
             (Some(causal), None) => {
-                if debug_mode {
-                    Self::check_tensor_health("causal_mask", &causal)?;
-                }
                 Some(causal)
             }
             (None, Some(mask)) => {
@@ -1490,9 +1467,6 @@ impl Qwen25VLTextModel {
                 // Use a large finite negative instead (Metal doesn't support where_cond)
                 let mask = mask.to_dtype(DType::F32)?;
                 let converted = ((1.0 - mask)? * -1e9)?.to_dtype(self.dtype)?;
-                if debug_mode {
-                    Self::check_tensor_health("attention_mask (no causal)", &converted)?;
-                }
                 Some(converted)
             }
             (None, None) => None,
@@ -1502,25 +1476,11 @@ impl Qwen25VLTextModel {
         let num_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
-
-            // Debug: Check first 3 layers, then every 10th layer, and last layer
-            if debug_mode && (layer_idx < 3 || layer_idx % 10 == 0 || layer_idx == num_layers - 1) {
-                let healthy =
-                    Self::check_tensor_health(&format!("layer {} output", layer_idx), &hidden_states)?;
-                if !healthy {
-                    eprintln!("[DEBUG] ⚠️  NaN first detected at layer {}!", layer_idx);
-                    // Continue to see the pattern, but we found the culprit
-                }
-            }
         }
 
         // Apply final layer norm - HuggingFace applies norm BEFORE adding to all_hidden_states,
         // so hidden_states[-1] includes the final layer norm (see modeling_qwen2_5_vl.py:946-950)
         let final_hidden_states = hidden_states.apply(&self.norm)?;
-
-        if debug_mode {
-            Self::check_tensor_health("final_norm output", &final_hidden_states)?;
-        }
 
         Ok(final_hidden_states)
     }
