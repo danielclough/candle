@@ -260,7 +260,7 @@ fn create_img2img_latents(
 ) -> Result<Tensor> {
     println!("  Loading init image: {}", init_path);
 
-    let init_image = common::load_image_for_vae(init_path, height, width, device, dtype)?;
+    let init_image = common::load_image_for_vae(init_path, height, width, device)?;
 
     let dist = vae.encode(&init_image)?;
     let encoded_latents = vae.normalize_latents(&dist.mode().clone())?;

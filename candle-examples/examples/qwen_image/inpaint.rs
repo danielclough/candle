@@ -71,7 +71,7 @@ pub fn run(
 
     // Encode input image
     let input_image =
-        common::load_image_for_vae(&args.input_image, target_height, target_width, device, dtype)?;
+        common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
     let dist = vae.encode(&input_image)?;
     let original_latents = vae.normalize_latents(&dist.mode().clone())?;
     println!("  Encoded latents shape: {:?}", original_latents.dims());

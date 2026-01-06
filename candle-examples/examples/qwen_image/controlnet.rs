@@ -63,7 +63,7 @@ pub fn run(
 
     // Load and encode control image
     let control_image =
-        common::load_image_for_vae(&args.control_image, args.height, args.width, device, dtype)?;
+        common::load_image_for_vae(&args.control_image, args.height, args.width, device)?;
 
     let control_condition =
         encode_control_condition(&control_image, &vae, dims.latent_height, dims.latent_width)?;

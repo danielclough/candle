@@ -79,12 +79,12 @@ pub fn setup_device_and_dtype(cpu: bool, use_f32: bool, seed: Option<u64>) -> Re
 ///
 /// Returns a tensor of shape [1, 3, 1, height, width] normalized to [-1, 1].
 /// This is the standard format for the Qwen-Image 3D VAE.
+/// Always returns F32 since the VAE uses F32 for numerical precision.
 pub fn load_image_for_vae(
     path: &str,
     target_height: usize,
     target_width: usize,
     device: &Device,
-    dtype: DType,
 ) -> Result<Tensor> {
     let img = image::ImageReader::open(path)
         .map_err(|e| anyhow!("Failed to open image '{}': {}", path, e))?
@@ -111,8 +111,8 @@ pub fn load_image_for_vae(
         }
     }
 
-    // Shape: [1, 3, 1, height, width] for 3D VAE
-    Ok(Tensor::from_vec(data, (1, 3, 1, target_height, target_width), device)?.to_dtype(dtype)?)
+    // Shape: [1, 3, 1, height, width] for 3D VAE (always F32 for VAE precision)
+    Ok(Tensor::from_vec(data, (1, 3, 1, target_height, target_width), device)?)
 }
 
 /// Load a grayscale mask image and resize to latent dimensions.

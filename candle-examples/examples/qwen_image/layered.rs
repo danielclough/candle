@@ -87,7 +87,7 @@ pub fn run(
     println!("  VAE loaded");
 
     let vae_input =
-        common::load_image_for_vae(&args.input_image, target_height, target_width, device, dtype)?;
+        common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
     let dist = vae.encode(&vae_input)?;
     let image_latents = vae.normalize_latents(&dist.mode().clone())?;
     println!("  Image latents shape: {:?}", image_latents.dims());
@@ -156,11 +156,12 @@ pub fn run(
         pack_layered_latents(&noise_latents, dims.latent_height, dims.latent_width, args.layers)?;
     println!("  Packed noise shape: {:?}", packed_noise.dims());
 
-    // Pack image latents (single frame) for conditioning
+    // Pack image latents (single frame) for conditioning, convert to BF16 for transformer
     let image_latents_frame = image_latents.squeeze(2)?; // [1, 16, h, w]
     let image_latents_frame = image_latents_frame.unsqueeze(1)?; // [1, 1, 16, h, w]
     let packed_image =
-        pack_layered_latents(&image_latents_frame, dims.latent_height, dims.latent_width, 0)?;
+        pack_layered_latents(&image_latents_frame, dims.latent_height, dims.latent_width, 0)?
+            .to_dtype(dtype)?;
 
     // Load transformer with layered config
     let config = Config::qwen_image_layered();

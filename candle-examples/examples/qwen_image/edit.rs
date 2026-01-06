@@ -92,7 +92,7 @@ pub fn run(
     println!("  VAE loaded");
 
     let vae_input =
-        common::load_image_for_vae(&args.input_image, target_height, target_width, device, dtype)?;
+        common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
     let dist = vae.encode(&vae_input)?;
     let image_latents = vae.normalize_latents(&dist.mode().clone())?;
     println!("  Image latents shape: {:?}", image_latents.dims());
@@ -129,17 +129,18 @@ pub fn run(
         pixel_values.dim(0)?
     );
 
-    // Compute vision embeddings
-    let vision_embeds = vision_model.forward(&pixel_values, &image_grid_thw)?;
+    // Compute vision embeddings (convert to F32 for text encoder which uses F32)
+    let vision_embeds = vision_model.forward(&pixel_values, &image_grid_thw)?
+        .to_dtype(DType::F32)?;
     let num_image_tokens = vision_embeds.dim(0)?;
     println!("  Vision embeddings: {} tokens", num_image_tokens);
 
-    // Load text encoder
+    // Load text encoder (always F32 for numerical precision)
     let mut text_model =
         common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
     println!("  Text encoder loaded");
 
-    // Encode prompts with vision
+    // Encode prompts with vision (text encoder outputs F32, convert to transformer dtype)
     let (pos_embeds, pos_mask) = encode_prompt_with_vision(
         &tokenizer,
         &mut text_model,
@@ -149,6 +150,7 @@ pub fn run(
         num_image_tokens,
         device,
     )?;
+    let pos_embeds = pos_embeds.to_dtype(dtype)?;
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
     let neg_prompt = if args.negative_prompt.is_empty() {
@@ -165,6 +167,7 @@ pub fn run(
         num_image_tokens,
         device,
     )?;
+    let neg_embeds = neg_embeds.to_dtype(dtype)?;
 
     drop(text_model);
     drop(vision_model);
@@ -186,7 +189,9 @@ pub fn run(
     )?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
-    let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?;
+    // Pack image latents and convert to BF16 for transformer input
+    let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?
+        .to_dtype(dtype)?;
 
     // Load transformer
     let config = Config::qwen_image_edit();

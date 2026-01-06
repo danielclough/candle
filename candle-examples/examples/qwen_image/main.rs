@@ -158,7 +158,7 @@ enum Command {
         negative_prompt: String,
 
         /// Number of denoising steps.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 20)]
         num_inference_steps: usize,
 
         /// True CFG guidance scale.
@@ -213,7 +213,7 @@ enum Command {
         negative_prompt: String,
 
         /// Number of denoising steps.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 20)]
         num_inference_steps: usize,
 
         /// True CFG guidance scale.
@@ -248,7 +248,7 @@ enum Command {
         resolution: usize,
 
         /// Number of denoising steps.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 20)]
         num_inference_steps: usize,
 
         /// True CFG guidance scale.
@@ -283,7 +283,7 @@ enum Command {
         width: usize,
 
         /// Number of denoising steps.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 20)]
         num_inference_steps: usize,
 
         /// True CFG guidance scale.
