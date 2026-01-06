@@ -20,6 +20,7 @@ use candle_transformers::models::{
 use tokenizers::Tokenizer;
 
 use crate::common;
+use crate::debug::{self, DebugContext};
 
 /// Vision encoder configuration constants.
 const VISION_PATCH_SIZE: usize = 14;
@@ -56,6 +57,7 @@ pub fn run(
     paths: EditModelPaths,
     device: &Device,
     dtype: DType,
+    mut debug_ctx: Option<&mut DebugContext>,
 ) -> Result<()> {
     println!("Qwen-Image Edit");
     println!("Device: {:?}, DType: {:?}", device, dtype);
@@ -93,8 +95,14 @@ pub fn run(
 
     let vae_input =
         common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
+    let vae_input = debug::checkpoint(&mut debug_ctx, "vae_input", vae_input)?;
+
     let dist = vae.encode(&vae_input)?;
-    let image_latents = vae.normalize_latents(&dist.mode().clone())?;
+    let image_latents_raw = dist.mode().clone();
+    let image_latents_raw = debug::checkpoint(&mut debug_ctx, "image_latents_raw", image_latents_raw)?;
+
+    let image_latents = vae.normalize_latents(&image_latents_raw)?;
+    let image_latents = debug::checkpoint(&mut debug_ctx, "image_latents_normalized", image_latents)?;
     println!("  Image latents shape: {:?}", image_latents.dims());
 
     // =========================================================================
@@ -132,6 +140,7 @@ pub fn run(
     // Compute vision embeddings (convert to F32 for text encoder which uses F32)
     let vision_embeds = vision_model.forward(&pixel_values, &image_grid_thw)?
         .to_dtype(DType::F32)?;
+    let vision_embeds = debug::checkpoint(&mut debug_ctx, "vision_embeds", vision_embeds)?;
     let num_image_tokens = vision_embeds.dim(0)?;
     println!("  Vision embeddings: {} tokens", num_image_tokens);
 
@@ -150,6 +159,8 @@ pub fn run(
         num_image_tokens,
         device,
     )?;
+    let pos_embeds = debug::checkpoint(&mut debug_ctx, "prompt_embeds", pos_embeds)?;
+    let pos_mask = debug::checkpoint(&mut debug_ctx, "prompt_mask", pos_mask)?;
     let pos_embeds = pos_embeds.to_dtype(dtype)?;
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
@@ -167,6 +178,8 @@ pub fn run(
         num_image_tokens,
         device,
     )?;
+    let neg_embeds = debug::checkpoint(&mut debug_ctx, "negative_prompt_embeds", neg_embeds)?;
+    let neg_mask = debug::checkpoint(&mut debug_ctx, "negative_prompt_mask", neg_mask)?;
     let neg_embeds = neg_embeds.to_dtype(dtype)?;
 
     drop(text_model);
@@ -187,11 +200,15 @@ pub fn run(
         (1, 16, 1, dims.latent_height, dims.latent_width),
         device,
     )?;
+    let noise_latents = debug::checkpoint(&mut debug_ctx, "noise_latents_unpacked", noise_latents)?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
+    let packed_noise = debug::checkpoint(&mut debug_ctx, "packed_noise_latents", packed_noise)?;
+
     // Pack image latents and convert to BF16 for transformer input
-    let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?
-        .to_dtype(dtype)?;
+    let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?;
+    let packed_image = debug::checkpoint(&mut debug_ctx, "packed_image_latents", packed_image)?;
+    let packed_image = packed_image.to_dtype(dtype)?;
 
     // Load transformer
     let config = Config::qwen_image_edit();
@@ -240,6 +257,12 @@ pub fn run(
         let latent_model_input = Tensor::cat(&[&latents_bf16, &packed_image], 1)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
+        // Debug: capture transformer inputs at step 0
+        if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "transformer_input_hidden_states", latent_model_input.clone())?;
+            debug::checkpoint(&mut debug_ctx, "transformer_input_timestep", t.clone())?;
+        }
+
         let pos_pred = transformer.forward(
             &latent_model_input,
             &pos_embeds,
@@ -248,6 +271,12 @@ pub fn run(
             &img_shapes,
             &txt_seq_lens,
         )?;
+
+        // Debug: capture full transformer output at step 0 (before extraction)
+        if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_full", pos_pred.clone())?;
+        }
+
         let neg_pred = transformer.forward(
             &latent_model_input,
             &neg_embeds,
@@ -262,7 +291,18 @@ pub fn run(
         let pos_pred = pos_pred.narrow(1, 0, noise_seq_len)?;
         let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
 
+        // Debug: capture extracted noise predictions at step 0
+        if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "noise_pred_pos_step0", pos_pred.clone())?;
+            debug::checkpoint(&mut debug_ctx, "noise_pred_neg_step0", neg_pred.clone())?;
+        }
+
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
+
+        // Debug: capture guided prediction at step 0
+        if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "guided_pred_step0", guided_pred.clone())?;
+        }
 
         // Unpack and step
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
@@ -272,9 +312,18 @@ pub fn run(
             unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
         let stepped = scheduler.step(&unpacked, &unpacked_latents)?;
         latents = pack_latents(&stepped, dims.latent_height, dims.latent_width)?;
+
+        // Debug: capture latents after step 0
+        if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "packed_latents_after_step0", latents.clone())?;
+            let latents_unpacked = unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
+            debug::checkpoint(&mut debug_ctx, "latents_after_step0", latents_unpacked)?;
+        }
     }
 
     let final_latents = unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
+    let final_latents = debug::checkpoint(&mut debug_ctx, "final_latents", final_latents)?;
+    debug::checkpoint(&mut debug_ctx, "final_latents_packed", latents)?;
 
     drop(transformer);
     println!("  Transformer freed");
@@ -288,6 +337,7 @@ pub fn run(
 
     // Note: Both latents and VAE are F32 for numerical precision
     let latents = vae.denormalize_latents(&final_latents)?;
+    let latents = debug::checkpoint(&mut debug_ctx, "denormalized_latents", latents)?;
 
     let image = if use_tiled {
         let tile_stride = (args.tile_size * 3) / 4;
@@ -304,6 +354,8 @@ pub fn run(
         println!("\nDecoding latents...");
         vae.decode(&latents)?
     };
+
+    debug::checkpoint(&mut debug_ctx, "decoded_image", image.clone())?;
 
     common::postprocess_and_save(&image, &args.output)?;
     println!("Edited image saved to: {}", args.output);
