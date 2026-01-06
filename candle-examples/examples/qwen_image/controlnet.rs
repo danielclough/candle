@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen_image::{
-    apply_true_cfg, pack_latents, unpack_latents, Config, ControlNetConfig,
-    QwenImageControlNetModel, TEXT_ONLY_DROP_TOKENS, TEXT_ONLY_PROMPT_TEMPLATE,
+    apply_true_cfg, pack_latents, unpack_latents, Config, ControlNetConfig, PromptMode,
+    QwenImageControlNetModel,
 };
 
 use crate::common;
@@ -76,7 +76,7 @@ pub fn run(
 
     let tokenizer = common::load_tokenizer(paths.tokenizer_path.as_deref(), &api)?;
     let mut text_model =
-        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device, dtype)?;
+        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
     println!("  Text encoder loaded");
 
     // Encode prompts
@@ -84,9 +84,9 @@ pub fn run(
         &tokenizer,
         &mut text_model,
         &args.prompt,
-        TEXT_ONLY_PROMPT_TEMPLATE,
-        TEXT_ONLY_DROP_TOKENS,
+        PromptMode::TextOnly,
         device,
+        dtype,
     )?;
 
     let neg_prompt = if args.negative_prompt.is_empty() {
@@ -98,9 +98,9 @@ pub fn run(
         &tokenizer,
         &mut text_model,
         neg_prompt,
-        TEXT_ONLY_PROMPT_TEMPLATE,
-        TEXT_ONLY_DROP_TOKENS,
+        PromptMode::TextOnly,
         device,
+        dtype,
     )?;
 
     drop(text_model);
@@ -113,13 +113,13 @@ pub fn run(
 
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
+    // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
     let latents = Tensor::randn(
         0f32,
         1f32,
         (1, 16, 1, dims.latent_height, dims.latent_width),
         device,
-    )?
-    .to_dtype(dtype)?;
+    )?;
 
     println!("  Latent size: {}x{}", dims.latent_height, dims.latent_width);
 
@@ -190,6 +190,8 @@ pub fn run(
         }
 
         let packed = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
+        // Convert F32 latents to BF16 for transformer/controlnet (weights are BF16)
+        let packed = packed.to_dtype(dtype)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         // Get ControlNet residuals for positive prediction
@@ -220,6 +222,8 @@ pub fn run(
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
+        // Convert back to F32 for scheduler arithmetic
+        let unpacked = unpacked.to_dtype(DType::F32)?;
 
         latents = scheduler.step(&unpacked, &latents)?;
     }
@@ -233,6 +237,7 @@ pub fn run(
     // =========================================================================
     println!("\n[6/6] Decoding latents...");
 
+    // Note: Both latents and VAE are F32 for numerical precision
     let latents = vae.denormalize_latents(&latents)?;
     let image = vae.decode(&latents)?;
 

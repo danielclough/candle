@@ -8,13 +8,14 @@
 //! - Scheduler setup
 
 use anyhow::{anyhow, Result};
-use candle::{DType, Device, IndexOp, Tensor};
+use candle::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
     qwen_image::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
-        FlowMatchEulerDiscreteScheduler, QwenImageTransformer2DModel, SchedulerConfig, VaeConfig,
+        FlowMatchEulerDiscreteScheduler, PromptMode, QwenImageTransformer2DModel, SchedulerConfig,
+        VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -50,10 +51,17 @@ pub fn setup_tracing(enabled: bool) -> Option<tracing_chrome::FlushGuard> {
 }
 
 /// Setup compute device and dtype based on arguments.
+///
+/// Note: Device seeding is only supported on Metal/CUDA. For CPU, the seed is
+/// handled by `MtBoxMullerRng` in the generate pipeline for reproducible latents.
 pub fn setup_device_and_dtype(cpu: bool, use_f32: bool, seed: Option<u64>) -> Result<(Device, DType)> {
     let device = candle_examples::device(cpu)?;
     if let Some(seed) = seed {
-        device.set_seed(seed)?;
+        // Only seed non-CPU devices (CPU doesn't support set_seed, but we use
+        // MtBoxMullerRng for reproducible latent generation anyway)
+        if !matches!(device, Device::Cpu) {
+            device.set_seed(seed)?;
+        }
     }
     let dtype = if use_f32 {
         DType::F32
@@ -161,16 +169,33 @@ pub fn postprocess_and_save(image: &Tensor, output_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Save a 4D image tensor [B, C, H, W] (already frame-selected).
+pub fn postprocess_and_save_4d(image: &Tensor, output_path: &str) -> Result<()> {
+    // Remove batch: [1, 3, H, W] -> [3, H, W]
+    let image = image.squeeze(0)?;
+    // Clamp and convert to [0, 255]
+    let image = ((image.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let image = image.to_dtype(DType::U8)?;
+
+    candle_examples::save_image(&image, output_path)?;
+    Ok(())
+}
+
 // ============================================================================
 // Model loading utilities
 // ============================================================================
 
 /// Load the Qwen-Image VAE.
+///
+/// NOTE: The VAE always runs in F32 for numerical precision, regardless of the
+/// `dtype` parameter. BF16 causes significant quality degradation in the 3D
+/// convolutions and upsampling layers. Input tensors are converted to F32
+/// before VAE operations.
 pub fn load_vae(
     vae_path: Option<&str>,
     api: &hf_hub::api::sync::Api,
     device: &Device,
-    dtype: DType,
+    _dtype: DType, // Ignored - VAE always uses F32 for precision
 ) -> Result<AutoencoderKLQwenImage> {
     let vae_config = VaeConfig::qwen_image();
     let vae_file = match vae_path {
@@ -181,7 +206,9 @@ pub fn load_vae(
         }
     };
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_file], dtype, device)? };
+    // Always use F32 for the VAE to maintain numerical precision
+    // through the 3D convolution and upsampling layers.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_file], DType::F32, device)? };
     Ok(AutoencoderKLQwenImage::new(&vae_config, vb)?)
 }
 
@@ -201,11 +228,14 @@ pub fn load_tokenizer(
 }
 
 /// Load the Qwen2.5-VL text encoder.
+///
+/// NOTE: The text encoder always runs in F32 for numerical precision. The embeddings are converted
+/// to the target dtype after encoding in `encode_text_prompt`. This mixed-precision approach provides
+/// optimal quality without sacrificing performance in the transformer/VAE.
 pub fn load_text_encoder(
     text_encoder_path: Option<&str>,
     api: &hf_hub::api::sync::Api,
     device: &Device,
-    dtype: DType,
 ) -> Result<Qwen25VLTextModel> {
     let text_config = TextConfig::default();
     let model_files = match text_encoder_path {
@@ -218,7 +248,9 @@ pub fn load_text_encoder(
         }
     };
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, device)? };
+    // Always use F32 for the text encoder to maintain numerical precision
+    // through the 28 transformer layers. BF16 accumulates too much error.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::F32, device)? };
     Ok(Qwen25VLTextModel::new(&text_config, vb)?)
 }
 
@@ -255,24 +287,26 @@ pub fn load_transformer(
 // Prompt encoding utilities
 // ============================================================================
 
-/// Encode a text-only prompt using the specified template.
+/// Encode a text-only prompt using the specified mode.
 ///
 /// This handles the standard text-only encoding flow:
-/// 1. Apply the prompt template
+/// 1. Apply the prompt template for the given mode
 /// 2. Tokenize
-/// 3. Run through text encoder
-/// 4. Drop the first `drop_tokens` tokens (system prefix)
+/// 3. Run through text encoder (always in F32 for precision)
+/// 4. Drop the system prefix tokens
+/// 5. Convert embeddings to target dtype (for downstream BF16 transformer)
 ///
 /// Returns (embeddings, attention_mask).
 pub fn encode_text_prompt(
     tokenizer: &Tokenizer,
     text_model: &mut Qwen25VLTextModel,
     prompt: &str,
-    template: &str,
-    drop_tokens: usize,
+    mode: PromptMode,
     device: &Device,
+    target_dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
-    let templated = template.replace("{}", prompt);
+    let templated = mode.template().replace("{}", prompt);
+    let drop_tokens = mode.drop_tokens();
 
     let encoding = tokenizer
         .encode(templated, false)
@@ -286,7 +320,61 @@ pub fn encode_text_prompt(
         .to_dtype(DType::F32)?
         .unsqueeze(0)?;
 
+    // Debug: Check input tensors before forward pass
+    if std::env::var("QWEN_DEBUG").is_ok() {
+        // Check attention mask values
+        let mask_f32 = attention_mask_tensor.to_dtype(DType::F32)?;
+        let mask_vec: Vec<f32> = mask_f32.flatten_all()?.to_vec1()?;
+        let mask_min = mask_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mask_max = mask_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mask_sum: f32 = mask_vec.iter().sum();
+        let mask_len = attention_mask_tensor.dim(1)?;
+        println!("[DEBUG] attention_mask: shape={:?}, min={}, max={}, sum={} (expect sum={})",
+            attention_mask_tensor.dims(), mask_min, mask_max, mask_sum, mask_len);
+
+        // Warn if mask values are outside expected range [0, 1]
+        if mask_min < 0.0 || mask_max > 1.0 {
+            println!("[DEBUG] ⚠️  WARNING: attention_mask values outside [0, 1] range!");
+        }
+
+        // Check input_ids range
+        let ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        let ids_min = *ids_vec.iter().min().unwrap_or(&0);
+        let ids_max = *ids_vec.iter().max().unwrap_or(&0);
+        println!("[DEBUG] input_ids: shape={:?}, min={}, max={}, num_tokens={}",
+            input_ids.dims(), ids_min, ids_max, ids_vec.len());
+
+        // Print first and last few tokens for context
+        if ids_vec.len() > 10 {
+            println!("[DEBUG] input_ids first 5: {:?}", &ids_vec[..5]);
+            println!("[DEBUG] input_ids last 5: {:?}", &ids_vec[ids_vec.len()-5..]);
+        } else {
+            println!("[DEBUG] input_ids all: {:?}", ids_vec);
+        }
+    }
+
     let hidden_states = text_model.forward_text_only(&input_ids, Some(&attention_mask_tensor))?;
+
+    // Debug: Check output hidden states for NaN
+    if std::env::var("QWEN_DEBUG").is_ok() {
+        let hs_f32 = hidden_states.to_dtype(DType::F32)?;
+        let hs_vec: Vec<f32> = hs_f32.flatten_all()?.to_vec1()?;
+        let nan_count = hs_vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = hs_vec.iter().filter(|x| x.is_infinite()).count();
+
+        if nan_count > 0 || inf_count > 0 {
+            println!("[DEBUG] ❌ hidden_states contains {} NaN, {} Inf values out of {}",
+                nan_count, inf_count, hs_vec.len());
+        } else {
+            let mean = hs_vec.iter().sum::<f32>() / hs_vec.len() as f32;
+            let variance = hs_vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / hs_vec.len() as f32;
+            let std = variance.sqrt();
+            let min = hs_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = hs_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!("[DEBUG] ✓ hidden_states: shape={:?}, mean={:.4}, std={:.4}, min={:.4}, max={:.4}",
+                hidden_states.dims(), mean, std, min, max);
+        }
+    }
 
     let seq_len = hidden_states.dim(1)?;
     if seq_len <= drop_tokens {
@@ -299,6 +387,9 @@ pub fn encode_text_prompt(
 
     let embeddings = hidden_states.narrow(1, drop_tokens, seq_len - drop_tokens)?;
     let mask = attention_mask_tensor.narrow(1, drop_tokens, seq_len - drop_tokens)?;
+
+    // Convert embeddings from F32 to target dtype (typically BF16) for the downstream transformer
+    let embeddings = embeddings.to_dtype(target_dtype)?;
 
     Ok((embeddings, mask))
 }

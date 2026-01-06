@@ -50,10 +50,12 @@ extern crate intel_mkl_src;
 
 mod common;
 mod controlnet;
+mod debug;
 mod edit;
 mod generate;
 mod inpaint;
 mod layered;
+mod mt_box_muller_rng;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -83,6 +85,19 @@ struct Cli {
     /// Random seed for reproducibility.
     #[arg(long, global = true)]
     seed: Option<u64>,
+
+    /// Enable debug mode: save tensors and compare with PyTorch reference.
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Substitution mode for debug (requires --debug). Options:
+    /// - "none": No substitution, run full Rust pipeline (default)
+    /// - "all": Substitute all available PyTorch reference tensors
+    /// - "prompt": Only substitute prompt_embeds and prompt_mask
+    /// - "latents": Only substitute final_latents and denormalized_latents
+    /// - "except:name1,name2": Substitute all except these tensors
+    #[arg(long, global = true, default_value = "none")]
+    debug_substitute: String,
 
     /// Local path to transformer weights.
     #[arg(long, global = true)]
@@ -122,7 +137,7 @@ enum Command {
         width: usize,
 
         /// Number of denoising steps.
-        #[arg(long, default_value_t = 28)]
+        #[arg(long, default_value_t = 20)]
         num_inference_steps: usize,
 
         /// True CFG guidance scale.
@@ -312,6 +327,9 @@ fn main() -> Result<()> {
     // Setup device and dtype
     let (device, dtype) = common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.seed)?;
 
+    // Parse substitution mode for debug
+    let substitute_mode = debug::SubstituteMode::parse(&cli.debug_substitute)?;
+
     // Dispatch to the appropriate pipeline
     match cli.command {
         Command::Generate {
@@ -335,6 +353,7 @@ fn main() -> Result<()> {
                 init_image,
                 strength,
                 output,
+                seed: cli.seed,
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,
@@ -342,7 +361,13 @@ fn main() -> Result<()> {
                 text_encoder_path: cli.text_encoder_path,
                 tokenizer_path: cli.tokenizer_path,
             };
-            generate::run(args, paths, &device, dtype)
+            // Create debug context if --debug flag is set
+            let mut debug_ctx = if cli.debug {
+                Some(debug::setup_debug_context_with_mode(&device, substitute_mode)?)
+            } else {
+                None
+            };
+            generate::run(args, paths, &device, dtype, debug_ctx.as_mut())
         }
 
         Command::Edit {

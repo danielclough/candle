@@ -8,12 +8,17 @@
 //! 2. Compute timestep embeddings and RoPE positional encodings
 //! 3. Process through 60 dual-stream transformer blocks
 //! 4. Apply final normalization and project to output channels
+//!
+//! # Debug Mode
+//!
+//! Set `QWEN_DEBUG=1` to enable detailed tensor statistics at key checkpoints.
 
 use candle::{DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 use super::blocks::QwenImageTransformerBlock;
 use super::config::Config;
+use super::debug::debug_tensor;
 use super::rope::{timestep_embedding, QwenEmbedRope};
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -80,8 +85,9 @@ impl AdaLayerNormContinuous {
         if chunks.len() != 2 {
             candle::bail!("Expected 2 chunks for AdaLN, got {}", chunks.len());
         }
-        let shift = &chunks[0];
-        let scale = &chunks[1];
+        // PyTorch: scale, shift = torch.chunk(emb, 2, dim=1)
+        let scale = &chunks[0];
+        let shift = &chunks[1];
 
         xs.apply(&self.norm)?
             .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
@@ -278,16 +284,24 @@ impl QwenImageTransformer2DModel {
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
 
+        debug_tensor("input_hidden_states", hidden_states);
+        debug_tensor("input_encoder_hidden_states", encoder_hidden_states);
+        debug_tensor("input_timestep", timestep);
+
         // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
         let mut hidden_states = hidden_states.apply(&self.img_in)?;
+        debug_tensor("after_img_in", &hidden_states);
 
         // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
         let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
+        debug_tensor("after_txt_norm", &encoder_hidden_states);
         encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
+        debug_tensor("after_txt_in", &encoder_hidden_states);
 
         // Compute timestep embedding
         let timestep = timestep.to_dtype(dtype)?;
         let temb = self.time_text_embed.forward(&timestep, dtype)?;
+        debug_tensor("temb", &temb);
 
         // Derive text sequence length from actual encoder_hidden_states shape
         let txt_seq_len = encoder_hidden_states.dim(1)?;
@@ -295,15 +309,29 @@ impl QwenImageTransformer2DModel {
 
         // Compute RoPE frequencies
         let image_rotary_emb = self.pos_embed.forward(img_shapes, txt_seq_lens)?;
+        debug_tensor("rope_img_freqs", &image_rotary_emb.0);
+        debug_tensor("rope_txt_freqs", &image_rotary_emb.1);
 
         // Process through transformer blocks
+        let num_blocks = self.transformer_blocks.len();
         for (idx, block) in self.transformer_blocks.iter().enumerate() {
-            let (enc_out, hid_out) = block.forward(
-                &hidden_states,
-                &encoder_hidden_states,
-                &temb,
-                Some(&image_rotary_emb),
-            )?;
+            // Use debug mode for block 0 to see internal values
+            let (enc_out, hid_out) = if idx == 0 {
+                block.forward_with_debug(
+                    &hidden_states,
+                    &encoder_hidden_states,
+                    &temb,
+                    Some(&image_rotary_emb),
+                    true,  // Enable debug for block 0
+                )?
+            } else {
+                block.forward(
+                    &hidden_states,
+                    &encoder_hidden_states,
+                    &temb,
+                    Some(&image_rotary_emb),
+                )?
+            };
             encoder_hidden_states = enc_out;
             hidden_states = hid_out;
 
@@ -313,13 +341,22 @@ impl QwenImageTransformer2DModel {
                     hidden_states = (&hidden_states + &residuals[idx])?;
                 }
             }
+
+            // Debug at key blocks: 0, 1, 10, 30, last
+            if idx == 0 || idx == 1 || idx == 10 || idx == 30 || idx == num_blocks - 1 {
+                debug_tensor(&format!("after_block_{}", idx), &hidden_states);
+            }
         }
 
         // Final normalization with AdaLN
         let hidden_states = self.norm_out.forward(&hidden_states, &temb)?;
+        debug_tensor("after_norm_out", &hidden_states);
 
         // Project to output: [batch, seq, patch_size² × out_channels]
-        hidden_states.apply(&self.proj_out)
+        let output = hidden_states.apply(&self.proj_out)?;
+        debug_tensor("output", &output);
+
+        Ok(output)
     }
 }
 

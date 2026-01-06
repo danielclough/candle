@@ -136,7 +136,7 @@ pub fn run(
 
     // Load text encoder
     let mut text_model =
-        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device, dtype)?;
+        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
     println!("  Text encoder loaded");
 
     // Encode prompts with vision
@@ -177,14 +177,13 @@ pub fn run(
 
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
-    // Create initial noise and pack latents
+    // Create initial noise and pack latents (F32 to avoid BF16 quantization error)
     let noise_latents = Tensor::randn(
         0f32,
         1f32,
         (1, 16, 1, dims.latent_height, dims.latent_width),
         device,
-    )?
-    .to_dtype(dtype)?;
+    )?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
     let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?;
@@ -230,8 +229,10 @@ pub fn run(
             );
         }
 
-        // Concatenate noise and image latents
-        let latent_model_input = Tensor::cat(&[&latents, &packed_image], 1)?;
+        // Convert F32 latents to BF16 for transformer (weights are BF16)
+        let latents_bf16 = latents.to_dtype(dtype)?;
+        // Concatenate noise and image latents (both BF16)
+        let latent_model_input = Tensor::cat(&[&latents_bf16, &packed_image], 1)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         let pos_pred = transformer.forward(
@@ -260,6 +261,8 @@ pub fn run(
 
         // Unpack and step
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
+        // Convert back to F32 for scheduler arithmetic
+        let unpacked = unpacked.to_dtype(DType::F32)?;
         let unpacked_latents =
             unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
         let stepped = scheduler.step(&unpacked, &unpacked_latents)?;
@@ -278,6 +281,7 @@ pub fn run(
         .tiled_decode
         .unwrap_or_else(|| target_height * target_width > 512 * 512);
 
+    // Note: Both latents and VAE are F32 for numerical precision
     let latents = vae.denormalize_latents(&final_latents)?;
 
     let image = if use_tiled {

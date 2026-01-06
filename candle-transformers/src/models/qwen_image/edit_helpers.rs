@@ -6,7 +6,47 @@
 use candle::{IndexOp, Result, Tensor};
 
 // ============================================================================
-// Prompt Templates
+// Prompt Modes
+// ============================================================================
+
+/// Prompt encoding mode that bundles template and drop_tokens together.
+///
+/// This ensures template/drop_tokens are always correctly paired and makes
+/// the API cleaner by avoiding separate constant arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    /// Text-only pipelines (text-to-image, inpaint, controlnet, img2img).
+    /// No vision tokens, drops 34 tokens from system prefix.
+    TextOnly,
+    /// Edit mode with vision tokens for image editing.
+    /// Drops 64 tokens from system prefix.
+    Edit,
+    /// Layered mode for layer decomposition (same as TextOnly).
+    Layered,
+}
+
+impl PromptMode {
+    /// Get the prompt template for this mode.
+    /// The `{}` placeholder is replaced with the user's prompt text.
+    pub fn template(&self) -> &'static str {
+        match self {
+            Self::TextOnly | Self::Layered => TEXT_ONLY_PROMPT_TEMPLATE,
+            Self::Edit => EDIT_PROMPT_TEMPLATE,
+        }
+    }
+
+    /// Get the number of tokens to drop from the start of embeddings.
+    /// This removes the system instruction prefix.
+    pub fn drop_tokens(&self) -> usize {
+        match self {
+            Self::TextOnly | Self::Layered => 34,
+            Self::Edit => 64,
+        }
+    }
+}
+
+// ============================================================================
+// Prompt Templates (kept for direct access)
 // ============================================================================
 
 /// Prompt template for text-only pipelines (text-to-image, inpaint, controlnet, img2img).
@@ -14,12 +54,7 @@ use candle::{IndexOp, Result, Tensor};
 /// This template is used for pipelines that don't include vision tokens.
 /// Both positive AND negative prompts should use this same template.
 /// The `{}` placeholder is replaced with the user's prompt text.
-pub const TEXT_ONLY_PROMPT_TEMPLATE: &str = "<|im_start|>system\n\
-    Describe the image by detailing the color, shape, size, texture, quantity, text, \
-    spatial relationships of the objects and background:<|im_end|>\n\
-    <|im_start|>user\n\
-    {}<|im_end|>\n\
-    <|im_start|>assistant\n";
+pub const TEXT_ONLY_PROMPT_TEMPLATE: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
 
 /// Number of tokens to drop from the start of text-only pipeline embeddings.
 ///
@@ -30,14 +65,7 @@ pub const TEXT_ONLY_DROP_TOKENS: usize = 34;
 ///
 /// This template instructs the model to analyze the input image and apply
 /// the user's editing instruction while maintaining consistency with the original.
-pub const EDIT_PROMPT_TEMPLATE: &str = "<|im_start|>system\n\
-    Describe the key features of the input image (color, shape, size, texture, objects, background), \
-    then explain how the user's text instruction should alter or modify the image. \
-    Generate a new image that meets the user's requirements while maintaining consistency \
-    with the original input where appropriate.<|im_end|>\n\
-    <|im_start|>user\n\
-    <|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n\
-    <|im_start|>assistant\n";
+pub const EDIT_PROMPT_TEMPLATE: &str = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n";
 
 /// Number of tokens to drop from the start of Edit mode embeddings.
 ///
@@ -49,12 +77,7 @@ pub const EDIT_DROP_TOKENS: usize = 64;
 /// This template is used when encoding the caption for layer decomposition.
 /// Unlike Edit mode, it doesn't include vision tokens as the caption is either
 /// provided by the user or auto-generated.
-pub const LAYERED_PROMPT_TEMPLATE: &str = "<|im_start|>system\n\
-    Describe the image by detailing the color, shape, size, texture, quantity, text, \
-    spatial relationships of the objects and background:<|im_end|>\n\
-    <|im_start|>user\n\
-    {}<|im_end|>\n\
-    <|im_start|>assistant\n";
+pub const LAYERED_PROMPT_TEMPLATE: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
 
 /// Number of tokens to drop from the start of Layered mode embeddings.
 pub const LAYERED_DROP_TOKENS: usize = 34;

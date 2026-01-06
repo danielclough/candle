@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::qwen_image::{
     apply_true_cfg, calculate_dimensions_with_resolution, pack_layered_latents,
-    unpack_layered_latents, Config, LAYERED_DROP_TOKENS, LAYERED_PROMPT_TEMPLATE,
+    unpack_layered_latents, Config, PromptMode,
 };
 
 use crate::common;
@@ -99,16 +99,16 @@ pub fn run(
 
     let tokenizer = common::load_tokenizer(paths.tokenizer_path.as_deref(), &api)?;
     let mut text_model =
-        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device, dtype)?;
+        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
     println!("  Text encoder loaded");
 
     let (pos_embeds, pos_mask) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         &args.prompt,
-        LAYERED_PROMPT_TEMPLATE,
-        LAYERED_DROP_TOKENS,
+        PromptMode::Layered,
         device,
+        dtype,
     )?;
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
@@ -121,9 +121,9 @@ pub fn run(
         &tokenizer,
         &mut text_model,
         neg_prompt,
-        LAYERED_PROMPT_TEMPLATE,
-        LAYERED_DROP_TOKENS,
+        PromptMode::Layered,
         device,
+        dtype,
     )?;
 
     drop(text_model);
@@ -143,13 +143,13 @@ pub fn run(
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
     // Create initial noise for all layers: [batch, layers+1, channels, height, width]
+    // Keep in F32 to avoid BF16 quantization error accumulating across steps
     let noise_latents = Tensor::randn(
         0f32,
         1f32,
         (1, args.layers + 1, 16, dims.latent_height, dims.latent_width),
         device,
-    )?
-    .to_dtype(dtype)?;
+    )?;
 
     // Pack layered latents
     let packed_noise =
@@ -204,8 +204,10 @@ pub fn run(
             );
         }
 
-        // Concatenate layered noise with image condition
-        let latent_model_input = Tensor::cat(&[&latents, &packed_image], 1)?;
+        // Convert F32 latents to BF16 for transformer (weights are BF16)
+        let latents_bf16 = latents.to_dtype(dtype)?;
+        // Concatenate layered noise with image condition (both now BF16)
+        let latent_model_input = Tensor::cat(&[&latents_bf16, &packed_image], 1)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         let pos_pred = transformer.forward(
@@ -240,6 +242,8 @@ pub fn run(
             args.layers,
             16,
         )?;
+        // Convert back to F32 for scheduler arithmetic
+        let unpacked = unpacked.to_dtype(DType::F32)?;
         let unpacked_latents = unpack_layered_latents(
             &latents,
             dims.latent_height,
@@ -277,7 +281,7 @@ pub fn run(
         // Extract single layer: [batch, channels, 1, height, width]
         let layer_latents = final_latents.narrow(2, layer_idx, 1)?;
 
-        // Denormalize and decode
+        // Denormalize and decode (both latents and VAE are F32 for precision)
         let layer_latents = vae.denormalize_latents(&layer_latents)?;
         let decoded = vae.decode(&layer_latents)?;
 

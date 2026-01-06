@@ -6,11 +6,13 @@
 use anyhow::Result;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::qwen_image::{
-    apply_true_cfg, pack_latents, unpack_latents, Config, TEXT_ONLY_DROP_TOKENS,
-    TEXT_ONLY_PROMPT_TEMPLATE,
+    apply_true_cfg, pack_latents, unpack_latents, Config, PromptMode,
 };
 
 use crate::common;
+use crate::debug;
+use crate::debug::DebugContext;
+use crate::mt_box_muller_rng::MtBoxMullerRng;
 
 /// Arguments specific to the generate pipeline.
 pub struct GenerateArgs {
@@ -23,6 +25,7 @@ pub struct GenerateArgs {
     pub init_image: Option<String>,
     pub strength: f64,
     pub output: String,
+    pub seed: Option<u64>,
 }
 
 /// Shared model path arguments.
@@ -33,15 +36,24 @@ pub struct ModelPaths {
     pub tokenizer_path: Option<String>,
 }
 
+/// Run the generate pipeline with optional debug context.
+///
+/// When `debug_ctx` is Some, the pipeline will:
+/// - Save intermediate tensors to disk for comparison
+/// - Optionally substitute PyTorch reference tensors
+/// - Print detailed tensor statistics
 pub fn run(
     args: GenerateArgs,
     paths: ModelPaths,
     device: &Device,
     dtype: DType,
+    mut debug_ctx: Option<&mut DebugContext>,
 ) -> Result<()> {
     common::validate_dimensions(args.height, args.width)?;
 
-    println!("Qwen-Image Text-to-Image");
+    let debug_mode = debug_ctx.is_some();
+
+    println!("Qwen-Image Text-to-Image{}", if debug_mode { " [DEBUG MODE]" } else { "" });
     println!("Device: {:?}, DType: {:?}", device, dtype);
     println!("Generating {}x{} image", args.width, args.height);
     println!("Prompt: {}", args.prompt);
@@ -62,7 +74,6 @@ pub fn run(
         paths.text_encoder_path.as_deref(),
         &api,
         device,
-        dtype,
     )?;
     println!("  Text encoder loaded");
 
@@ -75,11 +86,14 @@ pub fn run(
         &tokenizer,
         &mut text_model,
         &args.prompt,
-        TEXT_ONLY_PROMPT_TEMPLATE,
-        TEXT_ONLY_DROP_TOKENS,
+        PromptMode::TextOnly,
         device,
+        dtype,
     )?;
     println!("  Positive embeddings: {:?}", pos_embeds.dims());
+
+    let pos_embeds = debug::checkpoint(&mut debug_ctx, "prompt_embeds", pos_embeds)?;
+    let pos_mask = debug::checkpoint(&mut debug_ctx, "prompt_mask", pos_mask)?;
 
     // Only encode negative prompt if provided - True CFG requires an explicit negative prompt
     let do_true_cfg = args.true_cfg_scale > 1.0 && !args.negative_prompt.is_empty();
@@ -88,9 +102,9 @@ pub fn run(
             &tokenizer,
             &mut text_model,
             &args.negative_prompt,
-            TEXT_ONLY_PROMPT_TEMPLATE,
-            TEXT_ONLY_DROP_TOKENS,
+            PromptMode::TextOnly,
             device,
+            dtype,
         )?;
         println!("  Negative embeddings: {:?}", neg_embeds.dims());
         Some((neg_embeds, neg_mask))
@@ -141,16 +155,28 @@ pub fn run(
             device,
             dtype,
         )?
+    } else if let Some(seed) = args.seed {
+        // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
+        // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
+        let mut rng = MtBoxMullerRng::new(seed);
+        rng.randn(
+            &[1, 16, 1, dims.latent_height, dims.latent_width],
+            device,
+            DType::F32,
+        )?
     } else {
+        // Use Candle's default RNG (not reproducible across frameworks)
+        // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
         Tensor::randn(
             0f32,
             1f32,
             (1, 16, 1, dims.latent_height, dims.latent_width),
             device,
         )?
-        .to_dtype(dtype)?
     };
     println!("  Initial latents shape: {:?}", latents.dims());
+
+    let latents = debug::checkpoint(&mut debug_ctx, "initial_latents", latents)?;
 
     // =========================================================================
     // Stage 4: Load transformer and run denoising loop
@@ -193,6 +219,16 @@ pub fn run(
         let packed = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
+        // Debug checkpoint: step 0 packed latents (PyTorch ref name differs)
+        let packed = if step_idx == 0 {
+            debug::checkpoint_ref(&mut debug_ctx, "packed_latents_step0", "initial_latents_packed", packed)?
+        } else {
+            packed
+        };
+
+        // Convert F32 latents to BF16 for transformer (weights are BF16)
+        let packed = packed.to_dtype(dtype)?;
+
         let noise_pred =
             transformer.forward(&packed, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens)?;
 
@@ -205,24 +241,51 @@ pub fn run(
             noise_pred
         };
 
+        let noise_pred = if step_idx == 0 {
+            debug::checkpoint(&mut debug_ctx, "noise_pred_step0", noise_pred)?
+        } else {
+            noise_pred
+        };
+
         let unpacked = unpack_latents(&noise_pred, dims.latent_height, dims.latent_width, 16)?;
+        // Convert noise prediction back to F32 for scheduler arithmetic
+        let unpacked = unpacked.to_dtype(DType::F32)?;
 
         latents = scheduler.step(&unpacked, &latents)?;
+
+        if step_idx == 0 {
+            latents = debug::checkpoint(&mut debug_ctx, "latents_after_step0", latents)?;
+        }
     }
 
     drop(transformer);
     println!("  Transformer freed");
+
+    let latents = debug::checkpoint(&mut debug_ctx, "final_latents", latents)?;
 
     // =========================================================================
     // Stage 5: VAE decode and save
     // =========================================================================
     println!("\n[5/5] Decoding latents...");
 
-    let latents = vae.denormalize_latents(&latents)?;
-    let image = vae.decode(&latents)?;
+    let denormalized = vae.denormalize_latents(&latents)?;
 
-    common::postprocess_and_save(&image, &args.output)?;
+    let denormalized = debug::checkpoint(&mut debug_ctx, "denormalized_latents", denormalized)?;
+
+    // Use decode_image for single-frame output (matches PyTorch: vae.decode(z)[:, :, 0])
+    // Note: Both latents and VAE are F32 for numerical precision
+    let image = vae.decode_image(&denormalized)?;
+
+    let image = debug::checkpoint(&mut debug_ctx, "decoded_image", image)?;
+
+    common::postprocess_and_save_4d(&image, &args.output)?;
     println!("\nImage saved to: {}", args.output);
+
+    // Debug summary
+    if debug_mode {
+        println!("\n[DEBUG] Tensor comparison complete.");
+        println!("[DEBUG] Rust tensors saved to: debug_tensors/rust/");
+    }
 
     Ok(())
 }
@@ -246,13 +309,13 @@ fn create_img2img_latents(
     let dist = vae.encode(&init_image)?;
     let encoded_latents = vae.normalize_latents(&dist.mode().clone())?;
 
+    // Keep noise in F32 to avoid BF16 quantization error
     let noise = Tensor::randn(
         0f32,
         1f32,
         (1, 16, 1, dims.latent_height, dims.latent_width),
         device,
-    )?
-    .to_dtype(dtype)?;
+    )?;
 
     let sigmas = scheduler.sigmas();
     let start_sigma = sigmas[start_step];

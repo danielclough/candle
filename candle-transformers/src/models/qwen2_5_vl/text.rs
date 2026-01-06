@@ -1236,6 +1236,43 @@ impl Qwen25VLTextModel {
         }
     }
 
+    /// Debug helper: Check tensor for NaN/Inf and print statistics.
+    fn check_tensor_health(name: &str, tensor: &Tensor) -> Result<bool> {
+        let t_f32 = tensor.to_dtype(DType::F32)?;
+        let vec: Vec<f32> = t_f32.flatten_all()?.to_vec1()?;
+        let nan_count = vec.iter().filter(|x| x.is_nan()).count();
+        let inf_count = vec.iter().filter(|x| x.is_infinite()).count();
+
+        if nan_count > 0 || inf_count > 0 {
+            eprintln!(
+                "[DEBUG] ❌ {}: shape={:?}, {} NaN, {} Inf (out of {})",
+                name,
+                tensor.dims(),
+                nan_count,
+                inf_count,
+                vec.len()
+            );
+            return Ok(false);
+        }
+
+        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
+        let variance =
+            vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+        let std = variance.sqrt();
+        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "[DEBUG] ✓ {}: shape={:?}, mean={:.4}, std={:.4}, min={:.4}, max={:.4}",
+            name,
+            tensor.dims(),
+            mean,
+            std,
+            min,
+            max
+        );
+        Ok(true)
+    }
+
     /// Forward pass with vision embeddings, returning hidden states for diffusion.
     ///
     /// This is used by Qwen-Image Edit and Layered pipelines for encoding prompts
@@ -1332,16 +1369,20 @@ impl Qwen25VLTextModel {
         let attention_mask = match (causal_mask, attention_mask) {
             (Some(causal), Some(mask)) => {
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
-                let mask = mask.to_dtype(causal.dtype())?;
-                let mask = ((1.0 - mask)? * f32::NEG_INFINITY as f64)?;
+                // IMPORTANT: Cannot use (1-mask)*-inf because 0*-inf = NaN in IEEE 754!
+                // Use a large finite negative instead (Metal doesn't support where_cond)
+                let mask = mask.to_dtype(DType::F32)?;
+                let mask = ((1.0 - mask)? * -1e9)?.to_dtype(causal.dtype())?;
                 let mask = mask.broadcast_as(causal.dims())?;
                 Some((&causal + &mask)?)
             }
             (Some(causal), None) => Some(causal),
             (None, Some(mask)) => {
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
-                let mask = mask.to_dtype(self.dtype)?;
-                Some(((1.0 - mask)? * f32::NEG_INFINITY as f64)?)
+                // IMPORTANT: Cannot use (1-mask)*-inf because 0*-inf = NaN in IEEE 754!
+                // Use a large finite negative instead (Metal doesn't support where_cond)
+                let mask = mask.to_dtype(DType::F32)?;
+                Some(((1.0 - mask)? * -1e9)?.to_dtype(self.dtype)?)
             }
             (None, None) => None,
         };
@@ -1380,10 +1421,16 @@ impl Qwen25VLTextModel {
         // Clear KV cache to ensure fresh forward pass (no stale state from previous calls)
         self.clear_kv_cache();
 
+        let debug_mode = std::env::var("QWEN_DEBUG").is_ok();
         let (b_sz, seq_len) = input_ids.dims2()?;
 
         // Get token embeddings
         let mut hidden_states = self.embed_tokens(input_ids)?;
+
+        // Debug: Check embeddings for NaN
+        if debug_mode {
+            Self::check_tensor_health("embed_tokens output", &hidden_states)?;
+        }
 
         // Create simple sequential position IDs: [3, batch, seq_len]
         // For text-only, all three M-RoPE dimensions use the same sequential positions
@@ -1402,31 +1449,79 @@ impl Qwen25VLTextModel {
         // Combine with provided attention mask if any
         let attention_mask = match (causal_mask, attention_mask) {
             (Some(causal), Some(mask)) => {
+                // Debug: Check input mask before conversion
+                if debug_mode {
+                    Self::check_tensor_health("input_attention_mask (before conversion)", mask)?;
+                }
+
                 // Expand mask to match causal mask shape: [batch, 1, 1, seq_len]
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
-                // Convert 0/1 mask to -inf/0 additive mask
+                // Convert 0/1 mask to large_negative/0 additive mask
+                // IMPORTANT: Cannot use (1-mask)*-inf because 0*-inf = NaN in IEEE 754!
+                // Use a large finite negative instead (Metal doesn't support where_cond)
+                let mask = mask.to_dtype(DType::F32)?;
+                let mask = ((1.0 - mask)? * -1e9)?;
                 let mask = mask.to_dtype(causal.dtype())?;
-                let mask = ((1.0 - mask)? * f32::NEG_INFINITY as f64)?;
+
+                // Debug: Check mask after conversion
+                if debug_mode {
+                    Self::check_tensor_health("attention_mask (after -1e9 conversion)", &mask)?;
+                }
+
                 let mask = mask.broadcast_as(causal.dims())?;
-                Some((&causal + &mask)?)
+                let combined = (&causal + &mask)?;
+
+                // Debug: Check final combined mask
+                if debug_mode {
+                    Self::check_tensor_health("attention_mask (combined)", &combined)?;
+                }
+
+                Some(combined)
             }
-            (Some(causal), None) => Some(causal),
+            (Some(causal), None) => {
+                if debug_mode {
+                    Self::check_tensor_health("causal_mask", &causal)?;
+                }
+                Some(causal)
+            }
             (None, Some(mask)) => {
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
-                let mask = mask.to_dtype(self.dtype)?;
-                Some(((1.0 - mask)? * f32::NEG_INFINITY as f64)?)
+                // IMPORTANT: Cannot use (1-mask)*-inf because 0*-inf = NaN in IEEE 754!
+                // Use a large finite negative instead (Metal doesn't support where_cond)
+                let mask = mask.to_dtype(DType::F32)?;
+                let converted = ((1.0 - mask)? * -1e9)?.to_dtype(self.dtype)?;
+                if debug_mode {
+                    Self::check_tensor_health("attention_mask (no causal)", &converted)?;
+                }
+                Some(converted)
             }
             (None, None) => None,
         };
 
         // Forward through all transformer layers
-        for layer in self.layers.iter_mut() {
+        let num_layers = self.layers.len();
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+
+            // Debug: Check first 3 layers, then every 10th layer, and last layer
+            if debug_mode && (layer_idx < 3 || layer_idx % 10 == 0 || layer_idx == num_layers - 1) {
+                let healthy =
+                    Self::check_tensor_health(&format!("layer {} output", layer_idx), &hidden_states)?;
+                if !healthy {
+                    eprintln!("[DEBUG] ⚠️  NaN first detected at layer {}!", layer_idx);
+                    // Continue to see the pattern, but we found the culprit
+                }
+            }
         }
 
-        // Return hidden states WITHOUT final layer norm
-        // This matches HuggingFace's output_hidden_states behavior where hidden_states[-1]
-        // is the raw output of the last transformer layer, not normalized
-        Ok(hidden_states)
+        // Apply final layer norm - HuggingFace applies norm BEFORE adding to all_hidden_states,
+        // so hidden_states[-1] includes the final layer norm (see modeling_qwen2_5_vl.py:946-950)
+        let final_hidden_states = hidden_states.apply(&self.norm)?;
+
+        if debug_mode {
+            Self::check_tensor_health("final_norm output", &final_hidden_states)?;
+        }
+
+        Ok(final_hidden_states)
     }
 }

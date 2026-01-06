@@ -25,6 +25,7 @@ use candle::{Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 
 use super::config::VaeConfig;
+use super::debug::debug_vae_tensor;
 
 /// Cache size for temporal causality (number of frames to cache).
 const CACHE_T: usize = 2;
@@ -201,12 +202,14 @@ impl QwenImageRMSNorm {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // L2 normalize along channel dimension
+        // Matches PyTorch's F.normalize: v / max(||v||, eps)
         let dim = if self.channel_first { 1 } else { x.dims().len() - 1 };
-        let eps = 1e-6;
+        let eps = 1e-12; // Match PyTorch's F.normalize default
 
         // Compute L2 norm: sqrt(sum(x^2, dim=dim, keepdim=True))
         let norm = x.sqr()?.sum_keepdim(dim)?.sqrt()?;
-        let norm = (norm + eps)?;
+        // Use max(norm, eps) instead of norm + eps to match F.normalize behavior
+        let norm = norm.clamp(eps, f64::MAX)?;
         let normalized = x.broadcast_div(&norm)?;
 
         // Broadcast gamma appropriately
@@ -335,9 +338,11 @@ impl QwenImageAttentionBlock {
         // Reshape to [batch*time, channels, height, width]
         let x = x.permute([0, 2, 1, 3, 4])?.reshape((b * t, c, h, w))?;
         let x = self.norm.forward(&x)?;
+        debug_vae_tensor("attn after norm", &x);
 
         // Compute QKV
         let qkv = self.to_qkv.forward(&x)?;
+        debug_vae_tensor("attn qkv", &qkv);
 
         // Reshape for attention: [batch*time, 1, h*w, 3*dim] -> split to q, k, v
         let qkv = qkv.reshape((b * t, 1, c * 3, h * w))?;
@@ -345,12 +350,22 @@ impl QwenImageAttentionBlock {
 
         let chunks = qkv.chunk(3, D::Minus1)?;
         let (q, k, v) = (&chunks[0], &chunks[1], &chunks[2]);
+        debug_vae_tensor("attn Q", q);
+        debug_vae_tensor("attn K", k);
+        debug_vae_tensor("attn V", v);
 
         // Scaled dot-product attention
+        // NOTE: k.t() does a FULL transpose (reverses all dims), which is wrong for 4D tensors!
+        // We need to transpose only the last two dimensions: [B*T, 1, H*W, C] -> [B*T, 1, C, H*W]
         let scale = (self.dim as f64).sqrt();
-        let attn = (q.matmul(&k.t()?)? / scale)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        debug_vae_tensor("attn K^T", &k_t);
+        let attn = (q.matmul(&k_t)? / scale)?;
+        debug_vae_tensor("attn weights (pre-softmax)", &attn);
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        debug_vae_tensor("attn weights (post-softmax)", &attn);
         let out = attn.matmul(v)?;
+        debug_vae_tensor("attn output", &out);
 
         // Reshape back
         let out = out.squeeze(1)?.permute([0, 2, 1])?; // [batch*time, dim, h*w]
@@ -358,6 +373,7 @@ impl QwenImageAttentionBlock {
 
         // Output projection
         let out = self.proj.forward(&out)?;
+        debug_vae_tensor("attn proj output", &out);
 
         // Reshape back to 5D and add residual
         let out = out.reshape((b, t, c, h, w))?.permute([0, 2, 1, 3, 4])?;
@@ -661,20 +677,28 @@ impl Upsample3D {
         Ok(Self { upsample_2d, time_conv })
     }
 
-    fn forward(&self, x: &Tensor, _cache: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<Tensor> {
         let (b, c, t, h, w) = x.dims5()?;
 
-        // Time upsample: apply time_conv then interleave
-        let x_time = self.time_conv.forward(x, None)?;
+        // Temporal upsampling is ONLY done when using caching (frame-by-frame processing)
+        // When cache is None, we skip temporal upsample and only do spatial upsample
+        // This matches PyTorch's behavior in QwenImageResample.forward()
+        let x = if cache.is_some() {
+            // Time upsample: apply time_conv then interleave
+            let x_time = self.time_conv.forward(x, cache)?;
 
-        // x_time is [b, 2*c, t, h, w] - split and interleave
-        let x_time = x_time.reshape((b, 2, c, t, h, w))?;
-        let x0 = x_time.i((.., 0, .., .., .., ..))?;
-        let x1 = x_time.i((.., 1, .., .., .., ..))?;
+            // x_time is [b, 2*c, t, h, w] - split and interleave
+            let x_time = x_time.reshape((b, 2, c, t, h, w))?;
+            let x0 = x_time.i((.., 0, .., .., .., ..))?;
+            let x1 = x_time.i((.., 1, .., .., .., ..))?;
 
-        // Interleave: [b, c, t, h, w] + [b, c, t, h, w] -> [b, c, 2*t, h, w]
-        let x = Tensor::stack(&[x0, x1], 3)?; // [b, c, t, 2, h, w]
-        let x = x.reshape((b, c, t * 2, h, w))?;
+            // Interleave: [b, c, t, h, w] + [b, c, t, h, w] -> [b, c, 2*t, h, w]
+            let x = Tensor::stack(&[x0, x1], 3)?; // [b, c, t, 2, h, w]
+            x.reshape((b, c, t * 2, h, w))?
+        } else {
+            // No caching - skip temporal upsample entirely
+            x.clone()
+        };
 
         // Spatial upsample
         self.upsample_2d.forward(&x)
@@ -769,24 +793,33 @@ impl QwenImageDecoder3d {
 
     pub fn forward(&self, z: &Tensor) -> Result<Tensor> {
         let mut x = self.conv_in.forward(z, None)?;
+        debug_vae_tensor("after conv_in", &x);
 
         x = self.mid_block.forward(&x, None, &mut 0)?;
+        debug_vae_tensor("after mid_block", &x);
 
-        for block in &self.up_blocks {
-            for resnet in &block.resnets {
+        for (i, block) in self.up_blocks.iter().enumerate() {
+            for (j, resnet) in block.resnets.iter().enumerate() {
                 x = resnet.forward(&x, None, &mut 0)?;
+                if j == 0 {
+                    debug_vae_tensor(&format!("after up_block[{}].resnet[0]", i), &x);
+                }
             }
             if let Some(upsampler) = &block.upsampler {
                 x = match upsampler {
                     Upsample::Upsample2D(up) => up.forward(&x)?,
                     Upsample::Upsample3D(up) => up.forward(&x, None)?,
                 };
+                debug_vae_tensor(&format!("after up_block[{}].upsample", i), &x);
             }
         }
 
         x = self.norm_out.forward(&x)?;
+        debug_vae_tensor("after norm_out", &x);
+
         x = x.silu()?;
         let x = self.conv_out.forward(&x, None)?;
+        debug_vae_tensor("after conv_out (pre-clamp)", &x);
 
         // Clamp output to [-1, 1]
         x.clamp(-1.0, 1.0)
@@ -894,6 +927,17 @@ impl AutoencoderKLQwenImage {
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         let z = self.post_quant_conv.forward(z, None)?;
         self.decoder.forward(&z)
+    }
+
+    /// Decode latents to a single image frame.
+    ///
+    /// For single-frame image generation, extracts frame 0 from the temporal dimension.
+    /// This matches the PyTorch pipeline behavior: `vae.decode(z)[0][:, :, 0]`
+    pub fn decode_image(&self, z: &Tensor) -> Result<Tensor> {
+        let decoded = self.decode(z)?;
+        // Shape: [B, C, T, H, W] -> [B, C, H, W] by taking first frame
+        let (b, c, _t, h, w) = decoded.dims5()?;
+        decoded.i((.., .., 0, .., ..))?.reshape((b, c, h, w))
     }
 
     /// Normalize latents before transformer (training normalization).

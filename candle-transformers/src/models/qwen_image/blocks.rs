@@ -12,6 +12,7 @@
 use candle::{DType, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 
+use super::debug::debug_tensor;
 use super::rope::apply_rotary_emb_qwen;
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -41,6 +42,15 @@ impl ModulationOut {
     /// Apply gating: gate * x
     pub fn gate(&self, xs: &Tensor) -> Result<Tensor> {
         self.gate.broadcast_mul(xs)
+    }
+
+    /// Convert modulation parameters to F32 for mixed precision
+    pub fn to_f32(&self) -> Result<Self> {
+        Ok(Self {
+            shift: self.shift.to_dtype(DType::F32)?,
+            scale: self.scale.to_dtype(DType::F32)?,
+            gate: self.gate.to_dtype(DType::F32)?,
+        })
     }
 }
 
@@ -174,26 +184,37 @@ impl AddedQkNorm {
 }
 
 /// Scaled dot-product attention.
+///
+/// Input shapes: Q, K, V are [batch, heads, seq, head_dim]
 fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-    let dim = q.dim(D::Minus1)?;
-    let scale_factor = 1.0 / (dim as f64).sqrt();
+    let head_dim = q.dim(D::Minus1)?;
+    let scale_factor = 1.0 / (head_dim as f64).sqrt();
 
-    // Flatten batch dimensions for efficient computation
-    let mut batch_dims = q.dims().to_vec();
-    batch_dims.pop();
-    batch_dims.pop();
-    let q = q.flatten_to(batch_dims.len() - 1)?;
-    let k = k.flatten_to(batch_dims.len() - 1)?;
-    let v = v.flatten_to(batch_dims.len() - 1)?;
+    // Upcast to F32 for numerical stability
+    let q = q.to_dtype(DType::F32)?;
+    let k = k.to_dtype(DType::F32)?;
+    let v = v.to_dtype(DType::F32)?;
 
-    // Attention: softmax(Q @ K^T / sqrt(d)) @ V
-    let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    let attn_scores = candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
+    let k_t = k.transpose(D::Minus2, D::Minus1)?;
+    let attn_logits = q.matmul(&k_t)?;
+    let attn_weights = (&attn_logits * scale_factor)?;
 
-    // Restore original batch dimensions
-    batch_dims.push(attn_scores.dim(D::Minus2)?);
-    batch_dims.push(attn_scores.dim(D::Minus1)?);
-    attn_scores.reshape(batch_dims)
+    // Debug: compute std as sqrt(var)
+    let logits_flat = attn_logits.flatten_all()?;
+    let logits_mean = logits_flat.mean_all()?.to_scalar::<f32>()?;
+    let logits_var = logits_flat.broadcast_sub(&logits_flat.mean_all()?)?.sqr()?.mean_all()?.to_scalar::<f32>()?;
+    eprintln!("[SDPA] logits: mean={:.4}, std={:.4}", logits_mean, logits_var.sqrt());
+
+    let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+
+    // Entropy: lower = more peaked attention
+    let log_probs = attn_probs.clamp(1e-10, 1.0)?.log()?;
+    let entropy = ((&attn_probs * &log_probs)? * -1.0)?.sum(D::Minus1)?.mean_all()?;
+    eprintln!("[SDPA] entropy={:.4}", entropy.to_scalar::<f32>()?);
+
+    let attn_output = attn_probs.matmul(&v)?;
+
+    Ok(attn_output)
 }
 
 /// Dual-stream attention for Qwen-Image.
@@ -281,6 +302,26 @@ impl QwenDoubleStreamAttention {
         encoder_hidden_states: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, false)
+    }
+
+    /// Forward pass with debug logging for attention internals.
+    pub fn forward_with_debug(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, true)
+    }
+
+    fn forward_impl(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        debug: bool,
+    ) -> Result<(Tensor, Tensor)> {
         let (b_sz, img_seq, _) = hidden_states.dims3()?;
         let txt_seq = encoder_hidden_states.dim(1)?;
 
@@ -289,10 +330,22 @@ impl QwenDoubleStreamAttention {
         let img_k = hidden_states.apply(&self.to_k)?;
         let img_v = hidden_states.apply(&self.to_v)?;
 
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] img_q_proj", &img_q);
+            debug_tensor("[BLOCK0.ATTN] img_k_proj", &img_k);
+            debug_tensor("[BLOCK0.ATTN] img_v_proj", &img_v);
+        }
+
         // Compute QKV for text stream
         let txt_q = encoder_hidden_states.apply(&self.add_q_proj)?;
         let txt_k = encoder_hidden_states.apply(&self.add_k_proj)?;
         let txt_v = encoder_hidden_states.apply(&self.add_v_proj)?;
+
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] txt_q_proj", &txt_q);
+            debug_tensor("[BLOCK0.ATTN] txt_k_proj", &txt_k);
+            debug_tensor("[BLOCK0.ATTN] txt_v_proj", &txt_v);
+        }
 
         // Reshape for multi-head attention: [batch, seq, heads, head_dim]
         let img_q = img_q.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
@@ -309,6 +362,13 @@ impl QwenDoubleStreamAttention {
         let txt_q = self.txt_norm.forward_q(&txt_q)?;
         let txt_k = self.txt_norm.forward_k(&txt_k)?;
 
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] img_q_after_norm", &img_q);
+            debug_tensor("[BLOCK0.ATTN] img_k_after_norm", &img_k);
+            debug_tensor("[BLOCK0.ATTN] txt_q_after_norm", &txt_q);
+            debug_tensor("[BLOCK0.ATTN] txt_k_after_norm", &txt_k);
+        }
+
         // Apply RoPE
         let (img_q, img_k, txt_q, txt_k) = if let Some((img_freqs, txt_freqs)) = image_rotary_emb {
             let img_q = apply_rotary_emb_qwen(&img_q, img_freqs)?;
@@ -320,23 +380,38 @@ impl QwenDoubleStreamAttention {
             (img_q, img_k, txt_q, txt_k)
         };
 
-        // Transpose for attention: [batch, heads, seq, head_dim]
-        let img_q = img_q.transpose(1, 2)?;
-        let img_k = img_k.transpose(1, 2)?;
-        let img_v = img_v.transpose(1, 2)?;
-        let txt_q = txt_q.transpose(1, 2)?;
-        let txt_k = txt_k.transpose(1, 2)?;
-        let txt_v = txt_v.transpose(1, 2)?;
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] img_q_after_rope", &img_q);
+            debug_tensor("[BLOCK0.ATTN] img_k_after_rope", &img_k);
+            debug_tensor("[BLOCK0.ATTN] txt_q_after_rope", &txt_q);
+            debug_tensor("[BLOCK0.ATTN] txt_k_after_rope", &txt_k);
+        }
 
-        // Concatenate for joint attention: order is [text, image]
-        let joint_q = Tensor::cat(&[&txt_q, &img_q], 2)?;
-        let joint_k = Tensor::cat(&[&txt_k, &img_k], 2)?;
-        let joint_v = Tensor::cat(&[&txt_v, &img_v], 2)?;
+        // Concatenate for joint attention in [B, S, H, D] format: order is [text, image]
+        // This matches Python which concatenates before permuting
+        let joint_q = Tensor::cat(&[&txt_q, &img_q], 1)?;
+        let joint_k = Tensor::cat(&[&txt_k, &img_k], 1)?;
+        let joint_v = Tensor::cat(&[&txt_v, &img_v], 1)?;
+
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] joint_q", &joint_q);
+            debug_tensor("[BLOCK0.ATTN] joint_k", &joint_k);
+            debug_tensor("[BLOCK0.ATTN] joint_v", &joint_v);
+        }
+
+        // Transpose for attention: [B, S, H, D] -> [B, H, S, D]
+        let joint_q = joint_q.transpose(1, 2)?;
+        let joint_k = joint_k.transpose(1, 2)?;
+        let joint_v = joint_v.transpose(1, 2)?;
 
         // Compute attention
         let joint_attn = scaled_dot_product_attention(&joint_q, &joint_k, &joint_v)?;
 
-        // Reshape: [batch, heads, seq, head_dim] -> [batch, seq, heads * head_dim]
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] joint_attn_output", &joint_attn);
+        }
+
+        // Transpose back and flatten: [B, H, S, D] -> [B, S, H, D] -> [B, S, H*D]
         let joint_attn = joint_attn.transpose(1, 2)?.flatten_from(2)?;
         let joint_attn = joint_attn.to_dtype(hidden_states.dtype())?;
 
@@ -344,9 +419,18 @@ impl QwenDoubleStreamAttention {
         let txt_attn = joint_attn.narrow(1, 0, txt_seq)?;
         let img_attn = joint_attn.narrow(1, txt_seq, img_seq)?;
 
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] img_attn_pre_proj", &img_attn);
+        }
+
         // Output projections
         let img_out = img_attn.apply(&self.to_out)?;
         let txt_out = txt_attn.apply(&self.to_add_out)?;
+
+        if debug {
+            debug_tensor("[BLOCK0.ATTN] img_out_proj", &img_out);
+            debug_tensor("[BLOCK0.ATTN] txt_out_proj", &txt_out);
+        }
 
         Ok((img_out, txt_out))
     }
@@ -440,28 +524,92 @@ impl QwenImageTransformerBlock {
         temb: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_with_debug(hidden_states, encoder_hidden_states, temb, image_rotary_emb, false)
+    }
+
+    /// Forward pass with optional debug logging (for block 0 analysis).
+    pub fn forward_with_debug(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        debug: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let orig_dtype = hidden_states.dtype();
+
         // Get modulation parameters for both streams
         let (img_mod1, img_mod2) = self.img_mod.forward(temb)?;
         let (txt_mod1, txt_mod2) = self.txt_mod.forward(temb)?;
+
+        if debug {
+            debug_tensor("[BLOCK0] img_mod1.shift", &img_mod1.shift);
+            debug_tensor("[BLOCK0] img_mod1.scale", &img_mod1.scale);
+            debug_tensor("[BLOCK0] img_mod1.gate", &img_mod1.gate);
+            debug_tensor("[BLOCK0] txt_mod1.shift", &txt_mod1.shift);
+            debug_tensor("[BLOCK0] txt_mod1.scale", &txt_mod1.scale);
+            debug_tensor("[BLOCK0] txt_mod1.gate", &txt_mod1.gate);
+        }
 
         // === Attention phase ===
 
         // Image: norm1 + modulate
         let img_normed = hidden_states.apply(&self.img_norm1)?;
+        if debug {
+            debug_tensor("[BLOCK0] img_norm1_output", &img_normed);
+        }
         let img_modulated = img_mod1.scale_shift(&img_normed)?;
+        if debug {
+            debug_tensor("[BLOCK0] img_modulated", &img_modulated);
+        }
 
         // Text: norm1 + modulate
         let txt_normed = encoder_hidden_states.apply(&self.txt_norm1)?;
+        if debug {
+            debug_tensor("[BLOCK0] txt_norm1_output", &txt_normed);
+        }
         let txt_modulated = txt_mod1.scale_shift(&txt_normed)?;
+        if debug {
+            debug_tensor("[BLOCK0] txt_modulated", &txt_modulated);
+        }
 
         // Joint attention
-        let (img_attn_out, txt_attn_out) =
-            self.attn
-                .forward(&img_modulated, &txt_modulated, image_rotary_emb)?;
+        let (img_attn_out, txt_attn_out) = if debug {
+            self.attn.forward_with_debug(&img_modulated, &txt_modulated, image_rotary_emb)?
+        } else {
+            self.attn.forward(&img_modulated, &txt_modulated, image_rotary_emb)?
+        };
 
-        // Gated residual
-        let hidden_states = (hidden_states + img_mod1.gate(&img_attn_out)?)?;
-        let encoder_hidden_states = (encoder_hidden_states + txt_mod1.gate(&txt_attn_out)?)?;
+        if debug {
+            debug_tensor("[BLOCK0] img_attn_output", &img_attn_out);
+            debug_tensor("[BLOCK0] txt_attn_output", &txt_attn_out);
+        }
+
+        // === F32 ACCUMULATION FOR RESIDUAL ADDITIONS ===
+        // The MLP outputs have std > 2000, and accumulated values reach ±2.3M
+        // This exceeds BF16's max of ±65536, so we MUST compute residuals in F32
+        // then cast back to original dtype.
+
+        // Gated residual for attention
+        let gated_img_attn = img_mod1.gate(&img_attn_out)?;
+        let gated_txt_attn = txt_mod1.gate(&txt_attn_out)?;
+        if debug {
+            debug_tensor("[BLOCK0] gated_img_attn", &gated_img_attn);
+            debug_tensor("[BLOCK0] gated_txt_attn", &gated_txt_attn);
+        }
+
+        // Residual add in F32 to avoid overflow, then cast back
+        let hidden_states = (hidden_states.to_dtype(DType::F32)?
+            + gated_img_attn.to_dtype(DType::F32)?)?
+            .to_dtype(orig_dtype)?;
+        let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
+            + gated_txt_attn.to_dtype(DType::F32)?)?
+            .to_dtype(orig_dtype)?;
+
+        if debug {
+            debug_tensor("[BLOCK0] after_attn_residual_img", &hidden_states);
+            debug_tensor("[BLOCK0] after_attn_residual_txt", &encoder_hidden_states);
+        }
 
         // === MLP phase ===
 
@@ -469,23 +617,29 @@ impl QwenImageTransformerBlock {
         let img_normed2 = hidden_states.apply(&self.img_norm2)?;
         let img_modulated2 = img_mod2.scale_shift(&img_normed2)?;
         let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
-        let hidden_states = (&hidden_states + img_mod2.gate(&img_mlp_out)?)?;
+        if debug {
+            debug_tensor("[BLOCK0] img_mlp_output", &img_mlp_out);
+        }
+        let gated_img_mlp = img_mod2.gate(&img_mlp_out)?;
+
+        // Residual add in F32
+        let hidden_states = (hidden_states.to_dtype(DType::F32)?
+            + gated_img_mlp.to_dtype(DType::F32)?)?
+            .to_dtype(orig_dtype)?;
 
         // Text: norm2 + modulate + MLP + gated residual
         let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
         let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
         let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;
-        let encoder_hidden_states = (&encoder_hidden_states + txt_mod2.gate(&txt_mlp_out)?)?;
+        if debug {
+            debug_tensor("[BLOCK0] txt_mlp_output", &txt_mlp_out);
+        }
+        let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
 
-        // Clip for fp16 stability
-        let (hidden_states, encoder_hidden_states) =
-            if hidden_states.dtype() == DType::F16 || hidden_states.dtype() == DType::BF16 {
-                let hidden_states = hidden_states.clamp(-65504f32, 65504f32)?;
-                let encoder_hidden_states = encoder_hidden_states.clamp(-65504f32, 65504f32)?;
-                (hidden_states, encoder_hidden_states)
-            } else {
-                (hidden_states, encoder_hidden_states)
-            };
+        // Residual add in F32
+        let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
+            + gated_txt_mlp.to_dtype(DType::F32)?)?
+            .to_dtype(orig_dtype)?;
 
         Ok((encoder_hidden_states, hidden_states))
     }

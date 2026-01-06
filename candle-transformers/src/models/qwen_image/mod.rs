@@ -55,6 +55,7 @@
 
 pub mod config;
 pub mod controlnet;
+pub mod debug;
 pub mod edit_helpers;
 pub mod pipeline;
 pub mod rope;
@@ -68,7 +69,7 @@ pub use config::{Config, SchedulerConfig, VaeConfig};
 pub use controlnet::{ControlNetConfig, ControlNetOutput, QwenImageControlNetModel};
 pub use edit_helpers::{
     calculate_dimensions, calculate_dimensions_with_resolution, extract_and_pad_embeddings,
-    pack_layered_latents, unpack_layered_latents, CAPTION_PROMPT_CN, CAPTION_PROMPT_EN,
+    pack_layered_latents, unpack_layered_latents, PromptMode, CAPTION_PROMPT_CN, CAPTION_PROMPT_EN,
     EDIT_DROP_TOKENS, EDIT_PROMPT_TEMPLATE, LAYERED_DROP_TOKENS, LAYERED_PROMPT_TEMPLATE,
     TEXT_ONLY_DROP_TOKENS, TEXT_ONLY_PROMPT_TEMPLATE,
 };
