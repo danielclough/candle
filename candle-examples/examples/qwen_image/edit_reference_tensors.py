@@ -164,13 +164,59 @@ def main():
     save_tensor("vae_input", image_tensor, args.output_dir)
     tensor_stats("vae_input", image_tensor)
 
-    # Encode with VAE
+    # Encode with VAE - with intermediate tensor capture
+    print("\n  === VAE Encoder Debug (intermediate tensors) ===")
+
+    def debug_vae_encoder(vae, x):
+        """Run encoder with intermediate tensor capture."""
+        encoder = vae.encoder
+
+        tensor_stats("encoder_input", x)
+        save_tensor("vae_encoder_input", x, args.output_dir)
+
+        # conv_in
+        x = encoder.conv_in(x)
+        tensor_stats("after_conv_in", x)
+        save_tensor("vae_after_conv_in", x, args.output_dir)
+
+        # down_blocks
+        for i, block in enumerate(encoder.down_blocks):
+            x = block(x)
+            tensor_stats(f"after_down_block_{i}", x)
+            save_tensor(f"vae_after_down_block_{i}", x, args.output_dir)
+
+        # mid_block
+        x = encoder.mid_block(x)
+        tensor_stats("after_mid_block", x)
+        save_tensor("vae_after_mid_block", x, args.output_dir)
+
+        # norm_out + activation + conv_out
+        x = encoder.norm_out(x)
+        tensor_stats("after_norm_out", x)
+        save_tensor("vae_after_norm_out", x, args.output_dir)
+
+        x = torch.nn.functional.silu(x)
+        tensor_stats("after_silu", x)
+        save_tensor("vae_after_silu", x, args.output_dir)
+
+        x = encoder.conv_out(x)
+        tensor_stats("after_conv_out (encoder output)", x)
+        save_tensor("vae_after_conv_out", x, args.output_dir)
+
+        return x
+
     with torch.no_grad():
-        vae_output = pipe.vae.encode(image_tensor)
-        if hasattr(vae_output, "latent_dist"):
-            image_latents_raw = vae_output.latent_dist.mode()
-        else:
-            image_latents_raw = vae_output.latents
+        # Run encoder with debug
+        encoder_output = debug_vae_encoder(pipe.vae, image_tensor)
+
+        # Run quant_conv
+        h = pipe.vae.quant_conv(encoder_output)
+        tensor_stats("after_quant_conv", h)
+        save_tensor("vae_after_quant_conv", h, args.output_dir)
+
+        # Get latent distribution
+        mean, logvar = torch.chunk(h, 2, dim=1)
+        image_latents_raw = mean  # mode() returns mean
 
     save_tensor("image_latents_raw", image_latents_raw, args.output_dir)
     tensor_stats("image_latents_raw", image_latents_raw)

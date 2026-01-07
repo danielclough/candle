@@ -499,8 +499,18 @@ impl Downsample3D {
     fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<Tensor> {
         // First spatial downsample
         let x = self.conv_2d.forward(x)?;
-        // Then temporal downsample
-        self.time_conv.forward(&x, cache)
+
+        // IMPORTANT: Temporal downsample (time_conv) is ONLY applied when using caching
+        // for frame-by-frame video encoding. For single-image encoding without caching,
+        // we skip time_conv entirely. This matches PyTorch's QwenImageResample behavior:
+        //   if self.mode == "downsample3d":
+        //       if feat_cache is not None:  # <-- only when caching
+        //           x = self.time_conv(...)
+        if cache.is_some() {
+            self.time_conv.forward(&x, cache)
+        } else {
+            Ok(x)
+        }
     }
 }
 
@@ -586,20 +596,29 @@ impl QwenImageEncoder3d {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut x = self.conv_in.forward(x, None)?;
+        debug_vae_tensor("encoder_input", x);
 
-        for block in &self.down_blocks {
+        let mut x = self.conv_in.forward(x, None)?;
+        debug_vae_tensor("after_conv_in", &x);
+
+        for (i, block) in self.down_blocks.iter().enumerate() {
             x = match block {
                 DownBlock::Residual(res) => res.forward(&x, None, &mut 0)?,
                 DownBlock::Downsample2D(down) => down.forward(&x)?,
                 DownBlock::Downsample3D(down) => down.forward(&x, None)?,
             };
+            debug_vae_tensor(&format!("after_down_block_{}", i), &x);
         }
 
         x = self.mid_block.forward(&x, None, &mut 0)?;
+        debug_vae_tensor("after_mid_block", &x);
 
         x = self.norm_out.forward(&x)?;
+        debug_vae_tensor("after_norm_out", &x);
+
         x = x.silu()?;
+        debug_vae_tensor("after_silu", &x);
+
         self.conv_out.forward(&x, None)
     }
 }
