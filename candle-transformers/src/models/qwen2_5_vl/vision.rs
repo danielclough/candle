@@ -16,6 +16,7 @@ use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{rms_norm, Conv2d, Conv2dConfig, Linear, RmsNorm, VarBuilder};
 
 use super::config::VisionConfig;
+use crate::models::qwen_image::debug::debug_tensor;
 
 // ============================================================================
 // Conv3d for temporal patch size = 2
@@ -277,6 +278,7 @@ impl VisionAttention {
         let mut k = qkv.i(1)?.squeeze(0)?;
         let mut v = qkv.i(2)?.squeeze(0)?;
 
+        // RoPE and attention in F32 for numerical precision
         let cos = cos.to_dtype(DType::F32)?;
         let sin = sin.to_dtype(DType::F32)?;
         q = q.to_dtype(DType::F32)?;
@@ -311,6 +313,7 @@ impl VisionAttention {
 
             chunk_out.device().synchronize()?;
             chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
+            // Convert back to input dtype for output projection
             outputs.push(chunk_out.to_dtype(xs.dtype())?);
         }
         let attn_output = Tensor::cat(&outputs, 0)?;
@@ -352,11 +355,25 @@ impl VisionBlock {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        // All operations in original dtype (BF16) to match weights
+        // Only residual additions are done in F32 for numerical precision
         let normed = self.norm1.forward(xs)?;
         let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
-        let xs_att = xs.add(&attn_out)?;
-        let mlp_out = self.mlp.forward(&self.norm2.forward(&xs_att)?)?;
-        xs_att.add(&mlp_out)
+
+        // Residual addition in F32 for precision
+        let xs_att = xs
+            .to_dtype(DType::F32)?
+            .add(&attn_out.to_dtype(DType::F32)?)?
+            .to_dtype(xs.dtype())?;
+
+        let normed2 = self.norm2.forward(&xs_att)?;
+        let mlp_out = self.mlp.forward(&normed2)?;
+
+        // Residual addition in F32 for precision
+        xs_att
+            .to_dtype(DType::F32)?
+            .add(&mlp_out.to_dtype(DType::F32)?)?
+            .to_dtype(xs.dtype())
     }
 }
 
@@ -624,9 +641,11 @@ impl Qwen25VLVisionModel {
         let device = xs.device();
         // Patch embedding (no position embedding - Qwen2.5-VL relies entirely on RoPE)
         let hidden_states = self.patch_embed.forward(xs)?;
+        debug_tensor("vision_after_patch_embed", &hidden_states);
 
         // Compute 2D rotary position embeddings
         let rotary_pos_emb = self.rot_pos_emb(grid_thw, device)?;
+        debug_tensor("vision_rotary_pos_emb", &rotary_pos_emb);
 
         // Get window index for reordering patches into spatial windows
         let (window_index, cu_window_seqlens) = self.get_window_index(grid_thw)?;
@@ -648,6 +667,7 @@ impl Qwen25VLVisionModel {
 
         // Reshape back to (seq_len, hidden_dim)
         hidden_states = hidden_states.reshape((seq_len, hidden_dim))?;
+        debug_tensor("vision_after_window_reorder", &hidden_states);
 
         // Reorder rotary position embeddings similarly
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
@@ -659,6 +679,8 @@ impl Qwen25VLVisionModel {
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
         let cos = emb.cos()?.to_dtype(DType::F32)?;
         let sin = emb.sin()?.to_dtype(DType::F32)?;
+        debug_tensor("vision_cos", &cos);
+        debug_tensor("vision_sin", &sin);
 
         // Build cu_seqlens for full attention (image-level chunking)
         let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
@@ -673,10 +695,16 @@ impl Qwen25VLVisionModel {
                 &cu_window_seqlens // Window attention for other 28 layers
             };
             hidden_states = block.forward(&hidden_states, cu_seqlens_now, &cos, &sin)?;
+            // Debug after key blocks: 0 (first), 7 (first full-attn), 15, 23, 31 (last full-attn)
+            if layer_idx == 0 || layer_idx == 7 || layer_idx == 15 || layer_idx == 23 || layer_idx == 31 {
+                debug_tensor(&format!("vision_after_block_{}", layer_idx), &hidden_states);
+            }
         }
+        debug_tensor("vision_after_all_blocks", &hidden_states);
 
         // Apply merger to get final embeddings
         let hidden_states = self.merger.forward(&hidden_states)?;
+        debug_tensor("vision_after_merger", &hidden_states);
 
         // Reverse the window reordering to restore original patch order
         // Compute argsort of window_index to get reverse indices
@@ -685,6 +713,8 @@ impl Qwen25VLVisionModel {
         let reverse_index_tensor =
             Tensor::from_vec(reverse_indices, (window_index.len(),), device)?;
 
-        hidden_states.index_select(&reverse_index_tensor, 0)?.contiguous()
+        let output = hidden_states.index_select(&reverse_index_tensor, 0)?.contiguous()?;
+        debug_tensor("vision_final_output", &output);
+        Ok(output)
     }
 }

@@ -279,9 +279,120 @@ def main():
         print(f"  [DEBUG] Expected image tokens after merge: {expected_tokens}")
 
     # =========================================================================
-    # Extract vision embeddings separately (before encode_prompt merges them)
+    # Extract vision INTERMEDIATE tensors for debugging
     # =========================================================================
-    print("\n  Extracting vision embeddings...")
+    print("\n  Extracting vision intermediate tensors...")
+
+    # Get the visual model and process image
+    visual_model = pipe.text_encoder.model.visual
+    vision_inputs = pipe.processor.image_processor(
+        images=resized_image,
+        return_tensors="pt",
+    )
+    pixel_values = vision_inputs["pixel_values"].to(device=device, dtype=dtype)
+    image_grid_thw = vision_inputs["image_grid_thw"].to(device=device)
+
+    print(f"  pixel_values shape: {pixel_values.shape}")
+    print(f"  image_grid_thw: {image_grid_thw}")
+
+    # Run vision encoder with intermediate capture
+    with torch.no_grad():
+        # Components
+        patch_embed = visual_model.patch_embed
+        blocks = visual_model.blocks
+        merger = visual_model.merger
+        rotary_pos_emb_fn = visual_model.rot_pos_emb
+        get_window_index_fn = visual_model.get_window_index
+        spatial_merge_size = visual_model.spatial_merge_size
+        spatial_merge_unit = spatial_merge_size ** 2
+        fullatt_block_indexes = visual_model.fullatt_block_indexes
+
+        # 1. Patch embedding
+        hidden_states = patch_embed(pixel_values)
+        tensor_stats("vision_after_patch_embed", hidden_states)
+        save_tensor("vision_after_patch_embed", hidden_states, args.output_dir)
+
+        # 2. Rotary position embeddings
+        rotary_pos_emb = rotary_pos_emb_fn(image_grid_thw)
+        tensor_stats("vision_rotary_pos_emb", rotary_pos_emb)
+        save_tensor("vision_rotary_pos_emb", rotary_pos_emb, args.output_dir)
+
+        # 3. Window index and reordering
+        window_index, cu_window_seqlens = get_window_index_fn(image_grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens, device=hidden_states.device, dtype=torch.int32
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        seq_len = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(
+            seq_len // spatial_merge_unit, spatial_merge_unit, -1
+        )
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        tensor_stats("vision_after_window_reorder", hidden_states)
+        save_tensor("vision_after_window_reorder", hidden_states, args.output_dir)
+
+        # Reorder rotary embeddings
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // spatial_merge_unit, spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
+        # Compute cos/sin
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        tensor_stats("vision_cos", position_embeddings[0])
+        tensor_stats("vision_sin", position_embeddings[1])
+        save_tensor("vision_cos", position_embeddings[0], args.output_dir)
+        save_tensor("vision_sin", position_embeddings[1], args.output_dir)
+
+        # Build cu_seqlens for full attention
+        cu_seqlens = torch.repeat_interleave(
+            image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+
+        # 4. Process through blocks
+        for layer_idx, blk in enumerate(blocks):
+            if layer_idx in fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+            else:
+                cu_seqlens_now = cu_window_seqlens
+
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+            )
+
+            # Capture key blocks: 0, 7, 15, 23, 31
+            if layer_idx in [0, 7, 15, 23, 31]:
+                tensor_stats(f"vision_after_block_{layer_idx}", hidden_states)
+                save_tensor(f"vision_after_block_{layer_idx}", hidden_states, args.output_dir)
+
+        tensor_stats("vision_after_all_blocks", hidden_states)
+        save_tensor("vision_after_all_blocks", hidden_states, args.output_dir)
+
+        # 5. Merger
+        hidden_states = merger(hidden_states)
+        tensor_stats("vision_after_merger", hidden_states)
+        save_tensor("vision_after_merger", hidden_states, args.output_dir)
+
+        # 6. Reverse window reordering
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = hidden_states[reverse_indices, :]
+
+        tensor_stats("vision_final_output", hidden_states)
+        save_tensor("vision_final_output", hidden_states, args.output_dir)
+
+    # =========================================================================
+    # Extract vision embeddings via hook (captures what encode_prompt actually uses)
+    # =========================================================================
+    print("\n  Extracting vision embeddings (via encode_prompt hook)...")
 
     vision_captures = {}
 
