@@ -145,19 +145,21 @@ pub fn run(
     } else if let Some(seed) = args.seed {
         // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
+        // Use [B, T, C, H, W] format to match PyTorch's Qwen-Image convention
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
-            &[1, 16, 1, dims.latent_height, dims.latent_width],
+            &[1, 1, 16, dims.latent_height, dims.latent_width],
             device,
             DType::F32,
         )?
     } else {
         // Use Candle's default RNG (not reproducible across frameworks)
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
+        // Use [B, T, C, H, W] format to match PyTorch's Qwen-Image convention
         Tensor::randn(
             0f32,
             1f32,
-            (1, 16, 1, dims.latent_height, dims.latent_width),
+            (1, 1, 16, dims.latent_height, dims.latent_width),
             device,
         )?
     };
@@ -256,20 +258,24 @@ fn create_img2img_latents(
     height: usize,
     width: usize,
     device: &Device,
-    dtype: DType,
+    _dtype: DType,
 ) -> Result<Tensor> {
     println!("  Loading init image: {}", init_path);
 
     let init_image = common::load_image_for_vae(init_path, height, width, device)?;
 
     let dist = vae.encode(&init_image)?;
+    // VAE outputs [B, C, T, H, W] format
     let encoded_latents = vae.normalize_latents(&dist.mode().clone())?;
+    // Transpose to [B, T, C, H, W] format for packing
+    let encoded_latents = encoded_latents.permute([0, 2, 1, 3, 4])?;
 
     // Keep noise in F32 to avoid BF16 quantization error
+    // Use [B, T, C, H, W] format to match transposed VAE output
     let noise = Tensor::randn(
         0f32,
         1f32,
-        (1, 16, 1, dims.latent_height, dims.latent_width),
+        (1, 1, 16, dims.latent_height, dims.latent_width),
         device,
     )?;
 

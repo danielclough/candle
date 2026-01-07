@@ -185,7 +185,7 @@ enum Command {
         vae_model_id: String,
 
         /// Maximum output resolution (longest side). Use 0 to preserve input size.
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 512)]
         max_resolution: usize,
 
         /// Use tiled VAE decoding for memory efficiency.

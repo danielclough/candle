@@ -204,9 +204,13 @@ def main():
     parser = argparse.ArgumentParser(description="Generate reference tensors for Qwen-Image")
     parser.add_argument("--prompt", type=str, default="A serene mountain landscape",
                         help="Text prompt for generation")
+    parser.add_argument("--negative-prompt", type=str, default="",
+                        help="Negative prompt for CFG")
     parser.add_argument("--height", type=int, default=512, help="Image height")
     parser.add_argument("--width", type=int, default=512, help="Image width")
     parser.add_argument("--steps", type=int, default=20, help="Number of inference steps")
+    parser.add_argument("--true-cfg-scale", type=float, default=1.0,
+                        help="True CFG scale (>1 enables classifier-free guidance)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output-dir", type=str, default="debug_tensors/pytorch",
                         help="Output directory for tensors")
@@ -227,6 +231,8 @@ def main():
 
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Prompt: {args.prompt}")
+    print(f"Negative prompt: {args.negative_prompt or '(none)'}")
+    print(f"True CFG scale: {args.true_cfg_scale}")
     print(f"Output dir: {args.output_dir}")
     print()
 
@@ -757,11 +763,12 @@ def main():
 
     result = pipe(
         prompt=args.prompt,
+        negative_prompt=args.negative_prompt if args.negative_prompt else None,
         height=args.height,
         width=args.width,
         num_inference_steps=args.steps,
         generator=generator,
-        true_cfg_scale=1.0,
+        true_cfg_scale=args.true_cfg_scale,
         callback_on_step_end=save_step_tensors,
         callback_on_step_end_tensor_inputs=["latents"],
         output_type="latent",  # Get latents instead of image

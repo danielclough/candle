@@ -37,12 +37,30 @@ if transformers_path.exists():
 
 
 def save_tensor(name: str, tensor: torch.Tensor, output_dir: str):
-    """Save a PyTorch tensor as NumPy .npy file."""
+    """Save a PyTorch tensor as NumPy .npy file.
+
+    For 5D tensors, transposes from PyTorch pipeline convention (B, T, C, H, W)
+    to Rust/Candle VAE convention (B, C, T, H, W) for debug comparison.
+    Note: VAE outputs are already (B, C, T, H, W) so no transpose needed for those.
+    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{name}.npy")
     arr = tensor.detach().cpu().float().numpy()
+
+    # PyTorch pipeline creates noise as (B, T, C, H, W) but Rust uses (B, C, T, H, W)
+    # Transpose 5D tensors where T is at index 1 (not index 2)
+    # Skip tensors that are already in VAE format (like image_latents from encode)
+    if arr.ndim == 5 and "latents" in name and "image" not in name:
+        # Check if this looks like (B, T, C, H, W) format (T=1 at index 1)
+        if arr.shape[1] == 1 and arr.shape[2] > 1:
+            arr = arr.transpose(0, 2, 1, 3, 4)  # (B, T, C, H, W) -> (B, C, T, H, W)
+            print(f"  Saved {name}: shape={arr.shape} (transposed to Rust convention), mean={arr.mean():.6f}, std={arr.std():.6f}")
+        else:
+            print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
+    else:
+        print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
+
     np.save(path, arr)
-    print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
 
 
 def tensor_stats(name: str, tensor: torch.Tensor):
@@ -58,7 +76,7 @@ def main():
                         help="Input image to edit")
     parser.add_argument("--prompt", type=str, default="Make the sky more colorful",
                         help="Edit instruction")
-    parser.add_argument("--negative-prompt", type=str, default="",
+    parser.add_argument("--negative-prompt", type=str, default="blurry, low quality",
                         help="Negative prompt for CFG")
     parser.add_argument("--steps", type=int, default=20, help="Number of inference steps")
     parser.add_argument("--true-cfg-scale", type=float, default=4.0,
@@ -71,7 +89,7 @@ def main():
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to run on (cuda or cpu, NOT mps - has issues)")
-    parser.add_argument("--max-resolution", type=int, default=1024,
+    parser.add_argument("--max-resolution", type=int, default=512,
                         help="Maximum resolution for the longer side")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen-Image-Edit-2511",
                         help="HuggingFace model ID for the edit pipeline")
@@ -127,7 +145,7 @@ def main():
     # Calculate dimensions (matching pipeline behavior)
     # =========================================================================
     import math
-    target_area = 1024 * 1024
+    target_area = 512 * 512
     ratio = orig_width / orig_height
     width = math.sqrt(target_area * ratio)
     height = width / ratio
@@ -204,6 +222,64 @@ def main():
     # =========================================================================
     print("\n  Encoding prompt with vision...")
 
+    # Debug: Check merge configuration and tokenization
+    print("\n  [DEBUG] Analyzing vision/text tokenization...")
+    print(f"  [DEBUG] image_processor.merge_size = {pipe.processor.image_processor.merge_size}")
+
+    # After encoding, check the input shape
+    model_inputs = pipe.processor(text=[args.prompt], images=resized_image, return_tensors="pt")
+    print(f"  [DEBUG] input_ids shape: {model_inputs.input_ids.shape}")
+    print(f"  [DEBUG] image_grid_thw: {model_inputs.image_grid_thw}")
+
+    # Count image tokens (151655 is the <|image_pad|> token ID)
+    num_image_tokens_in_ids = (model_inputs.input_ids == 151655).sum().item()
+    print(f"  [DEBUG] Number of image tokens (151655) in input_ids: {num_image_tokens_in_ids}")
+
+    # Calculate expected tokens
+    if hasattr(model_inputs, 'image_grid_thw') and model_inputs.image_grid_thw is not None:
+        grid = model_inputs.image_grid_thw[0]  # First image
+        total_patches = grid.prod().item()
+        merge_length = pipe.processor.image_processor.merge_size ** 2
+        expected_tokens = total_patches // merge_length
+        print(f"  [DEBUG] Grid: T={grid[0].item()}, H={grid[1].item()}, W={grid[2].item()}")
+        print(f"  [DEBUG] Total patches: {total_patches}, merge_length: {merge_length}")
+        print(f"  [DEBUG] Expected image tokens after merge: {expected_tokens}")
+
+    # =========================================================================
+    # Extract vision embeddings separately (before encode_prompt merges them)
+    # =========================================================================
+    print("\n  Extracting vision embeddings...")
+
+    vision_captures = {}
+
+    def capture_vision_output(module, args, output):
+        """Capture the vision encoder output."""
+        vision_captures["vision_embeds"] = output.detach().clone()
+        return output
+
+    # The vision model is at pipe.text_encoder.model.visual
+    vision_hook = pipe.text_encoder.model.visual.register_forward_hook(capture_vision_output)
+
+    # Run a dummy encode_prompt to trigger vision encoding (we'll capture the embeddings)
+    # Use the same image that will be used for the actual prompt encoding
+    _ = pipe.encode_prompt(
+        prompt=args.prompt,
+        image=resized_image,
+        device=device,
+        num_images_per_prompt=1,
+    )
+
+    vision_hook.remove()
+
+    if "vision_embeds" in vision_captures:
+        vision_embeds = vision_captures["vision_embeds"]
+        # Vision embeds shape is [num_tokens, hidden_dim] after processing
+        save_tensor("vision_embeds", vision_embeds, args.output_dir)
+        tensor_stats("vision_embeds", vision_embeds)
+        print(f"  Vision embeddings captured: {list(vision_embeds.shape)}")
+    else:
+        print("  WARNING: Failed to capture vision embeddings!")
+
     # Hook to capture intermediate text encoder outputs
     text_encoder_captures = {}
 
@@ -234,9 +310,9 @@ def main():
         save_tensor("text_hidden_states_last", text_encoder_captures["hidden_states_last"], args.output_dir)
         tensor_stats("text_hidden_states_last", text_encoder_captures["hidden_states_last"])
 
-    # Encode negative prompt if using true CFG
+    # Encode negative prompt (always encode for debugging, even if CFG not used)
     do_true_cfg = args.true_cfg_scale > 1 and args.negative_prompt
-    if do_true_cfg:
+    if args.negative_prompt:
         neg_prompt_embeds, neg_prompt_mask = pipe.encode_prompt(
             prompt=args.negative_prompt,
             image=resized_image,
@@ -246,6 +322,8 @@ def main():
         save_tensor("negative_prompt_embeds", neg_prompt_embeds, args.output_dir)
         save_tensor("negative_prompt_mask", neg_prompt_mask.float(), args.output_dir)
         tensor_stats("negative_prompt_embeds", neg_prompt_embeds)
+        tensor_stats("negative_prompt_mask", neg_prompt_mask.float())
+        print(f"  Negative prompt sequence length: {neg_prompt_embeds.shape[1]}")
 
     # =========================================================================
     # Step 3: Prepare noise latents
@@ -271,43 +349,95 @@ def main():
     # =========================================================================
     print("\n[3/3] Running pipeline with tensor extraction...")
 
+    # =========================================================================
+    # MONKEY-PATCH: Force pipeline to use 512x512 for source image encoding
+    # By default, the pipeline uses calculate_dimensions(1024*1024, ...) which
+    # gives 1024x1024 for square images. We override this to match Rust.
+    # =========================================================================
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit as edit_pipeline_module
+
+    def _patched_calculate_dimensions(target_area, ratio):
+        """Force 512x512 encoding dimensions (matching Rust implementation)."""
+        # Use 512*512 instead of 1024*1024
+        patched_area = 512 * 512
+        width = math.sqrt(patched_area * ratio)
+        height_val = width / ratio
+        width = round(width / 32) * 32
+        height_val = round(height_val / 32) * 32
+        return int(width), int(height_val), None
+
+    edit_pipeline_module.calculate_dimensions = _patched_calculate_dimensions
+    print("  [PATCH] Overriding calculate_dimensions to use 512x512 (matching Rust)")
+
     # Reset generator
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     # Hook for transformer inputs/outputs
+    # With true CFG, transformer is called TWICE per step: positive then negative
     transformer_captures = {}
+    transformer_call_counter = {"count": 0}  # Counts calls within current step
 
     def capture_transformer_io(module, hook_args, kwargs, output):
         """Capture transformer input and output at step 0."""
         step = transformer_step_counter["count"]
+        call_in_step = transformer_call_counter["count"]
 
+        # Only capture at step 0
         if step == 0:
-            # Capture inputs
             hidden_states = kwargs.get("hidden_states", hook_args[0] if hook_args else None)
             encoder_hidden_states = kwargs.get("encoder_hidden_states")
             timestep = kwargs.get("timestep")
-
-            if hidden_states is not None:
-                transformer_captures["input_hidden_states"] = hidden_states.detach().clone()
-                print(f"  [TRANSFORMER] input_hidden_states: shape={list(hidden_states.shape)}, "
-                      f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
-
-            if encoder_hidden_states is not None:
-                transformer_captures["input_encoder_hidden_states"] = encoder_hidden_states.detach().clone()
-                print(f"  [TRANSFORMER] input_encoder_hidden_states: shape={list(encoder_hidden_states.shape)}, "
-                      f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
-
-            if timestep is not None:
-                transformer_captures["input_timestep"] = timestep.detach().clone()
-                print(f"  [TRANSFORMER] input_timestep: {timestep.item():.6f}")
-
-            # Capture output
             noise_pred = output[0] if isinstance(output, tuple) else output
-            transformer_captures["noise_pred_full"] = noise_pred.detach().clone()
-            print(f"  [TRANSFORMER] noise_pred_full: shape={list(noise_pred.shape)}, "
-                  f"mean={noise_pred.float().mean():.6f}, std={noise_pred.float().std():.6f}")
 
-        transformer_step_counter["count"] += 1
+            # Extract only the noise prediction part (first half of sequence)
+            noise_seq_len = noise_pred.shape[1] // 2  # noise + image -> just noise
+            noise_pred_extracted = noise_pred[:, :noise_seq_len, :]
+
+            if call_in_step == 0:
+                # First call = positive/conditional prediction
+                if hidden_states is not None:
+                    transformer_captures["input_hidden_states"] = hidden_states.detach().clone()
+                    print(f"  [TRANSFORMER] input_hidden_states: shape={list(hidden_states.shape)}, "
+                          f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+                if encoder_hidden_states is not None:
+                    transformer_captures["input_encoder_hidden_states"] = encoder_hidden_states.detach().clone()
+                    print(f"  [TRANSFORMER] input_encoder_hidden_states: shape={list(encoder_hidden_states.shape)}, "
+                          f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
+                if timestep is not None:
+                    transformer_captures["input_timestep"] = timestep.detach().clone()
+                    print(f"  [TRANSFORMER] input_timestep: {timestep.item():.6f}")
+
+                transformer_captures["noise_pred_full"] = noise_pred.detach().clone()
+                print(f"  [TRANSFORMER] noise_pred_full: shape={list(noise_pred.shape)}, "
+                      f"mean={noise_pred.float().mean():.6f}, std={noise_pred.float().std():.6f}")
+
+                # Save positive prediction (extracted noise part only)
+                transformer_captures["noise_pred_pos_step0"] = noise_pred_extracted.detach().clone()
+                print(f"  [TRANSFORMER] noise_pred_pos_step0: shape={list(noise_pred_extracted.shape)}, "
+                      f"mean={noise_pred_extracted.float().mean():.6f}, std={noise_pred_extracted.float().std():.6f}")
+
+            elif call_in_step == 1 and do_true_cfg:
+                # Second call = negative/unconditional prediction
+                transformer_captures["noise_pred_neg_step0"] = noise_pred_extracted.detach().clone()
+                print(f"  [TRANSFORMER] noise_pred_neg_step0: shape={list(noise_pred_extracted.shape)}, "
+                      f"mean={noise_pred_extracted.float().mean():.6f}, std={noise_pred_extracted.float().std():.6f}")
+
+                # Compute guided prediction (CFG)
+                pos_pred = transformer_captures["noise_pred_pos_step0"]
+                neg_pred = noise_pred_extracted
+                # CFG formula: neg + scale * (pos - neg)
+                guided = neg_pred + args.true_cfg_scale * (pos_pred - neg_pred)
+
+                # Apply norm rescaling (matching pipeline)
+                cond_norm = torch.norm(pos_pred, dim=-1, keepdim=True)
+                noise_norm = torch.norm(guided, dim=-1, keepdim=True)
+                guided = guided * (cond_norm / noise_norm)
+
+                transformer_captures["guided_pred_step0"] = guided.detach().clone()
+                print(f"  [TRANSFORMER] guided_pred_step0: shape={list(guided.shape)}, "
+                      f"mean={guided.float().mean():.6f}, std={guided.float().std():.6f}")
+
+        transformer_call_counter["count"] += 1
         return output
 
     transformer_hook = pipe.transformer.register_forward_hook(capture_transformer_io, with_kwargs=True)
@@ -316,6 +446,10 @@ def main():
     def save_step_tensors(pipe_obj, step_idx, timestep, callback_kwargs):
         """Callback to save tensors at each denoising step."""
         latents = callback_kwargs["latents"]
+
+        # Reset call counter for next step, increment step counter
+        transformer_call_counter["count"] = 0
+        transformer_step_counter["count"] += 1
 
         if step_idx == 0:
             save_tensor("packed_latents_after_step0", latents, args.output_dir)
@@ -397,6 +531,7 @@ def main():
     print("  - image_latents_raw: VAE encoder output")
     print("  - image_latents_normalized: Normalized image latents")
     print("  - packed_image_latents: Packed image latents for transformer")
+    print("  - vision_embeds: Vision encoder output (before text encoder)")
     print("  - prompt_embeds: Text+vision prompt embeddings")
     print("  - prompt_mask: Attention mask for prompt")
     print("  - noise_latents_unpacked: Initial noise (5D)")

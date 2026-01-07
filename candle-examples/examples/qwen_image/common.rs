@@ -78,7 +78,7 @@ pub fn setup_device_and_dtype(cpu: bool, use_f32: bool, seed: Option<u64>) -> Re
 /// Load an image and prepare it for VAE encoding.
 ///
 /// Returns a tensor of shape [1, 3, 1, height, width] normalized to [-1, 1].
-/// This is the standard format for the Qwen-Image 3D VAE.
+/// Uses (B, C, T, H, W) convention which VAE expects internally.
 /// Always returns F32 since the VAE uses F32 for numerical precision.
 pub fn load_image_for_vae(
     path: &str,
@@ -111,13 +111,13 @@ pub fn load_image_for_vae(
         }
     }
 
-    // Shape: [1, 3, 1, height, width] for 3D VAE (always F32 for VAE precision)
+    // Shape: [1, 3, 1, height, width] for 3D VAE - (B, C, T, H, W) convention
     Ok(Tensor::from_vec(data, (1, 3, 1, target_height, target_width), device)?)
 }
 
 /// Load a grayscale mask image and resize to latent dimensions.
 ///
-/// Returns a tensor of shape [1, 1, 1, latent_height, latent_width] with values in [0, 1].
+/// Returns a tensor of shape [1, 1, 1, latent_height, latent_width] (B, T, C, H, W) with values in [0, 1].
 /// White (1.0) = region to process, Black (0.0) = region to preserve.
 pub fn load_mask_for_latents(
     path: &str,
@@ -491,4 +491,31 @@ pub fn calculate_output_dims(
         };
         round_to_16(h, w)
     }
+}
+
+/// Calculate source image encoding dimensions for edit pipeline.
+///
+/// PyTorch's QwenImageEditPipeline encodes the source image at a HIGHER resolution
+/// (targeting 1M pixels = 1024×1024) to preserve detail for editing, while the
+/// output is generated at the target resolution.
+///
+/// This function replicates PyTorch's `calculate_dimensions(1024*1024, ratio)`:
+/// ```python
+/// width = math.sqrt(target_area * ratio)
+/// height = width / ratio
+/// width = round(width / 32) * 32
+/// height = round(height / 32) * 32
+/// ```
+pub fn calculate_source_image_dims(orig_width: usize, orig_height: usize) -> (usize, usize) {
+    const TARGET_AREA: f64 = 1024.0 * 1024.0; // 1M pixels, matching PyTorch
+
+    let ratio = orig_width as f64 / orig_height as f64;
+    let width = (TARGET_AREA * ratio).sqrt();
+    let height = width / ratio;
+
+    // Round to nearest 32 (matching PyTorch's rounding)
+    let width = ((width / 32.0).round() * 32.0) as usize;
+    let height = ((height / 32.0).round() * 32.0) as usize;
+
+    (width, height)
 }

@@ -5,7 +5,7 @@
 //! the encoded input image latents during denoising.
 
 use anyhow::{anyhow, Result};
-use candle::{DType, Device, Tensor};
+use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::{
     qwen2_5_vl::{
@@ -103,6 +103,8 @@ pub fn run(
 
     let image_latents = vae.normalize_latents(&image_latents_raw)?;
     let image_latents = debug::checkpoint(&mut debug_ctx, "image_latents_normalized", image_latents)?;
+    // Transpose from VAE format [B, C, T, H, W] to pack format [B, T, C, H, W]
+    let image_latents = image_latents.permute([0, 2, 1, 3, 4])?;
     println!("  Image latents shape: {:?}", image_latents.dims());
 
     // =========================================================================
@@ -194,6 +196,7 @@ pub fn run(
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
     // Create initial noise and pack latents (F32 to avoid BF16 quantization error)
+    // Use [B, C, T, H, W] format to match PyTorch convention (edit pipeline)
     let noise_latents = Tensor::randn(
         0f32,
         1f32,
@@ -201,6 +204,8 @@ pub fn run(
         device,
     )?;
     let noise_latents = debug::checkpoint(&mut debug_ctx, "noise_latents_unpacked", noise_latents)?;
+    // Transpose from [B, C, T, H, W] to [B, T, C, H, W] for pack_latents (edit pipeline)
+    let noise_latents = noise_latents.permute([0, 2, 1, 3, 4])?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
     let packed_noise = debug::checkpoint(&mut debug_ctx, "packed_noise_latents", packed_noise)?;
@@ -227,10 +232,10 @@ pub fn run(
     // =========================================================================
     println!("\n[5/5] Running denoising loop...");
 
-    // Image shapes for RoPE: noise + image regions
+    // Image shapes for RoPE: noise + image regions (both same size)
     let img_shapes = vec![
-        (1, dims.packed_height, dims.packed_width),
-        (1, dims.packed_height, dims.packed_width),
+        (1, dims.packed_height, dims.packed_width),  // Noise latents
+        (1, dims.packed_height, dims.packed_width),  // Image latents
     ];
     let txt_seq_lens = vec![pos_embeds.dim(1)?];
 
@@ -305,12 +310,16 @@ pub fn run(
         }
 
         // Unpack and step
+        // unpack_latents outputs [B, C, T, H, W] to match PyTorch checkpoints
+        // NOTE: Noise predictions use output/target dimensions
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
         // Convert back to F32 for scheduler arithmetic
         let unpacked = unpacked.to_dtype(DType::F32)?;
         let unpacked_latents =
             unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
         let stepped = scheduler.step(&unpacked, &unpacked_latents)?;
+        // Transpose from [B, C, T, H, W] to [B, T, C, H, W] for pack_latents
+        let stepped = stepped.permute([0, 2, 1, 3, 4])?;
         latents = pack_latents(&stepped, dims.latent_height, dims.latent_width)?;
 
         // Debug: capture latents after step 0
@@ -339,6 +348,9 @@ pub fn run(
     let latents = vae.denormalize_latents(&final_latents)?;
     let latents = debug::checkpoint(&mut debug_ctx, "denormalized_latents", latents)?;
 
+    // Decode latents to image
+    // PyTorch: image = vae.decode(latents)[0][:, :, 0]
+    // The [:, :, 0] extracts first temporal frame: [B, C, T, H, W] -> [B, C, H, W]
     let image = if use_tiled {
         let tile_stride = (args.tile_size * 3) / 4;
         let config = TiledDecodeConfig {
@@ -349,15 +361,18 @@ pub fn run(
             "\nDecoding with tiled VAE (tile: {}px, stride: {}px)...",
             config.tile_sample_min_size, config.tile_sample_stride
         );
-        vae.tiled_decode(&latents, &config)?
+        let decoded = vae.tiled_decode(&latents, &config)?;
+        // Extract first frame: [B, C, T, H, W] -> [B, C, H, W]
+        let (b, c, _t, h, w) = decoded.dims5()?;
+        decoded.i((.., .., 0, .., ..))?.reshape((b, c, h, w))?
     } else {
         println!("\nDecoding latents...");
-        vae.decode(&latents)?
+        vae.decode_image(&latents)?
     };
 
     debug::checkpoint(&mut debug_ctx, "decoded_image", image.clone())?;
 
-    common::postprocess_and_save(&image, &args.output)?;
+    common::postprocess_and_save_4d(&image, &args.output)?;
     println!("Edited image saved to: {}", args.output);
 
     Ok(())
