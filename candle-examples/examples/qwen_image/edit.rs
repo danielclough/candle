@@ -7,6 +7,8 @@
 use anyhow::{anyhow, Result};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
+
+use crate::mt_box_muller_rng::MtBoxMullerRng;
 use candle_transformers::models::{
     qwen2_5_vl::{
         get_image_grid_thw, normalize_image, patchify_image, smart_resize, Qwen25VLTextModel,
@@ -41,6 +43,7 @@ pub struct EditArgs {
     pub tiled_decode: Option<bool>,
     pub tile_size: usize,
     pub output: String,
+    pub seed: Option<u64>,
 }
 
 /// Model paths for the edit pipeline.
