@@ -643,7 +643,8 @@ impl Qwen25VLVisionModel {
         let window_index_u32: Vec<u32> = window_index.iter().map(|&x| x as u32).collect();
         let window_index_tensor =
             Tensor::from_vec(window_index_u32, (window_index.len(),), device)?;
-        let mut hidden_states = hidden_states.index_select(&window_index_tensor, 0)?;
+        // NOTE: index_select may produce non-contiguous tensor, force contiguity for downstream ops
+        let mut hidden_states = hidden_states.index_select(&window_index_tensor, 0)?.contiguous()?;
 
         // Reshape back to (seq_len, hidden_dim)
         hidden_states = hidden_states.reshape((seq_len, hidden_dim))?;
@@ -651,7 +652,7 @@ impl Qwen25VLVisionModel {
         // Reorder rotary position embeddings similarly
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
         let rotary_pos_emb = rotary_pos_emb.reshape((grouped, self.spatial_merge_unit, ()))?;
-        let rotary_pos_emb = rotary_pos_emb.index_select(&window_index_tensor, 0)?;
+        let rotary_pos_emb = rotary_pos_emb.index_select(&window_index_tensor, 0)?.contiguous()?;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
 
         // Compute cos/sin for RoPE
@@ -684,6 +685,6 @@ impl Qwen25VLVisionModel {
         let reverse_index_tensor =
             Tensor::from_vec(reverse_indices, (window_index.len(),), device)?;
 
-        hidden_states.index_select(&reverse_index_tensor, 0)
+        hidden_states.index_select(&reverse_index_tensor, 0)?.contiguous()
     }
 }

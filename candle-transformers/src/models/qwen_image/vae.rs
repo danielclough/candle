@@ -128,9 +128,11 @@ impl QwenImageCausalConv3d {
         let (b, c, _t_in, h_in, w_in) = x.dims5()?;
 
         // Apply causal temporal padding (zeros on left only)
+        // NOTE: After cat, tensor may be non-contiguous which can cause issues
+        // with Metal's im2col3d kernel that expects contiguous NCDHW layout
         let x = if t_pad_left > 0 {
             let zero_pad = Tensor::zeros((b, c, t_pad_left, h_in, w_in), dtype, device)?;
-            Tensor::cat(&[&zero_pad, &x], 2)?
+            Tensor::cat(&[&zero_pad, &x], 2)?.contiguous()?
         } else {
             x
         };
