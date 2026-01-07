@@ -39,27 +39,14 @@ if transformers_path.exists():
 def save_tensor(name: str, tensor: torch.Tensor, output_dir: str):
     """Save a PyTorch tensor as NumPy .npy file.
 
-    For 5D tensors, transposes from PyTorch pipeline convention (B, T, C, H, W)
-    to Rust/Candle VAE convention (B, C, T, H, W) for debug comparison.
-    Note: VAE outputs are already (B, C, T, H, W) so no transpose needed for those.
+    Saves tensors in their native format without transposing.
+    - Noise latents: [B, T, C, H, W] (diffusers native format)
+    - VAE outputs: [B, C, T, H, W] (VAE native format)
     """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{name}.npy")
     arr = tensor.detach().cpu().float().numpy()
-
-    # PyTorch pipeline creates noise as (B, T, C, H, W) but Rust uses (B, C, T, H, W)
-    # Transpose 5D tensors where T is at index 1 (not index 2)
-    # Skip tensors that are already in VAE format (like image_latents from encode)
-    if arr.ndim == 5 and "latents" in name and "image" not in name:
-        # Check if this looks like (B, T, C, H, W) format (T=1 at index 1)
-        if arr.shape[1] == 1 and arr.shape[2] > 1:
-            arr = arr.transpose(0, 2, 1, 3, 4)  # (B, T, C, H, W) -> (B, C, T, H, W)
-            print(f"  Saved {name}: shape={arr.shape} (transposed to Rust convention), mean={arr.mean():.6f}, std={arr.std():.6f}")
-        else:
-            print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
-    else:
-        print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
-
+    print(f"  Saved {name}: shape={arr.shape}, mean={arr.mean():.6f}, std={arr.std():.6f}")
     np.save(path, arr)
 
 

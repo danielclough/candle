@@ -198,17 +198,27 @@ pub fn run(
 
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
-    // Create initial noise and pack latents (F32 to avoid BF16 quantization error)
-    // Use [B, C, T, H, W] format to match PyTorch convention (edit pipeline)
-    let noise_latents = Tensor::randn(
-        0f32,
-        1f32,
-        (1, 16, 1, dims.latent_height, dims.latent_width),
-        device,
-    )?;
+    // Create initial noise (F32 to avoid BF16 quantization error)
+    // Use [B, T, C, H, W] format to match PyTorch/diffusers native convention
+    let noise_latents = if let Some(seed) = args.seed {
+        // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
+        let mut rng = MtBoxMullerRng::new(seed);
+        rng.randn(
+            &[1, 1, 16, dims.latent_height, dims.latent_width],
+            &Device::Cpu,
+            DType::F32,
+        )?
+        .to_device(device)?
+    } else {
+        // Use Candle's default RNG (not reproducible across frameworks)
+        Tensor::randn(
+            0f32,
+            1f32,
+            (1, 1, 16, dims.latent_height, dims.latent_width),
+            device,
+        )?
+    };
     let noise_latents = debug::checkpoint(&mut debug_ctx, "noise_latents_unpacked", noise_latents)?;
-    // Transpose from [B, C, T, H, W] to [B, T, C, H, W] for pack_latents (edit pipeline)
-    let noise_latents = noise_latents.permute([0, 2, 1, 3, 4])?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
     let packed_noise = debug::checkpoint(&mut debug_ctx, "packed_noise_latents", packed_noise)?;

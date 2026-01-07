@@ -384,6 +384,7 @@ fn main() -> Result<()> {
                 tiled_decode,
                 tile_size,
                 output,
+                seed: cli.seed,
             };
             let paths = edit::EditModelPaths {
                 transformer_path: cli.transformer_path,
