@@ -102,6 +102,14 @@ impl AdaLayerNormContinuous {
 /// - **Text**: Qwen2.5-VL embeddings [batch, txt_seq, 3584]
 /// - **Output**: Unpacked predictions [batch, seq, 16 × patch_size²]
 ///
+/// # Edit Mode (zero_cond_t)
+///
+/// When `zero_cond_t` is enabled (edit mode), the model uses per-token modulation:
+/// - Timestep is doubled: `[t, 0]` → creates two sets of modulation parameters
+/// - `modulate_index` tensor marks which modulation to use per token:
+///   - Index 0 (actual timestep): for noise latents being denoised
+///   - Index 1 (zero timestep): for reference image latents (conditioning)
+///
 /// # Example
 ///
 /// ```ignore
@@ -145,6 +153,10 @@ pub struct QwenImageTransformer2DModel {
 
     /// Output projection: 3072 -> patch_size² × out_channels
     proj_out: Linear,
+
+    /// Whether to use zero conditioning for timestep (edit mode).
+    /// When true, doubles timestep and uses per-token modulation.
+    zero_cond_t: bool,
 }
 
 impl QwenImageTransformer2DModel {
@@ -210,6 +222,7 @@ impl QwenImageTransformer2DModel {
             transformer_blocks,
             norm_out,
             proj_out,
+            zero_cond_t: config.zero_cond_t,
         })
     }
 
@@ -279,6 +292,7 @@ impl QwenImageTransformer2DModel {
         controlnet_residuals: Option<&[Tensor]>,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
+        let device = hidden_states.device();
 
         debug_tensor("input_hidden_states", hidden_states);
         debug_tensor("input_encoder_hidden_states", encoder_hidden_states);
@@ -294,8 +308,29 @@ impl QwenImageTransformer2DModel {
         encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
         debug_tensor("after_txt_in", &encoder_hidden_states);
 
-        // Compute timestep embedding
+        // Handle zero_cond_t for edit mode:
+        // - Double the timestep: [t, 0] creates two modulation sets
+        // - Create modulate_index: per-token mask for which modulation to use
         let timestep = timestep.to_dtype(dtype)?;
+        let (timestep, modulate_index) = if self.zero_cond_t {
+            // Double timestep: [t, 0] for two different modulation parameter sets
+            let zero_timestep = (&timestep * 0.0)?;
+            let doubled_timestep = Tensor::cat(&[&timestep, &zero_timestep], 0)?;
+            debug_tensor("doubled_timestep", &doubled_timestep);
+
+            // Create modulate_index: marks which tokens use which modulation
+            // In edit mode, img_shapes is [(noise_f, noise_h, noise_w), (img_f, img_h, img_w), ...]
+            // - First shape (index 0): noise latents -> use timestep modulation (index 0)
+            // - Remaining shapes (index 1+): reference images -> use zero-timestep modulation (index 1)
+            let modulate_idx = Self::create_modulate_index(img_shapes, device)?;
+            debug_tensor("modulate_index", &modulate_idx);
+
+            (doubled_timestep, Some(modulate_idx))
+        } else {
+            (timestep, None)
+        };
+
+        // Compute timestep embedding (doubled if zero_cond_t)
         let temb = self.time_text_embed.forward(&timestep, dtype)?;
         debug_tensor("temb", &temb);
 
@@ -318,14 +353,16 @@ impl QwenImageTransformer2DModel {
                     &encoder_hidden_states,
                     &temb,
                     Some(&image_rotary_emb),
+                    modulate_index.as_ref(),
                     true,  // Enable debug for block 0
                 )?
             } else {
-                block.forward(
+                block.forward_with_modulate_index(
                     &hidden_states,
                     &encoder_hidden_states,
                     &temb,
                     Some(&image_rotary_emb),
+                    modulate_index.as_ref(),
                 )?
             };
             encoder_hidden_states = enc_out;
@@ -344,8 +381,16 @@ impl QwenImageTransformer2DModel {
             }
         }
 
+        // For zero_cond_t, use only the first half of temb for final normalization
+        let temb_for_norm = if self.zero_cond_t {
+            let batch_size = temb.dim(0)? / 2;
+            temb.narrow(0, 0, batch_size)?
+        } else {
+            temb
+        };
+
         // Final normalization with AdaLN
-        let hidden_states = self.norm_out.forward(&hidden_states, &temb)?;
+        let hidden_states = self.norm_out.forward(&hidden_states, &temb_for_norm)?;
         debug_tensor("after_norm_out", &hidden_states);
 
         // Project to output: [batch, seq, patch_size² × out_channels]
@@ -353,6 +398,39 @@ impl QwenImageTransformer2DModel {
         debug_tensor("output", &output);
 
         Ok(output)
+    }
+
+    /// Create modulate_index tensor for edit mode.
+    ///
+    /// In edit mode, img_shapes contains multiple shapes:
+    /// - First shape: noise latents being denoised (use index 0 = actual timestep)
+    /// - Remaining shapes: reference image latents (use index 1 = zero timestep)
+    ///
+    /// Returns a tensor of shape [1, total_seq_len] with 0s for noise tokens and 1s for image tokens.
+    fn create_modulate_index(
+        img_shapes: &[(usize, usize, usize)],
+        device: &candle::Device,
+    ) -> Result<Tensor> {
+        if img_shapes.is_empty() {
+            candle::bail!("img_shapes cannot be empty for modulate_index creation");
+        }
+
+        let mut indices: Vec<i64> = Vec::new();
+
+        // First shape (noise latents) -> index 0
+        let (f0, h0, w0) = img_shapes[0];
+        let noise_seq_len = f0 * h0 * w0;
+        indices.extend(std::iter::repeat(0i64).take(noise_seq_len));
+
+        // Remaining shapes (reference images) -> index 1
+        for &(f, h, w) in img_shapes.iter().skip(1) {
+            let seq_len = f * h * w;
+            indices.extend(std::iter::repeat(1i64).take(seq_len));
+        }
+
+        // Create tensor with shape [1, total_seq_len] (batch dim = 1 for now)
+        let total_len = indices.len();
+        Tensor::from_vec(indices, (1, total_len), device)
     }
 }
 

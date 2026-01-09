@@ -219,6 +219,10 @@ def main():
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to run on (cuda or cpu, NOT mps - has issues)")
+    parser.add_argument("--use-f32", action="store_true",
+                        help="Use full F32 precision (default is BF16 mixed precision)")
+    parser.add_argument("--use-f16", action="store_true",
+                        help="Use F16 precision for lower memory usage")
     args = parser.parse_args()
 
     # Force CPU if MPS was selected - MPS has numerical issues with this model
@@ -227,7 +231,20 @@ def main():
         args.device = "cpu"
 
     device = torch.device(args.device)
-    dtype = torch.float32  # Use float32 for consistency
+
+    # Determine dtype based on flags and device capabilities
+    # CPU: default to F32 (BF16 is emulated and very slow without AVX-512 BF16)
+    # GPU: default to BF16 (fast and good quality)
+    if args.use_f32:
+        dtype = torch.float32
+    elif args.use_f16:
+        # F16 causes NaN in attention due to limited dynamic range, fall back to BF16
+        print("  Warning: F16 causes NaN in attention, using BF16 instead")
+        dtype = torch.bfloat16
+    elif args.device == "cpu":
+        dtype = torch.float32  # BF16 on CPU is emulated and slow
+    else:
+        dtype = torch.bfloat16  # GPU: use BF16 mixed precision
 
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Prompt: {args.prompt}")
@@ -248,6 +265,11 @@ def main():
         torch_dtype=dtype,
     )
     pipe = pipe.to(device)
+
+    # Match Candle's mixed precision: text encoder always runs in F32
+    if dtype in (torch.bfloat16, torch.float16):
+        pipe.text_encoder = pipe.text_encoder.to(torch.float32)
+        print(f"  Text encoder set to F32 (mixed precision with {dtype})")
 
     print("  Pipeline loaded!")
     print()

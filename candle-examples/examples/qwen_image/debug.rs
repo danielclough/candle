@@ -267,6 +267,14 @@ impl SubstituteMode {
                     .collect();
                 Ok(SubstituteMode::Only(names))
             }
+            "vae_input" => {
+                // VAE encoder INPUT - use to test VAE encoder with identical inputs
+                let names: HashSet<String> = ["vae_input"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                Ok(SubstituteMode::Only(names))
+            }
             "noise" => {
                 // Initial noise latents
                 let names: HashSet<String> =
@@ -336,7 +344,7 @@ impl SubstituteMode {
                 Ok(SubstituteMode::Except(names))
             }
             _ => Err(anyhow!(
-                "Invalid substitution mode: '{}'. Use 'none', 'all', 'prompt', 'latents', 'vae', 'vision', 'vision_input', 'noise', 'transformer', 'rope', 'block0', 'only:name1,name2', or 'except:name1,name2'",
+                "Invalid substitution mode: '{}'. Use 'none', 'all', 'prompt', 'latents', 'vae', 'vae_input', 'vision', 'vision_input', 'noise', 'transformer', 'rope', 'block0', 'only:name1,name2', or 'except:name1,name2'",
                 mode_str
             )),
         }

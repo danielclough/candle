@@ -54,6 +54,73 @@ impl ModulationOut {
     }
 }
 
+/// Apply per-token modulation based on modulate_index.
+///
+/// When modulate_index is provided, we have doubled modulation params (from doubled timestep).
+/// The index tensor indicates which modulation to use per token:
+/// - Index 0: use modulation from actual timestep (for noise latents)
+/// - Index 1: use modulation from zero timestep (for reference image latents)
+///
+/// # Arguments
+/// * `xs` - Input tensor [batch, seq, dim]
+/// * `mod_out` - Modulation output with shape [2*batch, 1, dim] (doubled for zero_cond_t)
+/// * `modulate_index` - Per-token index tensor [batch, seq] with values 0 or 1
+///
+/// # Returns
+/// Tuple of (modulated_x, gate) where modulated_x = x * (1 + scale) + shift
+pub fn apply_modulation_with_index(
+    xs: &Tensor,
+    mod_out: &ModulationOut,
+    modulate_index: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let dtype = xs.dtype();
+    let batch_size = xs.dim(0)?;
+
+    // mod_out has shape [2*batch, 1, dim] from doubled timestep
+    // Split into two halves: [batch, 1, dim] each
+    let shift_all = &mod_out.shift; // [2*batch, 1, dim]
+    let scale_all = &mod_out.scale;
+    let gate_all = &mod_out.gate;
+
+    // First half (index 0): actual timestep modulation
+    let shift_0 = shift_all.narrow(0, 0, batch_size)?; // [batch, 1, dim]
+    let scale_0 = scale_all.narrow(0, 0, batch_size)?;
+    let gate_0 = gate_all.narrow(0, 0, batch_size)?;
+
+    // Second half (index 1): zero timestep modulation
+    let shift_1 = shift_all.narrow(0, batch_size, batch_size)?;
+    let scale_1 = scale_all.narrow(0, batch_size, batch_size)?;
+    let gate_1 = gate_all.narrow(0, batch_size, batch_size)?;
+
+    // Expand index to match feature dimension: [batch, seq] -> [batch, seq, 1]
+    let index_expanded = modulate_index.unsqueeze(D::Minus1)?.to_dtype(dtype)?;
+
+    // For broadcasting, we need shift_0/1 to be [batch, 1, dim] which they already are
+    // Then torch.where will broadcast to [batch, seq, dim]
+
+    // Create masks for selection (index == 0 means use _0, else use _1)
+    // In Candle, we can use: result = (1 - index) * val_0 + index * val_1
+    let one_minus_index = (1.0 - &index_expanded)?;
+
+    // Select shift per token
+    let shift_result = (&shift_0.broadcast_mul(&one_minus_index)?
+        + &shift_1.broadcast_mul(&index_expanded)?)?;
+
+    // Select scale per token
+    let scale_result = (&scale_0.broadcast_mul(&one_minus_index)?
+        + &scale_1.broadcast_mul(&index_expanded)?)?;
+
+    // Select gate per token
+    let gate_result = (&gate_0.broadcast_mul(&one_minus_index)?
+        + &gate_1.broadcast_mul(&index_expanded)?)?;
+
+    // Apply modulation: x * (1 + scale) + shift
+    let modulated = xs.broadcast_mul(&(&scale_result + 1.0)?)?
+        .broadcast_add(&shift_result)?;
+
+    Ok((modulated, gate_result))
+}
+
 /// Modulation layer for dual-stream blocks.
 ///
 /// Projects the timestep embedding to 6 × dim parameters:
@@ -508,7 +575,7 @@ impl QwenImageTransformerBlock {
         })
     }
 
-    /// Forward pass through the dual-stream block.
+    /// Forward pass through the dual-stream block (standard mode, no per-token modulation).
     ///
     /// # Arguments
     /// * `hidden_states` - Image stream [batch, img_seq, dim]
@@ -525,7 +592,24 @@ impl QwenImageTransformerBlock {
         temb: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_with_debug(hidden_states, encoder_hidden_states, temb, image_rotary_emb, false)
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, None, false)
+    }
+
+    /// Forward pass with modulate_index for edit mode (zero_cond_t).
+    ///
+    /// When modulate_index is provided:
+    /// - `temb` is doubled: [2*batch, dim] with [actual_timestep, zero_timestep]
+    /// - Image modulation uses per-token selection based on modulate_index
+    /// - Text modulation uses only actual timestep (first half of temb)
+    pub fn forward_with_modulate_index(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        modulate_index: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, false)
     }
 
     /// Forward pass with optional debug logging (for block 0 analysis).
@@ -535,13 +619,37 @@ impl QwenImageTransformerBlock {
         encoder_hidden_states: &Tensor,
         temb: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
+        modulate_index: Option<&Tensor>,
+        debug: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, debug)
+    }
+
+    /// Internal forward implementation handling both standard and edit modes.
+    fn forward_impl(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        modulate_index: Option<&Tensor>,
         debug: bool,
     ) -> Result<(Tensor, Tensor)> {
         let orig_dtype = hidden_states.dtype();
+        let batch_size = hidden_states.dim(0)?;
 
-        // Get modulation parameters for both streams
+        // Get modulation parameters for image stream (uses full temb if doubled)
         let (img_mod1, img_mod2) = self.img_mod.forward(temb)?;
-        let (txt_mod1, txt_mod2) = self.txt_mod.forward(temb)?;
+
+        // For text stream, use only first half of temb if modulate_index is provided (zero_cond_t mode)
+        let txt_temb = if modulate_index.is_some() {
+            // In zero_cond_t mode, temb is doubled [2*batch, dim]
+            // Text uses only actual timestep (first half)
+            temb.narrow(0, 0, batch_size)?
+        } else {
+            temb.clone()
+        };
+        let (txt_mod1, txt_mod2) = self.txt_mod.forward(&txt_temb)?;
 
         if debug {
             debug_tensor("[BLOCK0] img_mod1.shift", &img_mod1.shift);
@@ -554,22 +662,33 @@ impl QwenImageTransformerBlock {
 
         // === Attention phase ===
 
-        // Image: norm1 + modulate
+        // Image: norm1 + modulate (with per-token selection if modulate_index provided)
         let img_normed = hidden_states.apply(&self.img_norm1)?;
         if debug {
             debug_tensor("[BLOCK0] img_norm1_output", &img_normed);
         }
-        let img_modulated = img_mod1.scale_shift(&img_normed)?;
+
+        let (img_modulated, img_gate1) = if let Some(mod_idx) = modulate_index {
+            // Per-token modulation for edit mode
+            apply_modulation_with_index(&img_normed, &img_mod1, mod_idx)?
+        } else {
+            // Standard modulation
+            let modulated = img_mod1.scale_shift(&img_normed)?;
+            let gate = img_mod1.gate.clone();
+            (modulated, gate)
+        };
+
         if debug {
             debug_tensor("[BLOCK0] img_modulated", &img_modulated);
         }
 
-        // Text: norm1 + modulate
+        // Text: norm1 + modulate (always standard, no per-token selection)
         let txt_normed = encoder_hidden_states.apply(&self.txt_norm1)?;
         if debug {
             debug_tensor("[BLOCK0] txt_norm1_output", &txt_normed);
         }
         let txt_modulated = txt_mod1.scale_shift(&txt_normed)?;
+        let txt_gate1 = txt_mod1.gate.clone();
         if debug {
             debug_tensor("[BLOCK0] txt_modulated", &txt_modulated);
         }
@@ -591,9 +710,9 @@ impl QwenImageTransformerBlock {
         // This exceeds BF16's max of ±65536, so we MUST compute residuals in F32
         // then cast back to original dtype.
 
-        // Gated residual for attention
-        let gated_img_attn = img_mod1.gate(&img_attn_out)?;
-        let gated_txt_attn = txt_mod1.gate(&txt_attn_out)?;
+        // Gated residual for attention (use per-token gate for image if in edit mode)
+        let gated_img_attn = img_gate1.broadcast_mul(&img_attn_out)?;
+        let gated_txt_attn = txt_gate1.broadcast_mul(&txt_attn_out)?;
         if debug {
             debug_tensor("[BLOCK0] gated_img_attn", &gated_img_attn);
             debug_tensor("[BLOCK0] gated_txt_attn", &gated_txt_attn);
@@ -616,19 +735,27 @@ impl QwenImageTransformerBlock {
 
         // Image: norm2 + modulate + MLP + gated residual
         let img_normed2 = hidden_states.apply(&self.img_norm2)?;
-        let img_modulated2 = img_mod2.scale_shift(&img_normed2)?;
+
+        let (img_modulated2, img_gate2) = if let Some(mod_idx) = modulate_index {
+            apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx)?
+        } else {
+            let modulated = img_mod2.scale_shift(&img_normed2)?;
+            let gate = img_mod2.gate.clone();
+            (modulated, gate)
+        };
+
         let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
         if debug {
             debug_tensor("[BLOCK0] img_mlp_output", &img_mlp_out);
         }
-        let gated_img_mlp = img_mod2.gate(&img_mlp_out)?;
+        let gated_img_mlp = img_gate2.broadcast_mul(&img_mlp_out)?;
 
         // Residual add in F32
         let hidden_states = (hidden_states.to_dtype(DType::F32)?
             + gated_img_mlp.to_dtype(DType::F32)?)?
             .to_dtype(orig_dtype)?;
 
-        // Text: norm2 + modulate + MLP + gated residual
+        // Text: norm2 + modulate + MLP + gated residual (always standard)
         let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
         let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
         let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;

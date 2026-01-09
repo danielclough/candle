@@ -122,9 +122,14 @@ impl Config {
     ///
     /// The Edit model uses the same architecture as the base model but is
     /// fine-tuned for image editing tasks with vision-language conditioning.
+    /// Key difference: `zero_cond_t: true` enables per-token modulation where:
+    /// - Noise latents (first sequence) use timestep-based modulation
+    /// - Reference image latents (subsequent sequences) use zero-timestep modulation
     pub fn qwen_image_edit() -> Self {
-        // Same architecture as base model - weights are from fine-tuned checkpoint
-        Self::qwen_image()
+        Self {
+            zero_cond_t: true, // Critical for edit mode - enables per-token modulation
+            ..Self::qwen_image()
+        }
     }
 
     /// Configuration for Qwen-Image Layered model.

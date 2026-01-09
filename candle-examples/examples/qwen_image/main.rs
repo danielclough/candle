@@ -74,9 +74,13 @@ struct Cli {
     #[arg(long, global = true)]
     cpu: bool,
 
-    /// Use F32 dtype instead of BF16.
+    /// Use F32 dtype instead of mixed precision (BF16/F16).
     #[arg(long, global = true)]
     use_f32: bool,
+
+    /// Use F16 dtype instead of BF16 for lower memory usage.
+    #[arg(long, global = true)]
+    use_f16: bool,
 
     /// Enable Chrome tracing profiler.
     #[arg(long, global = true)]
@@ -331,7 +335,7 @@ fn main() -> Result<()> {
     let _guard = common::setup_tracing(cli.tracing);
 
     // Setup device and dtype
-    let (device, dtype) = common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.seed)?;
+    let (device, dtype) = common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.use_f16, cli.seed)?;
 
     // Dispatch to the appropriate pipeline
     match cli.command {

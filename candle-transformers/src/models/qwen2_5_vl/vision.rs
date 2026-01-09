@@ -231,15 +231,25 @@ impl VisionAttention {
         cu_seqlens: &[usize],
         cos: &Tensor,
         sin: &Tensor,
+        debug_block: bool,
     ) -> Result<Tensor> {
         let seq_len = xs.dim(0)?;
         let hidden_states = self.qkv.forward(xs)?;
+        if debug_block {
+            debug_tensor("vision_block0_qkv_output", &hidden_states);
+        }
         let qkv = hidden_states
             .reshape((seq_len, 3, self.num_heads, self.head_dim))?
             .permute((1, 0, 2, 3))?;
         let mut q = qkv.i(0)?.squeeze(0)?;
         let mut k = qkv.i(1)?.squeeze(0)?;
         let mut v = qkv.i(2)?.squeeze(0)?;
+
+        if debug_block {
+            debug_tensor("vision_block0_q_pre_rope", &q);
+            debug_tensor("vision_block0_k_pre_rope", &k);
+            debug_tensor("vision_block0_v", &v);
+        }
 
         // RoPE and attention in F32 for numerical precision
         let cos = cos.to_dtype(DType::F32)?;
@@ -249,7 +259,13 @@ impl VisionAttention {
         v = v.to_dtype(DType::F32)?;
         (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
 
+        if debug_block {
+            debug_tensor("vision_block0_q_post_rope", &q);
+            debug_tensor("vision_block0_k_post_rope", &k);
+        }
+
         let mut outputs = Vec::new();
+        let mut first_chunk = true;
         for window in cu_seqlens.windows(2) {
             let start = window[0];
             let end = window[1];
@@ -269,7 +285,16 @@ impl VisionAttention {
                 let attn_weights =
                     (q.matmul(&k.transpose(2, 3)?)? / (self.head_dim as f64).sqrt())?;
 
+                if debug_block && first_chunk {
+                    debug_tensor("vision_block0_attn_scores_chunk0", &attn_weights);
+                }
+
                 let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+
+                if debug_block && first_chunk {
+                    debug_tensor("vision_block0_attn_probs_chunk0", &attn_weights);
+                }
+
                 attn_weights.matmul(&v)?
             };
             chunk_out = chunk_out.squeeze(0)?.transpose(0, 1)?;
@@ -278,9 +303,17 @@ impl VisionAttention {
             chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
             // Convert back to input dtype for output projection
             outputs.push(chunk_out.to_dtype(xs.dtype())?);
+            first_chunk = false;
         }
         let attn_output = Tensor::cat(&outputs, 0)?;
-        self.proj.forward(&attn_output)
+        if debug_block {
+            debug_tensor("vision_block0_attn_output_pre_proj", &attn_output);
+        }
+        let proj_output = self.proj.forward(&attn_output)?;
+        if debug_block {
+            debug_tensor("vision_block0_attn_output", &proj_output);
+        }
+        Ok(proj_output)
     }
 }
 
@@ -317,11 +350,22 @@ impl VisionBlock {
         cu_seqlens: &[usize],
         cos: &Tensor,
         sin: &Tensor,
+        layer_idx: usize,
     ) -> Result<Tensor> {
+        let debug_block = layer_idx == 0;
+
         // Operations run in the model's dtype (F32 or BF16 depending on how loaded)
         // Residual additions are done in F32 for numerical precision
+        if debug_block {
+            debug_tensor("vision_block0_input", xs);
+        }
+
         let normed = self.norm1.forward(xs)?;
-        let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
+        if debug_block {
+            debug_tensor("vision_block0_norm1_output", &normed);
+        }
+
+        let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin, debug_block)?;
 
         // Residual addition in F32 for precision
         let xs_att = xs
@@ -329,14 +373,31 @@ impl VisionBlock {
             .add(&attn_out.to_dtype(DType::F32)?)?
             .to_dtype(xs.dtype())?;
 
+        if debug_block {
+            debug_tensor("vision_block0_after_attn_residual", &xs_att);
+        }
+
         let normed2 = self.norm2.forward(&xs_att)?;
+        if debug_block {
+            debug_tensor("vision_block0_norm2_output", &normed2);
+        }
+
         let mlp_out = self.mlp.forward(&normed2)?;
+        if debug_block {
+            debug_tensor("vision_block0_mlp_output", &mlp_out);
+        }
 
         // Residual addition in F32 for precision
-        xs_att
+        let output = xs_att
             .to_dtype(DType::F32)?
             .add(&mlp_out.to_dtype(DType::F32)?)?
-            .to_dtype(xs.dtype())
+            .to_dtype(xs.dtype())?;
+
+        if debug_block {
+            debug_tensor("vision_block0_output", &output);
+        }
+
+        Ok(output)
     }
 }
 
@@ -657,7 +718,7 @@ impl Qwen25VLVisionModel {
             } else {
                 &cu_window_seqlens // Window attention for other 28 layers
             };
-            hidden_states = block.forward(&hidden_states, cu_seqlens_now, &cos, &sin)?;
+            hidden_states = block.forward(&hidden_states, cu_seqlens_now, &cos, &sin, layer_idx)?;
             // Debug after key blocks: 0 (first), 7 (first full-attn), 15, 23, 31 (last full-attn)
             if layer_idx == 0 || layer_idx == 7 || layer_idx == 15 || layer_idx == 23 || layer_idx == 31 {
                 debug_tensor(&format!("vision_after_block_{}", layer_idx), &hidden_states);
