@@ -39,6 +39,8 @@ pub struct EditArgs {
     pub true_cfg_scale: f64,
     pub model_id: String,
     pub vae_model_id: String,
+    pub height: Option<usize>,
+    pub width: Option<usize>,
     pub max_resolution: usize,
     pub tiled_decode: Option<bool>,
     pub tile_size: usize,
@@ -67,6 +69,8 @@ pub fn run(
     println!("Model: {}", args.model_id);
     println!("Input image: {}", args.input_image);
     println!("Prompt: {}", args.prompt);
+    println!("Negative prompt: {}", if args.negative_prompt.is_empty() { "(none)" } else { &args.negative_prompt });
+    println!("CFG scale: {}", args.true_cfg_scale);
     println!("Steps: {}", args.num_inference_steps);
 
     let api = hf_hub::api::sync::Api::new()?;
@@ -82,8 +86,13 @@ pub fn run(
     let (orig_width, orig_height) = (input_img.width() as usize, input_img.height() as usize);
     println!("  Original size: {}x{}", orig_width, orig_height);
 
-    let (target_width, target_height) =
-        common::calculate_output_dims(orig_width, orig_height, args.max_resolution);
+    let (target_width, target_height) = if let (Some(h), Some(w)) = (args.height, args.width) {
+        // Use explicit dimensions if both specified
+        println!("  Using explicit dimensions: {}x{}", w, h);
+        (w, h)
+    } else {
+        common::calculate_output_dims(orig_width, orig_height, args.max_resolution)
+    };
     println!("  Output size: {}x{}", target_width, target_height);
 
     let dims = common::calculate_latent_dims(target_height, target_width);
@@ -106,8 +115,7 @@ pub fn run(
 
     let image_latents = vae.normalize_latents(&image_latents_raw)?;
     let image_latents = debug::checkpoint(&mut debug_ctx, "image_latents_normalized", image_latents)?;
-    // Transpose from VAE format [B, C, T, H, W] to pack format [B, T, C, H, W]
-    let image_latents = image_latents.permute([0, 2, 1, 3, 4])?;
+    // Keep in [B, C, T, H, W] format for pack_latents
     println!("  Image latents shape: {:?}", image_latents.dims());
 
     // =========================================================================
@@ -129,14 +137,18 @@ pub fn run(
         }
     };
 
+    // Load vision encoder in F32 for numerical precision
     let vb_vision =
-        unsafe { VarBuilder::from_mmaped_safetensors(&vision_model_files, dtype, device)? };
+        unsafe { VarBuilder::from_mmaped_safetensors(&vision_model_files, DType::F32, device)? };
     let vision_model = Qwen25VLVisionModel::new(&vision_config, vb_vision.pp("visual"))?;
-    println!("  Vision encoder loaded");
+    println!("  Vision encoder loaded (F32)");
 
-    // Preprocess input image for vision encoder
+    // Preprocess input image for vision encoder (F32)
+    // Constrain to target dimensions to match Python behavior
+    let vision_max_pixels = target_width * target_height;
     let (pixel_values, image_grid_thw, _) =
-        preprocess_image_for_vision(&input_img, device, dtype)?;
+        preprocess_image_for_vision(&input_img, device, DType::F32, Some(vision_max_pixels))?;
+    let pixel_values = debug::checkpoint(&mut debug_ctx, "vision_pixel_values", pixel_values)?;
     println!(
         "  Image preprocessed for vision: {} patches",
         pixel_values.dim(0)?
@@ -148,6 +160,9 @@ pub fn run(
     let vision_embeds = debug::checkpoint(&mut debug_ctx, "vision_embeds", vision_embeds)?;
     let num_image_tokens = vision_embeds.dim(0)?;
     println!("  Vision embeddings: {} tokens", num_image_tokens);
+
+    // Free vision encoder from memory before loading text encoder
+    drop(vision_model);
 
     // Load text encoder (always F32 for numerical precision)
     let mut text_model =
@@ -187,9 +202,9 @@ pub fn run(
     let neg_mask = debug::checkpoint(&mut debug_ctx, "negative_prompt_mask", neg_mask)?;
     let neg_embeds = neg_embeds.to_dtype(dtype)?;
 
+    // Free text encoder from memory before loading transformer
     drop(text_model);
-    drop(vision_model);
-    println!("  Encoders freed");
+    println!("  Text encoder freed");
 
     // =========================================================================
     // Stage 4: Load transformer and setup scheduler
@@ -199,12 +214,12 @@ pub fn run(
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
     // Create initial noise (F32 to avoid BF16 quantization error)
-    // Use [B, T, C, H, W] format to match PyTorch/diffusers native convention
+    // Use [B, C, T, H, W] format to match pack_latents expectation
     let noise_latents = if let Some(seed) = args.seed {
         // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
-            &[1, 1, 16, dims.latent_height, dims.latent_width],
+            &[1, 16, 1, dims.latent_height, dims.latent_width],
             &Device::Cpu,
             DType::F32,
         )?
@@ -214,7 +229,7 @@ pub fn run(
         Tensor::randn(
             0f32,
             1f32,
-            (1, 1, 16, dims.latent_height, dims.latent_width),
+            (1, 16, 1, dims.latent_height, dims.latent_width),
             device,
         )?
     };
@@ -309,17 +324,26 @@ pub fn run(
         let pos_pred = pos_pred.narrow(1, 0, noise_seq_len)?;
         let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
 
-        // Debug: capture extracted noise predictions at step 0
+        // Debug: capture noise predictions at each step
+        let pos_name = format!("noise_pred_pos_step{}", step);
+        let neg_name = format!("noise_pred_neg_step{}", step);
+        debug::checkpoint(&mut debug_ctx, &pos_name, pos_pred.clone())?;
+        debug::checkpoint(&mut debug_ctx, &neg_name, neg_pred.clone())?;
+
+        // Keep backwards-compatible names for step 0
         if step == 0 {
-            debug::checkpoint(&mut debug_ctx, "noise_pred_pos_step0", pos_pred.clone())?;
-            debug::checkpoint(&mut debug_ctx, "noise_pred_neg_step0", neg_pred.clone())?;
+            debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_pos_step0", pos_pred.clone())?;
+            debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_neg_step0", neg_pred.clone())?;
         }
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
 
-        // Debug: capture guided prediction at step 0
+        // Debug: capture guided prediction at each step
+        let guided_name = format!("guided_pred_step{}", step);
+        debug::checkpoint(&mut debug_ctx, &guided_name, guided_pred.clone())?;
+
         if step == 0 {
-            debug::checkpoint(&mut debug_ctx, "guided_pred_step0", guided_pred.clone())?;
+            debug::checkpoint(&mut debug_ctx, "transformer_guided_pred_step0", guided_pred.clone())?;
         }
 
         // Unpack and step
@@ -331,11 +355,14 @@ pub fn run(
         let unpacked_latents =
             unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
         let stepped = scheduler.step(&unpacked, &unpacked_latents)?;
-        // Transpose from [B, C, T, H, W] to [B, T, C, H, W] for pack_latents
-        let stepped = stepped.permute([0, 2, 1, 3, 4])?;
+        // stepped is [B, C, T, H, W], matching pack_latents expectation
         latents = pack_latents(&stepped, dims.latent_height, dims.latent_width)?;
 
-        // Debug: capture latents after step 0
+        // Debug: capture latents after each step
+        let step_name = format!("latents_after_step{}", step);
+        debug::checkpoint(&mut debug_ctx, &step_name, latents.clone())?;
+
+        // Keep backwards-compatible names for step 0
         if step == 0 {
             debug::checkpoint(&mut debug_ctx, "packed_latents_after_step0", latents.clone())?;
             let latents_unpacked = unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
@@ -392,26 +419,32 @@ pub fn run(
 }
 
 /// Preprocess an image for the vision encoder.
+///
+/// If `max_pixels` is provided, it constrains the resize to that maximum.
+/// This is used to match the output dimensions (e.g., 256x256 = 65536 pixels).
 fn preprocess_image_for_vision(
     img: &image::DynamicImage,
     device: &Device,
     dtype: DType,
+    max_pixels: Option<usize>,
 ) -> Result<(Tensor, Tensor, usize)> {
     let (orig_width, orig_height) = (img.width() as usize, img.height() as usize);
 
     let factor = VISION_PATCH_SIZE * VISION_MERGE_SIZE;
+    let max_px = max_pixels.unwrap_or(DEFAULT_MAX_PIXELS);
     let (resized_height, resized_width) = smart_resize(
         orig_height,
         orig_width,
         factor,
         DEFAULT_MIN_PIXELS,
-        DEFAULT_MAX_PIXELS,
+        max_px,
     );
 
+    // Use CatmullRom (bicubic) to match PyTorch's default resample method
     let resized = img.resize_exact(
         resized_width as u32,
         resized_height as u32,
-        image::imageops::FilterType::Lanczos3,
+        image::imageops::FilterType::CatmullRom,
     );
 
     let rgb = resized.to_rgb8();
@@ -464,8 +497,15 @@ fn encode_prompt_with_vision(
 
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
 
+    // DEBUG: Print original tokens
+    eprintln!("[ENCODE_PROMPT] original tokens len: {}", tokens.len());
+    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID we're looking for: {}", IMAGE_TOKEN_ID);
+    let original_image_pos = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID);
+    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID found at position: {:?}", original_image_pos);
+
     // Expand image_pad token to the correct number
     if let Some(pos) = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID) {
+        eprintln!("[ENCODE_PROMPT] Expanding single IMAGE_TOKEN_ID at pos {} to {} copies", pos, num_image_tokens);
         let expanded: Vec<u32> = tokens[..pos]
             .iter()
             .chain(std::iter::repeat(&IMAGE_TOKEN_ID).take(num_image_tokens))
@@ -473,9 +513,23 @@ fn encode_prompt_with_vision(
             .copied()
             .collect();
         tokens = expanded;
+    } else {
+        eprintln!("[ENCODE_PROMPT] WARNING: No IMAGE_TOKEN_ID found in tokens!");
     }
 
     let seq_len = tokens.len();
+    eprintln!("[ENCODE_PROMPT] final tokens len: {}", seq_len);
+
+    // Verify expansion
+    let image_count = tokens.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
+    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID count in final tokens: {}", image_count);
+
+    // Print tokens around the image region
+    if let Some(first_img_pos) = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID) {
+        let start = first_img_pos.saturating_sub(3);
+        let end = (first_img_pos + 10).min(tokens.len());
+        eprintln!("[ENCODE_PROMPT] tokens[{}..{}] around image start: {:?}", start, end, &tokens[start..end]);
+    }
     let input_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
     let attention_mask = Tensor::ones((1, seq_len), DType::F32, device)?;
 

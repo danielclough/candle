@@ -131,17 +131,21 @@ impl QwenEmbedRope {
         Tensor::cat(&all_freqs, 1)
     }
 
-    /// Compute video frequencies for a given frame/height/width configuration.
+    /// Compute video frequencies for a single region.
     ///
     /// # Arguments
     /// * `frame` - Number of frames (typically 1 for images)
     /// * `height` - Height in latent space (image_height / 8 / 2 for packed latents)
     /// * `width` - Width in latent space
+    /// * `idx` - Region index (used to offset frame frequencies for edit mode)
     ///
     /// # Returns
     /// Tensor of shape [frame * height * width, total_dim/2, 2]
-    fn compute_video_freqs(&self, frame: usize, height: usize, width: usize) -> Result<Tensor> {
+    fn compute_video_freqs(&self, frame: usize, height: usize, width: usize, idx: usize) -> Result<Tensor> {
         let seq_len = frame * height * width;
+        eprintln!("[DIFFUSION_ROPE] compute_video_freqs: frame={}, height={}, width={}, idx={}, scale_rope={}",
+            frame, height, width, idx, self.scale_rope);
+        eprintln!("[DIFFUSION_ROPE] axes_dim: {:?}, seq_len={}", self.axes_dim, seq_len);
         let _device = self.pos_freqs.device();
 
         // Compute split offsets for axis: [frame_dim/2, height_dim/2, width_dim/2]
@@ -161,8 +165,9 @@ impl QwenEmbedRope {
         let neg_height = self.neg_freqs.narrow(1, offset1, half_dims[1])?;
         let neg_width = self.neg_freqs.narrow(1, offset2, half_dims[2])?;
 
-        // Frame frequencies: just take indices 0..frame from positive
-        let freqs_frame = pos_frame.narrow(0, 0, frame)?; // [frame, frame_dim/2, 2]
+        // Frame frequencies: use region index to offset (matches PyTorch's idx parameter)
+        // For edit mode: region 0 (noise) uses [0:frame], region 1 (image) uses [1:1+frame]
+        let freqs_frame = pos_frame.narrow(0, idx, frame)?; // [frame, frame_dim/2, 2]
         let freqs_frame = freqs_frame
             .reshape((frame, 1, 1, half_dims[0], 2))?
             .broadcast_as((frame, height, width, half_dims[0], 2))?;
@@ -202,9 +207,32 @@ impl QwenEmbedRope {
         // Concatenate along frequency dimension and reshape to [seq_len, total_dim/2, 2]
         let freqs = Tensor::cat(&[freqs_frame, freqs_height, freqs_width], 3)?;
         let total_half_dim: usize = half_dims.iter().sum();
-        freqs
+        let result = freqs
             .reshape((seq_len, total_half_dim, 2))?
-            .contiguous()
+            .contiguous()?;
+
+        // DEBUG: Print frequency statistics for comparison with Python
+        // Convert to F32 for debug printing (tensors may be BF16)
+        let result_f32 = result.to_dtype(candle::DType::F32)?;
+        let freqs_flat = result_f32.flatten_all()?;
+        let mean = freqs_flat.mean_all()?.to_scalar::<f32>().unwrap_or(0.0);
+        let min = freqs_flat.min(0)?.to_scalar::<f32>().unwrap_or(0.0);
+        let max = freqs_flat.max(0)?.to_scalar::<f32>().unwrap_or(0.0);
+        eprintln!("[DIFFUSION_ROPE] freqs shape: {:?}, mean={:.6}, min={:.6}, max={:.6}",
+            result.dims(), mean, min, max);
+
+        // Print frequency values for position 0: frame(0-7), height(8-15), width(36-43)
+        let first_pos = result_f32.i(0)?;  // [total_dim/2, 2]
+        let all_cos: Vec<f32> = first_pos.i((.., 0))?.flatten_all()?.to_vec1()?;
+        let all_sin: Vec<f32> = first_pos.i((.., 1))?.flatten_all()?.to_vec1()?;
+        eprintln!("[DIFFUSION_ROPE] pos[0] frame cos[0:8]:  {:?}", &all_cos[..8.min(all_cos.len())]);
+        eprintln!("[DIFFUSION_ROPE] pos[0] frame sin[0:8]:  {:?}", &all_sin[..8.min(all_sin.len())]);
+        eprintln!("[DIFFUSION_ROPE] pos[0] height cos[8:16]: {:?}", &all_cos[8..16.min(all_cos.len())]);
+        eprintln!("[DIFFUSION_ROPE] pos[0] height sin[8:16]: {:?}", &all_sin[8..16.min(all_sin.len())]);
+        eprintln!("[DIFFUSION_ROPE] pos[0] width cos[36:44]: {:?}", &all_cos[36..44.min(all_cos.len())]);
+        eprintln!("[DIFFUSION_ROPE] pos[0] width sin[36:44]: {:?}", &all_sin[36..44.min(all_sin.len())]);
+
+        Ok(result)
     }
 
     /// Forward pass: compute frequencies for video and text sequences.
@@ -224,8 +252,9 @@ impl QwenEmbedRope {
         let mut vid_freqs_list = Vec::with_capacity(video_fhw.len());
         let mut max_vid_index = 0usize;
 
-        for &(frame, height, width) in video_fhw {
-            let vid_freqs = self.compute_video_freqs(frame, height, width)?;
+        for (idx, &(frame, height, width)) in video_fhw.iter().enumerate() {
+            // Pass idx to offset frame frequencies for each region (matches PyTorch behavior)
+            let vid_freqs = self.compute_video_freqs(frame, height, width, idx)?;
             vid_freqs_list.push(vid_freqs);
 
             // Track max index for text offset
@@ -363,8 +392,8 @@ mod tests {
         let device = Device::Cpu;
         let rope = QwenEmbedRope::new(10000, vec![16, 56, 56], true, &device, DType::F32)?;
 
-        // Test with a small latent size: 1 frame, 8x8 spatial
-        let vid_freqs = rope.compute_video_freqs(1, 8, 8)?;
+        // Test with a small latent size: 1 frame, 8x8 spatial, region index 0
+        let vid_freqs = rope.compute_video_freqs(1, 8, 8, 0)?;
         assert_eq!(vid_freqs.dims(), &[64, 64, 2]); // 1*8*8 = 64 tokens
         Ok(())
     }

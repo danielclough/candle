@@ -286,6 +286,22 @@ pub fn compute_mrope_position_ids_multi(
     let (batch, seq_len) = input_ids.dims2()?;
     let input_ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
 
+    // DEBUG: Print image token detection info
+    eprintln!("[MROPE_POSITION_IDS] input shape: batch={}, seq_len={}", batch, seq_len);
+    eprintln!("[MROPE_POSITION_IDS] image_token_id to match: {}", image_token_id);
+    eprintln!("[MROPE_POSITION_IDS] num_grids provided: {}", image_grids.len());
+    for (i, grid) in image_grids.iter().enumerate() {
+        eprintln!("[MROPE_POSITION_IDS] grid[{}]: {}x{} = {} tokens", i, grid.grid_h, grid.grid_w, grid.grid_h * grid.grid_w);
+    }
+
+    // Count how many times image_token_id appears in the sequence
+    let image_token_count = input_ids_vec.iter().filter(|&&t| t == image_token_id).count();
+    eprintln!("[MROPE_POSITION_IDS] image_token_id {} found {} times in sequence", image_token_id, image_token_count);
+
+    // Print first few tokens to see what's there
+    let sample_size = 20.min(input_ids_vec.len());
+    eprintln!("[MROPE_POSITION_IDS] first {} tokens: {:?}", sample_size, &input_ids_vec[..sample_size]);
+
     let mut pos_t = vec![0i64; batch * seq_len];
     let mut pos_h = vec![0i64; batch * seq_len];
     let mut pos_w = vec![0i64; batch * seq_len];
@@ -314,8 +330,15 @@ pub fn compute_mrope_position_ids_multi(
             image_ranges.push((image_start, seq_len));
         }
 
+        // DEBUG: Print found image ranges
+        eprintln!("[MROPE_POSITION_IDS] batch {}: found {} image ranges", b, image_ranges.len());
+        for (i, (start, end)) in image_ranges.iter().enumerate() {
+            eprintln!("[MROPE_POSITION_IDS]   range[{}]: [{}, {}) = {} tokens", i, start, end, end - start);
+        }
+
         // Verify image count matches
         if image_ranges.len() != image_grids.len() {
+            eprintln!("[MROPE_POSITION_IDS] ERROR: image_ranges.len()={} != image_grids.len()={}", image_ranges.len(), image_grids.len());
             return Err(candle::Error::Msg(format!(
                 "Mismatch: found {} image ranges but {} grids provided",
                 image_ranges.len(),
@@ -346,6 +369,7 @@ pub fn compute_mrope_position_ids_multi(
 
                 // Assign spatial positions
                 let offset = current_pos;
+                eprintln!("[MROPE_POSITION_IDS] Assigning 2D positions for image range [{}, {}), offset={}", img_start, img_end, offset);
                 for vision_idx in 0..num_vision_tokens {
                     let token_idx = batch_start + img_start + vision_idx;
                     let t_pos = 0i64; // Temporal is 0 for images
@@ -355,6 +379,15 @@ pub fn compute_mrope_position_ids_multi(
                     pos_t[token_idx] = t_pos + offset;
                     pos_h[token_idx] = h_pos + offset;
                     pos_w[token_idx] = w_pos + offset;
+
+                    // DEBUG: Print first few and last few position assignments
+                    if vision_idx < 5 || vision_idx >= num_vision_tokens - 3 {
+                        eprintln!("[MROPE_POSITION_IDS]   token[{}]: t={}, h={}, w={} (raw: t=0, h={}, w={})",
+                            token_idx, pos_t[token_idx], pos_h[token_idx], pos_w[token_idx],
+                            h_pos, w_pos);
+                    } else if vision_idx == 5 {
+                        eprintln!("[MROPE_POSITION_IDS]   ... ({} more tokens) ...", num_vision_tokens - 8);
+                    }
                 }
 
                 // Update position to max + 1
@@ -1305,8 +1338,18 @@ impl Qwen25VLTextModel {
         let (batch_size, seq_len) = input_ids.dims2()?;
         let hidden_dim = self.hidden_size;
 
+        // DEBUG: Print input info
+        let input_ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        eprintln!("[TEXT_ENCODER] seq_len={}, first 10 tokens: {:?}", seq_len, &input_ids_vec[..10.min(input_ids_vec.len())]);
+
         // 1. Get base token embeddings
         let mut input_embeds = self.embed_tokens(input_ids)?;
+
+        // DEBUG: Token embeddings stats
+        let embed_f32 = input_embeds.to_dtype(candle::DType::F32)?;
+        let embed_mean = embed_f32.mean_all()?.to_scalar::<f32>()?;
+        let embed_var = embed_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+        eprintln!("[TEXT_ENCODER] token_embeds: mean={:.6}, var={:.6}", embed_mean, embed_var.sqrt());
 
         // 2. Replace image placeholder tokens with vision embeddings
         let input_ids_flat: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
@@ -1341,22 +1384,69 @@ impl Qwen25VLTextModel {
             }
         }
 
+        // DEBUG: After vision insertion
+        let embed_f32 = input_embeds.to_dtype(candle::DType::F32)?;
+        let embed_mean = embed_f32.mean_all()?.to_scalar::<f32>()?;
+        let embed_std = embed_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+        eprintln!("[TEXT_ENCODER] after_vision_insert: mean={:.6}, std={:.6}", embed_mean, embed_std);
+
         // 3. Compute M-RoPE position IDs from image grid dimensions
         let grid_thw_vec = image_grid_thw.to_vec2::<u32>()?;
+        eprintln!("[FORWARD_WITH_VISION] image_grid_thw (raw, pre-merge): {:?}", grid_thw_vec);
+        eprintln!("[FORWARD_WITH_VISION] spatial_merge_size: {}", spatial_merge_size);
+        eprintln!("[FORWARD_WITH_VISION] image_token_id: {}", image_token_id);
+
         let image_grids: Vec<ImageGrid> = grid_thw_vec
             .iter()
             .map(|g| {
                 let h = g[1] as usize;
                 let w = g[2] as usize;
-                ImageGrid {
+                let grid = ImageGrid {
                     grid_h: h / spatial_merge_size,
                     grid_w: w / spatial_merge_size,
-                }
+                };
+                eprintln!("[FORWARD_WITH_VISION] ImageGrid: raw h={}, w={} -> post-merge grid_h={}, grid_w={} -> {} expected tokens",
+                    h, w, grid.grid_h, grid.grid_w, grid.grid_h * grid.grid_w);
+                grid
             })
             .collect();
 
         let position_ids =
             compute_mrope_position_ids_multi(input_ids, image_token_id, &image_grids, &self.device)?;
+
+        // DEBUG: Position IDs - print values for text tokens AND image tokens
+        let pos_t: Vec<i64> = position_ids.i(0)?.flatten_all()?.to_vec1()?;
+        let pos_h: Vec<i64> = position_ids.i(1)?.flatten_all()?.to_vec1()?;
+        let pos_w: Vec<i64> = position_ids.i(2)?.flatten_all()?.to_vec1()?;
+        eprintln!("[TEXT_ENCODER] position_ids shape: {:?}", position_ids.dims());
+        eprintln!("[TEXT_ENCODER] pos_t[0..10]: {:?}", &pos_t[..10.min(pos_t.len())]);
+        eprintln!("[TEXT_ENCODER] pos_h[0..10]: {:?}", &pos_h[..10.min(pos_h.len())]);
+        eprintln!("[TEXT_ENCODER] pos_w[0..10]: {:?}", &pos_w[..10.min(pos_w.len())]);
+
+        // Find where image tokens start (first position where h != w for spatial grid)
+        // Image tokens should have varying h/w while text tokens have h==w==t
+        let mut image_start = None;
+        for i in 0..pos_t.len() {
+            if pos_h[i] != pos_w[i] || pos_t[i] != pos_h[i] {
+                image_start = Some(i);
+                break;
+            }
+        }
+        if let Some(start) = image_start {
+            let end = (start + 20).min(pos_t.len());
+            eprintln!("[TEXT_ENCODER] IMAGE REGION starts at {}", start);
+            eprintln!("[TEXT_ENCODER] pos_t[{}..{}]: {:?}", start, end, &pos_t[start..end]);
+            eprintln!("[TEXT_ENCODER] pos_h[{}..{}]: {:?}", start, end, &pos_h[start..end]);
+            eprintln!("[TEXT_ENCODER] pos_w[{}..{}]: {:?}", start, end, &pos_w[start..end]);
+        } else {
+            eprintln!("[TEXT_ENCODER] WARNING: No image tokens found (all positions have t==h==w)");
+            // Print some middle positions anyway
+            let mid = pos_t.len() / 2;
+            let end = (mid + 10).min(pos_t.len());
+            eprintln!("[TEXT_ENCODER] pos_t[{}..{}]: {:?}", mid, end, &pos_t[mid..end]);
+            eprintln!("[TEXT_ENCODER] pos_h[{}..{}]: {:?}", mid, end, &pos_h[mid..end]);
+            eprintln!("[TEXT_ENCODER] pos_w[{}..{}]: {:?}", mid, end, &pos_w[mid..end]);
+        }
 
         // 4. Create causal attention mask if sequence length > 1
         let causal_mask = if seq_len <= 1 {
@@ -1389,12 +1479,32 @@ impl Qwen25VLTextModel {
 
         // 5. Forward through all transformer layers
         let mut hidden_states = input_embeds;
-        for layer in self.layers.iter_mut() {
+        let num_layers = self.layers.len();
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+
+            // DEBUG: Print stats for first, middle, and last layers
+            if layer_idx == 0 || layer_idx == num_layers / 2 || layer_idx == num_layers - 1 {
+                let hs_f32 = hidden_states.to_dtype(candle::DType::F32)?;
+                let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+                let hs_std = hs_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+                let hs_min = hs_f32.flatten_all()?.min(0)?.to_scalar::<f32>()?;
+                let hs_max = hs_f32.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+                eprintln!("[TEXT_ENCODER] after_layer_{}: mean={:.6}, std={:.6}, min={:.4}, max={:.4}",
+                    layer_idx, hs_mean, hs_std, hs_min, hs_max);
+            }
         }
 
         // 6. Apply final layer norm (but NOT lm_head - we want hidden states)
-        hidden_states.apply(&self.norm)
+        let output = hidden_states.apply(&self.norm)?;
+
+        // DEBUG: Final output stats
+        let out_f32 = output.to_dtype(candle::DType::F32)?;
+        let out_mean = out_f32.mean_all()?.to_scalar::<f32>()?;
+        let out_std = out_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+        eprintln!("[TEXT_ENCODER] final_output: mean={:.6}, std={:.6}", out_mean, out_std);
+
+        Ok(output)
     }
 
     /// Forward pass for text-only input, returning hidden states.

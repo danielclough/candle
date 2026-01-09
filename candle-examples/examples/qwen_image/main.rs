@@ -184,7 +184,16 @@ enum Command {
         #[arg(long, default_value = "Qwen/Qwen-Image")]
         vae_model_id: String,
 
+        /// Output height (overrides max_resolution if both height and width specified).
+        #[arg(long)]
+        height: Option<usize>,
+
+        /// Output width (overrides max_resolution if both height and width specified).
+        #[arg(long)]
+        width: Option<usize>,
+
         /// Maximum output resolution (longest side). Use 0 to preserve input size.
+        /// Ignored if both --height and --width are specified.
         #[arg(long, default_value_t = 512)]
         max_resolution: usize,
 
@@ -366,6 +375,8 @@ fn main() -> Result<()> {
             true_cfg_scale,
             model_id,
             vae_model_id,
+            height,
+            width,
             max_resolution,
             tiled_decode,
             tile_size,
@@ -380,6 +391,8 @@ fn main() -> Result<()> {
                 true_cfg_scale,
                 model_id,
                 vae_model_id,
+                height,
+                width,
                 max_resolution,
                 tiled_decode,
                 tile_size,

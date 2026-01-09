@@ -145,21 +145,21 @@ pub fn run(
     } else if let Some(seed) = args.seed {
         // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-        // Use [B, T, C, H, W] format to match PyTorch's Qwen-Image convention
+        // Use [B, C, T, H, W] format to match pack_latents expectation
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
-            &[1, 1, 16, dims.latent_height, dims.latent_width],
+            &[1, 16, 1, dims.latent_height, dims.latent_width],
             device,
             DType::F32,
         )?
     } else {
         // Use Candle's default RNG (not reproducible across frameworks)
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-        // Use [B, T, C, H, W] format to match PyTorch's Qwen-Image convention
+        // Use [B, C, T, H, W] format to match pack_latents expectation
         Tensor::randn(
             0f32,
             1f32,
-            (1, 1, 16, dims.latent_height, dims.latent_width),
+            (1, 16, 1, dims.latent_height, dims.latent_width),
             device,
         )?
     };
@@ -221,10 +221,12 @@ pub fn run(
             noise_pred
         };
 
+        // Unpack noise prediction: 3D packed -> [B, C, T, H, W]
         let unpacked = unpack_latents(&noise_pred, dims.latent_height, dims.latent_width, 16)?;
         // Convert noise prediction back to F32 for scheduler arithmetic
         let unpacked = unpacked.to_dtype(DType::F32)?;
 
+        // Both unpacked and latents are [B, C, T, H, W], scheduler does element-wise ops
         latents = scheduler.step(&unpacked, &latents)?;
     }
 
@@ -236,6 +238,7 @@ pub fn run(
     // =========================================================================
     println!("\n[5/5] Decoding latents...");
 
+    // latents are already in [B, C, T, H, W] format (matching VAE expectation)
     let denormalized = vae.denormalize_latents(&latents)?;
 
     // Use decode_image for single-frame output (matches PyTorch: vae.decode(z)[:, :, 0])

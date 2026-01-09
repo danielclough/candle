@@ -13,40 +13,20 @@
 //! - No DeepStack injection (unlike Qwen3-VL)
 
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{rms_norm, Conv2d, Conv2dConfig, Linear, RmsNorm, VarBuilder};
+use candle_nn::{rms_norm, Linear, RmsNorm, VarBuilder};
 
 use super::config::VisionConfig;
 use crate::models::qwen_image::debug::debug_tensor;
 
 // ============================================================================
-// Conv3d for temporal patch size = 2
+// Conv3d for patch embedding (no bias, asymmetric kernel/stride)
 // ============================================================================
 
-/// Configuration for 3D convolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Conv3dConfig {
-    pub padding: usize,
-    pub stride: usize,
-    pub dilation: usize,
-    pub groups: usize,
-}
-
-impl Default for Conv3dConfig {
-    fn default() -> Self {
-        Self {
-            padding: 0,
-            stride: 1,
-            dilation: 1,
-            groups: 1,
-        }
-    }
-}
-
-/// 3D convolution without bias, implemented as two 2D convolutions.
-/// Assumes temporal patch size of 2.
+/// 3D convolution without bias, using native Candle conv3d.
+/// Supports asymmetric kernel sizes and strides (e.g., [2, 14, 14]).
 pub struct Conv3dNoBias {
-    conv2d_1: Conv2d,
-    conv2d_2: Conv2d,
+    weight: Tensor,
+    stride: (usize, usize, usize),
 }
 
 impl Conv3dNoBias {
@@ -54,13 +34,12 @@ impl Conv3dNoBias {
         in_channels: usize,
         out_channels: usize,
         kernel_sizes: [usize; 3],
-        cfg: Conv3dConfig,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let ws = vb.get(
+        let weight = vb.get(
             (
                 out_channels,
-                in_channels / cfg.groups,
+                in_channels,
                 kernel_sizes[0],
                 kernel_sizes[1],
                 kernel_sizes[2],
@@ -68,30 +47,18 @@ impl Conv3dNoBias {
             "weight",
         )?;
 
-        // Split on temporal dimension (assuming temporal_patch_size = 2)
-        let w1 = ws.i((.., .., 0, .., ..))?;
-        let w2 = ws.i((.., .., 1, .., ..))?;
+        // Stride matches kernel size (standard for patch embedding)
+        let stride = (kernel_sizes[0], kernel_sizes[1], kernel_sizes[2]);
 
-        let cfg = Conv2dConfig {
-            padding: cfg.padding,
-            stride: cfg.stride,
-            dilation: cfg.dilation,
-            groups: cfg.groups,
-            cudnn_fwd_algo: None,
-        };
-
-        Ok(Self {
-            conv2d_1: Conv2d::new(w1.contiguous()?, None, cfg),
-            conv2d_2: Conv2d::new(w2.contiguous()?, None, cfg),
-        })
+        Ok(Self { weight, stride })
     }
 }
 
 impl Module for Conv3dNoBias {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs1 = xs.i((.., .., 0, .., ..))?;
-        let xs2 = xs.i((.., .., 1, .., ..))?;
-        (self.conv2d_1.forward(&xs1)? + self.conv2d_2.forward(&xs2)?)?.unsqueeze(2)
+        let padding = (0, 0, 0);
+        let dilation = (1, 1, 1);
+        xs.conv3d(&self.weight, padding, self.stride, dilation, 1)
     }
 }
 
@@ -123,10 +90,6 @@ impl PatchEmbed {
             cfg.in_chans,
             cfg.hidden_size,
             [cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size],
-            Conv3dConfig {
-                stride: cfg.patch_size,
-                ..Default::default()
-            },
             proj_vb,
         )?;
         Ok(Self {
@@ -355,8 +318,8 @@ impl VisionBlock {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
-        // All operations in original dtype (BF16) to match weights
-        // Only residual additions are done in F32 for numerical precision
+        // Operations run in the model's dtype (F32 or BF16 depending on how loaded)
+        // Residual additions are done in F32 for numerical precision
         let normed = self.norm1.forward(xs)?;
         let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
 

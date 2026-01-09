@@ -76,8 +76,12 @@ def main():
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to run on (cuda or cpu, NOT mps - has issues)")
+    parser.add_argument("--height", type=int, default=None,
+                        help="Output height (overrides auto-calculation)")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Output width (overrides auto-calculation)")
     parser.add_argument("--max-resolution", type=int, default=512,
-                        help="Maximum resolution for the longer side")
+                        help="Maximum resolution for the longer side (used if height/width not specified)")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen-Image-Edit-2511",
                         help="HuggingFace model ID for the edit pipeline")
     args = parser.parse_args()
@@ -132,15 +136,21 @@ def main():
     # Calculate dimensions (matching pipeline behavior)
     # =========================================================================
     import math
-    target_area = 512 * 512
-    ratio = orig_width / orig_height
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-    width, height = int(width), int(height)
 
-    print(f"Target dimensions: {width}x{height}")
+    if args.height is not None and args.width is not None:
+        # Use explicit dimensions
+        width, height = args.width, args.height
+        print(f"Using explicit dimensions: {width}x{height}")
+    else:
+        # Auto-calculate from max_resolution
+        target_area = args.max_resolution * args.max_resolution
+        ratio = orig_width / orig_height
+        width = math.sqrt(target_area * ratio)
+        height = width / ratio
+        width = round(width / 32) * 32
+        height = round(height / 32) * 32
+        width, height = int(width), int(height)
+        print(f"Target dimensions: {width}x{height} (from max_resolution={args.max_resolution})")
 
     # Align to VAE scale factor * 2
     multiple_of = pipe.vae_scale_factor * 2
@@ -295,6 +305,10 @@ def main():
     print(f"  pixel_values shape: {pixel_values.shape}")
     print(f"  image_grid_thw: {image_grid_thw}")
 
+    # Save pixel_values for comparison with Rust
+    tensor_stats("vision_pixel_values", pixel_values)
+    save_tensor("vision_pixel_values", pixel_values, args.output_dir)
+
     # Run vision encoder with intermediate capture
     with torch.no_grad():
         # Components
@@ -424,16 +438,63 @@ def main():
     else:
         print("  WARNING: Failed to capture vision embeddings!")
 
-    # Hook to capture intermediate text encoder outputs
+    # =========================================================================
+    # DEBUG: Add comprehensive text encoder hooks to match Rust debug output
+    # =========================================================================
+    print("\n  [TEXT_ENCODER DEBUG] Setting up hooks...")
+
     text_encoder_captures = {}
 
-    def capture_hidden_states(module, args, kwargs, output):
-        """Capture the final hidden states."""
-        if hasattr(output, "hidden_states") and output.hidden_states is not None:
-            text_encoder_captures["hidden_states_last"] = output.hidden_states[-1].detach().clone()
+    # Get the underlying language model (nested structure in Qwen2.5-VL)
+    # pipe.text_encoder.model is Qwen2_5_VLModel
+    # pipe.text_encoder.model.language_model is Qwen2_5_VLTextModel (has embed_tokens, layers, norm)
+    language_model = pipe.text_encoder.model.language_model
+
+    # Hook 1: Capture input embeddings
+    def capture_embed_tokens(module, args, output):
+        text_encoder_captures["token_embeds"] = output.detach().clone()
+        print(f"  [PY_TEXT_ENCODER] token_embeds: mean={output.float().mean():.6f}, std={output.float().std():.6f}")
         return output
 
-    hook = pipe.text_encoder.register_forward_hook(capture_hidden_states, with_kwargs=True)
+    embed_hook = language_model.embed_tokens.register_forward_hook(capture_embed_tokens)
+
+    # Hook 2: Capture hidden states after each layer
+    layer_hooks = []
+    num_layers = len(language_model.layers)
+
+    def make_layer_hook(layer_idx):
+        def hook(module, args, output):
+            hs = output[0] if isinstance(output, tuple) else output
+            text_encoder_captures[f"after_layer_{layer_idx}"] = hs.detach().clone()
+            # Print for first, middle, and last layers
+            if layer_idx == 0 or layer_idx == num_layers // 2 or layer_idx == num_layers - 1:
+                hs_f = hs.float()
+                print(f"  [PY_TEXT_ENCODER] after_layer_{layer_idx}: mean={hs_f.mean():.6f}, std={hs_f.std():.6f}, min={hs_f.min():.4f}, max={hs_f.max():.4f}")
+            return output
+        return hook
+
+    for i, layer in enumerate(language_model.layers):
+        h = layer.register_forward_hook(make_layer_hook(i))
+        layer_hooks.append(h)
+
+    # Hook 3: Capture final norm output
+    def capture_final_norm(module, args, output):
+        text_encoder_captures["final_norm"] = output.detach().clone()
+        print(f"  [PY_TEXT_ENCODER] final_output: mean={output.float().mean():.6f}, std={output.float().std():.6f}")
+        return output
+
+    norm_hook = language_model.norm.register_forward_hook(capture_final_norm)
+
+    # Also print tokenization info and tokens
+    print(f"\n  [PY_TEXT_ENCODER] Encoding prompt: '{args.prompt[:50]}...'")
+
+    # Get tokenization to compare with Rust
+    # The template used by Qwen-Image Edit
+    EDIT_TEMPLATE = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+    templated_prompt = EDIT_TEMPLATE.format(args.prompt)
+    tokenizer = pipe.tokenizer
+    tokens = tokenizer.encode(templated_prompt, add_special_tokens=False)
+    print(f"  [PY_TEXT_ENCODER] seq_len={len(tokens)}, first 10 tokens: {tokens[:10]}")
 
     # Encode positive prompt
     prompt_embeds, prompt_mask = pipe.encode_prompt(
@@ -443,7 +504,13 @@ def main():
         num_images_per_prompt=1,
     )
 
-    hook.remove()
+    # Remove all hooks
+    embed_hook.remove()
+    for h in layer_hooks:
+        h.remove()
+    norm_hook.remove()
+
+    print(f"  [PY_TEXT_ENCODER] prompt_embeds shape: {list(prompt_embeds.shape)}")
 
     save_tensor("prompt_embeds", prompt_embeds, args.output_dir)
     save_tensor("prompt_mask", prompt_mask.float(), args.output_dir)
@@ -500,18 +567,16 @@ def main():
     # =========================================================================
     import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit as edit_pipeline_module
 
+    # Capture the target dimensions for the patch
+    _target_width, _target_height = width, height
+
     def _patched_calculate_dimensions(target_area, ratio):
-        """Force 512x512 encoding dimensions (matching Rust implementation)."""
-        # Use 512*512 instead of 1024*1024
-        patched_area = 512 * 512
-        width = math.sqrt(patched_area * ratio)
-        height_val = width / ratio
-        width = round(width / 32) * 32
-        height_val = round(height_val / 32) * 32
-        return int(width), int(height_val), None
+        """Force dimensions to match what we're using (matching Rust implementation)."""
+        # Return our pre-calculated dimensions instead of pipeline's default
+        return _target_width, _target_height, None
 
     edit_pipeline_module.calculate_dimensions = _patched_calculate_dimensions
-    print("  [PATCH] Overriding calculate_dimensions to use 512x512 (matching Rust)")
+    print(f"  [PATCH] Overriding calculate_dimensions to use {_target_width}x{_target_height} (matching Rust)")
 
     # Reset generator
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -521,13 +586,151 @@ def main():
     transformer_captures = {}
     transformer_call_counter = {"count": 0}  # Counts calls within current step
 
+    # =========================================================================
+    # Hook to capture DIFFUSION RoPE embeddings from inside the transformer
+    # =========================================================================
+    rope_captures = {}
+
+    def capture_rope_forward(module, args, output):
+        """Capture RoPE frequencies from pos_embed.forward()"""
+        step = transformer_step_counter["count"]
+        if step == 0 and "img_freqs" not in rope_captures:
+            # output is tuple: (image_rotary_emb, text_rotary_emb)
+            img_freqs, txt_freqs = output
+
+            # PyTorch RoPE uses complex numbers! Convert to [seq, dim, 2] format (real, imag)
+            # to match Rust's representation
+            if img_freqs.is_complex():
+                img_freqs_real = torch.stack([img_freqs.real, img_freqs.imag], dim=-1)
+                txt_freqs_real = torch.stack([txt_freqs.real, txt_freqs.imag], dim=-1)
+                print(f"  [DIFFUSION_ROPE] Converting complex RoPE to real format")
+            else:
+                img_freqs_real = img_freqs
+                txt_freqs_real = txt_freqs
+
+            rope_captures["img_freqs"] = img_freqs_real.detach().clone()
+            rope_captures["txt_freqs"] = txt_freqs_real.detach().clone()
+
+            print(f"  [DIFFUSION_ROPE] img_freqs: shape={list(img_freqs_real.shape)}, "
+                  f"mean={img_freqs_real.float().mean():.6f}, min={img_freqs_real.min():.6f}, max={img_freqs_real.max():.6f}")
+            print(f"  [DIFFUSION_ROPE] txt_freqs: shape={list(txt_freqs_real.shape)}, "
+                  f"mean={txt_freqs_real.float().mean():.6f}, min={txt_freqs_real.min():.6f}, max={txt_freqs_real.max():.6f}")
+
+            # Print first position's frequencies for comparison with Rust
+            # Format: [seq, dim/2, 2] where last dim is [cos/real, sin/imag]
+            if img_freqs_real.dim() == 3:
+                first_pos = img_freqs_real[0].float()  # [dim/2, 2]
+                cos_vals = first_pos[:, 0].tolist()
+                sin_vals = first_pos[:, 1].tolist()
+                print(f"  [DIFFUSION_ROPE] img pos[0] cos[0:8]: {cos_vals[:8]}")
+                print(f"  [DIFFUSION_ROPE] img pos[0] sin[0:8]: {sin_vals[:8]}")
+                print(f"  [DIFFUSION_ROPE] img pos[0] cos[8:16]: {cos_vals[8:16]}")
+                print(f"  [DIFFUSION_ROPE] img pos[0] sin[8:16]: {sin_vals[8:16]}")
+        return output
+
+    # Hook the pos_embed module inside transformer
+    rope_hook = None
+    if hasattr(pipe.transformer, 'pos_embed'):
+        rope_hook = pipe.transformer.pos_embed.register_forward_hook(capture_rope_forward)
+        print("  [HOOK] Registered RoPE capture hook on transformer.pos_embed")
+
+    # =========================================================================
+    # Hook to capture BLOCK 0 internal tensors
+    # =========================================================================
+    block0_captures = {}
+
+    def capture_block0_forward(module, args, kwargs, output):
+        """Capture block 0 inputs and outputs"""
+        step = transformer_step_counter["count"]
+        if step == 0 and transformer_call_counter["count"] == 0 and "output" not in block0_captures:
+            # args: (hidden_states, encoder_hidden_states)
+            # kwargs: temb, image_rotary_emb
+            hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+            encoder_hidden_states = args[1] if len(args) > 1 else kwargs.get("encoder_hidden_states")
+
+            if hidden_states is not None:
+                block0_captures["input_img"] = hidden_states.detach().clone()
+                print(f"  [BLOCK0] input_img: shape={list(hidden_states.shape)}, "
+                      f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+            if encoder_hidden_states is not None:
+                block0_captures["input_txt"] = encoder_hidden_states.detach().clone()
+                print(f"  [BLOCK0] input_txt: shape={list(encoder_hidden_states.shape)}, "
+                      f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
+
+            # output is tuple: (encoder_hidden_states, hidden_states)
+            enc_out, hid_out = output
+            block0_captures["output_txt"] = enc_out.detach().clone()
+            block0_captures["output_img"] = hid_out.detach().clone()
+            print(f"  [BLOCK0] output_img: shape={list(hid_out.shape)}, "
+                  f"mean={hid_out.float().mean():.6f}, std={hid_out.float().std():.6f}")
+            print(f"  [BLOCK0] output_txt: shape={list(enc_out.shape)}, "
+                  f"mean={enc_out.float().mean():.6f}, std={enc_out.float().std():.6f}")
+        return output
+
+    # =========================================================================
+    # Hook to capture BLOCK 0 INTERNAL tensors (modulation, norm, attention)
+    # =========================================================================
+    block0_internal_captures = {}
+
+    def capture_block0_internals():
+        """Set up hooks to capture internal block 0 tensors"""
+        block0 = pipe.transformer.transformer_blocks[0]
+        hooks = []
+
+        # Capture modulation output
+        def capture_img_mod(module, args, output):
+            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+                mod1, mod2 = output
+                block0_internal_captures["img_mod1_shift"] = mod1[0].detach().clone()
+                block0_internal_captures["img_mod1_scale"] = mod1[1].detach().clone()
+                block0_internal_captures["img_mod1_gate"] = mod1[2].detach().clone()
+                print(f"  [BLOCK0.INTERNAL] img_mod1_scale: mean={mod1[1].float().mean():.6f}")
+            return output
+
+        def capture_txt_mod(module, args, output):
+            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+                mod1, mod2 = output
+                block0_internal_captures["txt_mod1_shift"] = mod1[0].detach().clone()
+                block0_internal_captures["txt_mod1_scale"] = mod1[1].detach().clone()
+                block0_internal_captures["txt_mod1_gate"] = mod1[2].detach().clone()
+                print(f"  [BLOCK0.INTERNAL] txt_mod1_scale: mean={mod1[1].float().mean():.6f}")
+            return output
+
+        # Capture attention internals
+        def capture_attn(module, args, kwargs, output):
+            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+                img_out, txt_out = output
+                block0_internal_captures["attn_img_out"] = img_out.detach().clone()
+                block0_internal_captures["attn_txt_out"] = txt_out.detach().clone()
+                print(f"  [BLOCK0.INTERNAL] attn_img_out: mean={img_out.float().mean():.6f}, std={img_out.float().std():.6f}")
+                print(f"  [BLOCK0.INTERNAL] attn_txt_out: mean={txt_out.float().mean():.6f}, std={txt_out.float().std():.6f}")
+            return output
+
+        # Register hooks
+        if hasattr(block0, 'img_mod'):
+            hooks.append(block0.img_mod.register_forward_hook(capture_img_mod))
+        if hasattr(block0, 'txt_mod'):
+            hooks.append(block0.txt_mod.register_forward_hook(capture_txt_mod))
+        if hasattr(block0, 'attn'):
+            hooks.append(block0.attn.register_forward_hook(capture_attn, with_kwargs=True))
+
+        return hooks
+
+    block0_internal_hooks = capture_block0_internals()
+    print("  [HOOK] Registered block 0 internal capture hooks")
+
+    block0_hook = None
+    if hasattr(pipe.transformer, 'transformer_blocks') and len(pipe.transformer.transformer_blocks) > 0:
+        block0_hook = pipe.transformer.transformer_blocks[0].register_forward_hook(capture_block0_forward, with_kwargs=True)
+        print("  [HOOK] Registered block 0 capture hook")
+
     def capture_transformer_io(module, hook_args, kwargs, output):
-        """Capture transformer input and output at step 0."""
+        """Capture transformer input and output at each step."""
         step = transformer_step_counter["count"]
         call_in_step = transformer_call_counter["count"]
 
-        # Only capture at step 0
-        if step == 0:
+        # Capture noise predictions for all steps
+        if True:  # Was: step == 0
             hidden_states = kwargs.get("hidden_states", hook_args[0] if hook_args else None)
             encoder_hidden_states = kwargs.get("encoder_hidden_states")
             timestep = kwargs.get("timestep")
@@ -539,35 +742,36 @@ def main():
 
             if call_in_step == 0:
                 # First call = positive/conditional prediction
-                if hidden_states is not None:
-                    transformer_captures["input_hidden_states"] = hidden_states.detach().clone()
-                    print(f"  [TRANSFORMER] input_hidden_states: shape={list(hidden_states.shape)}, "
-                          f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
-                if encoder_hidden_states is not None:
-                    transformer_captures["input_encoder_hidden_states"] = encoder_hidden_states.detach().clone()
-                    print(f"  [TRANSFORMER] input_encoder_hidden_states: shape={list(encoder_hidden_states.shape)}, "
-                          f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
-                if timestep is not None:
-                    transformer_captures["input_timestep"] = timestep.detach().clone()
-                    print(f"  [TRANSFORMER] input_timestep: {timestep.item():.6f}")
+                if step == 0:
+                    if hidden_states is not None:
+                        transformer_captures["input_hidden_states"] = hidden_states.detach().clone()
+                        print(f"  [TRANSFORMER] input_hidden_states: shape={list(hidden_states.shape)}, "
+                              f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+                    if encoder_hidden_states is not None:
+                        transformer_captures["input_encoder_hidden_states"] = encoder_hidden_states.detach().clone()
+                        print(f"  [TRANSFORMER] input_encoder_hidden_states: shape={list(encoder_hidden_states.shape)}, "
+                              f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
+                    if timestep is not None:
+                        transformer_captures["input_timestep"] = timestep.detach().clone()
+                        print(f"  [TRANSFORMER] input_timestep: {timestep.item():.6f}")
 
-                transformer_captures["noise_pred_full"] = noise_pred.detach().clone()
-                print(f"  [TRANSFORMER] noise_pred_full: shape={list(noise_pred.shape)}, "
-                      f"mean={noise_pred.float().mean():.6f}, std={noise_pred.float().std():.6f}")
+                    transformer_captures["noise_pred_full"] = noise_pred.detach().clone()
+                    print(f"  [TRANSFORMER] noise_pred_full: shape={list(noise_pred.shape)}, "
+                          f"mean={noise_pred.float().mean():.6f}, std={noise_pred.float().std():.6f}")
 
-                # Save positive prediction (extracted noise part only)
-                transformer_captures["noise_pred_pos_step0"] = noise_pred_extracted.detach().clone()
-                print(f"  [TRANSFORMER] noise_pred_pos_step0: shape={list(noise_pred_extracted.shape)}, "
+                # Save positive prediction for this step
+                transformer_captures[f"noise_pred_pos_step{step}"] = noise_pred_extracted.detach().clone()
+                print(f"  [TRANSFORMER] noise_pred_pos_step{step}: shape={list(noise_pred_extracted.shape)}, "
                       f"mean={noise_pred_extracted.float().mean():.6f}, std={noise_pred_extracted.float().std():.6f}")
 
             elif call_in_step == 1 and do_true_cfg:
                 # Second call = negative/unconditional prediction
-                transformer_captures["noise_pred_neg_step0"] = noise_pred_extracted.detach().clone()
-                print(f"  [TRANSFORMER] noise_pred_neg_step0: shape={list(noise_pred_extracted.shape)}, "
+                transformer_captures[f"noise_pred_neg_step{step}"] = noise_pred_extracted.detach().clone()
+                print(f"  [TRANSFORMER] noise_pred_neg_step{step}: shape={list(noise_pred_extracted.shape)}, "
                       f"mean={noise_pred_extracted.float().mean():.6f}, std={noise_pred_extracted.float().std():.6f}")
 
                 # Compute guided prediction (CFG)
-                pos_pred = transformer_captures["noise_pred_pos_step0"]
+                pos_pred = transformer_captures[f"noise_pred_pos_step{step}"]
                 neg_pred = noise_pred_extracted
                 # CFG formula: neg + scale * (pos - neg)
                 guided = neg_pred + args.true_cfg_scale * (pos_pred - neg_pred)
@@ -577,8 +781,8 @@ def main():
                 noise_norm = torch.norm(guided, dim=-1, keepdim=True)
                 guided = guided * (cond_norm / noise_norm)
 
-                transformer_captures["guided_pred_step0"] = guided.detach().clone()
-                print(f"  [TRANSFORMER] guided_pred_step0: shape={list(guided.shape)}, "
+                transformer_captures[f"guided_pred_step{step}"] = guided.detach().clone()
+                print(f"  [TRANSFORMER] guided_pred_step{step}: shape={list(guided.shape)}, "
                       f"mean={guided.float().mean():.6f}, std={guided.float().std():.6f}")
 
         transformer_call_counter["count"] += 1
@@ -595,11 +799,13 @@ def main():
         transformer_call_counter["count"] = 0
         transformer_step_counter["count"] += 1
 
+        # Save latents after each step
+        save_tensor(f"latents_after_step{step_idx}", latents, args.output_dir)
+        tensor_stats(f"latents_after_step{step_idx}", latents)
+
+        # Keep backwards-compatible names for step 0
         if step_idx == 0:
             save_tensor("packed_latents_after_step0", latents, args.output_dir)
-            tensor_stats("packed_latents_after_step0", latents)
-
-            # Unpack for comparison
             latents_unpacked = pipe_obj._unpack_latents(latents, height, width, pipe_obj.vae_scale_factor)
             save_tensor("latents_after_step0", latents_unpacked, args.output_dir)
 
@@ -624,11 +830,34 @@ def main():
     )
 
     transformer_hook.remove()
+    if rope_hook is not None:
+        rope_hook.remove()
+    if block0_hook is not None:
+        block0_hook.remove()
 
     # Save transformer captures
     print("\n  Saving transformer captures...")
     for name, tensor in transformer_captures.items():
         save_tensor(f"transformer_{name}", tensor, args.output_dir)
+
+    # Save RoPE captures
+    print("\n  Saving RoPE captures...")
+    for name, tensor in rope_captures.items():
+        save_tensor(f"diffusion_rope_{name}", tensor, args.output_dir)
+
+    # Save block0 captures
+    print("\n  Saving block 0 captures...")
+    for name, tensor in block0_captures.items():
+        save_tensor(f"block0_{name}", tensor, args.output_dir)
+
+    # Save block0 internal captures
+    print("\n  Saving block 0 internal captures...")
+    for name, tensor in block0_internal_captures.items():
+        save_tensor(f"block0_internal_{name}", tensor, args.output_dir)
+
+    # Cleanup internal hooks
+    for hook in block0_internal_hooks:
+        hook.remove()
 
     # Save final latents
     final_latents_packed = result.images
