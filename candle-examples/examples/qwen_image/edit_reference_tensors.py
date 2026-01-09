@@ -84,6 +84,8 @@ def main():
                         help="Maximum resolution for the longer side (used if height/width not specified)")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen-Image-Edit-2511",
                         help="HuggingFace model ID for the edit pipeline")
+    parser.add_argument("--use-f32", action="store_true",
+                        help="Use full F32 precision (default is mixed precision matching Candle)")
     args = parser.parse_args()
 
     # Force CPU if MPS was selected - MPS has numerical issues with this model
@@ -92,7 +94,9 @@ def main():
         args.device = "cpu"
 
     device = torch.device(args.device)
-    dtype = torch.float32  # Use float32 for consistency
+    # Default: Match Candle's mixed precision (BF16 for VAE/transformer, F32 for vision/attention)
+    # With --use-f32: Use full F32 everywhere
+    dtype = torch.float32 if args.use_f32 else torch.bfloat16
 
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Model: {args.model_id}")
@@ -120,6 +124,17 @@ def main():
         torch_dtype=dtype,
     )
     pipe = pipe.to(device)
+
+    # Match Candle's mixed precision exactly:
+    # - Vision encoder: always F32
+    # - Text encoder: always F32 (outputs converted to BF16 for transformer)
+    # - VAE: BF16 (main dtype)
+    # - Transformer: BF16 (main dtype)
+    if dtype == torch.bfloat16:
+        pipe.image_encoder = pipe.image_encoder.to(torch.float32)
+        pipe.text_encoder = pipe.text_encoder.to(torch.float32)
+        print("  Vision encoder set to F32 (matching Candle)")
+        print("  Text encoder set to F32 (matching Candle)")
 
     print("  Pipeline loaded!")
     print(f"  VAE scale factor: {pipe.vae_scale_factor}")
