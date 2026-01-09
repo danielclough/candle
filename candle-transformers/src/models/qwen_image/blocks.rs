@@ -191,11 +191,14 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let scale_factor = 1.0 / (head_dim as f64).sqrt();
 
     // Upcast to F32 for numerical stability
-    let q = q.to_dtype(DType::F32)?;
-    let k = k.to_dtype(DType::F32)?;
-    let v = v.to_dtype(DType::F32)?;
+    // Note: Must call contiguous() because input tensors are non-contiguous after transpose.
+    // When already F32, to_dtype is a no-op preserving non-contiguous layout, but Metal
+    // matmul requires contiguous tensors.
+    let q = q.to_dtype(DType::F32)?.contiguous()?;
+    let k = k.to_dtype(DType::F32)?.contiguous()?;
+    let v = v.to_dtype(DType::F32)?.contiguous()?;
 
-    let k_t = k.transpose(D::Minus2, D::Minus1)?;
+    let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
     let attn_logits = q.matmul(&k_t)?;
     let attn_weights = (&attn_logits * scale_factor)?;
 

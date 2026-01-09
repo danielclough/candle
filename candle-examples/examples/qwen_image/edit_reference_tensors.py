@@ -678,22 +678,36 @@ def main():
         hooks = []
 
         # Capture modulation output
+        # Note: diffusers modulation returns a single tensor [B, 1, 6*dim] that gets chunked later,
+        # not a tuple of (mod1, mod2). We chunk it here to extract the parameters.
         def capture_img_mod(module, args, output):
             if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
-                mod1, mod2 = output
-                block0_internal_captures["img_mod1_shift"] = mod1[0].detach().clone()
-                block0_internal_captures["img_mod1_scale"] = mod1[1].detach().clone()
-                block0_internal_captures["img_mod1_gate"] = mod1[2].detach().clone()
-                print(f"  [BLOCK0.INTERNAL] img_mod1_scale: mean={mod1[1].float().mean():.6f}")
+                # Output is a single tensor [B, 1, 6*dim] - chunk into 6 parts
+                if isinstance(output, tuple):
+                    mod1, mod2 = output
+                    shift, scale, gate = mod1[0], mod1[1], mod1[2]
+                else:
+                    chunks = output.chunk(6, dim=-1)
+                    shift, scale, gate = chunks[0], chunks[1], chunks[2]
+                block0_internal_captures["img_mod1_shift"] = shift.detach().clone()
+                block0_internal_captures["img_mod1_scale"] = scale.detach().clone()
+                block0_internal_captures["img_mod1_gate"] = gate.detach().clone()
+                print(f"  [BLOCK0.INTERNAL] img_mod1_scale: mean={scale.float().mean():.6f}")
             return output
 
         def capture_txt_mod(module, args, output):
             if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
-                mod1, mod2 = output
-                block0_internal_captures["txt_mod1_shift"] = mod1[0].detach().clone()
-                block0_internal_captures["txt_mod1_scale"] = mod1[1].detach().clone()
-                block0_internal_captures["txt_mod1_gate"] = mod1[2].detach().clone()
-                print(f"  [BLOCK0.INTERNAL] txt_mod1_scale: mean={mod1[1].float().mean():.6f}")
+                # Output is a single tensor [B, 1, 6*dim] - chunk into 6 parts
+                if isinstance(output, tuple):
+                    mod1, mod2 = output
+                    shift, scale, gate = mod1[0], mod1[1], mod1[2]
+                else:
+                    chunks = output.chunk(6, dim=-1)
+                    shift, scale, gate = chunks[0], chunks[1], chunks[2]
+                block0_internal_captures["txt_mod1_shift"] = shift.detach().clone()
+                block0_internal_captures["txt_mod1_scale"] = scale.detach().clone()
+                block0_internal_captures["txt_mod1_gate"] = gate.detach().clone()
+                print(f"  [BLOCK0.INTERNAL] txt_mod1_scale: mean={scale.float().mean():.6f}")
             return output
 
         # Capture attention internals

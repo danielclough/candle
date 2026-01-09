@@ -115,7 +115,8 @@ pub fn run(
 
     let image_latents = vae.normalize_latents(&image_latents_raw)?;
     let image_latents = debug::checkpoint(&mut debug_ctx, "image_latents_normalized", image_latents)?;
-    // Keep in [B, C, T, H, W] format for pack_latents
+    // Permute from VAE format [B, C, T, H, W] to pack format [B, T, C, H, W]
+    let image_latents = image_latents.permute([0, 2, 1, 3, 4])?;
     println!("  Image latents shape: {:?}", image_latents.dims());
 
     // =========================================================================
@@ -214,12 +215,12 @@ pub fn run(
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
     // Create initial noise (F32 to avoid BF16 quantization error)
-    // Use [B, C, T, H, W] format to match pack_latents expectation
+    // Use [B, T, C, H, W] format to match PyTorch diffusers
     let noise_latents = if let Some(seed) = args.seed {
         // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
-            &[1, 16, 1, dims.latent_height, dims.latent_width],
+            &[1, 1, 16, dims.latent_height, dims.latent_width],
             &Device::Cpu,
             DType::F32,
         )?
@@ -229,7 +230,7 @@ pub fn run(
         Tensor::randn(
             0f32,
             1f32,
-            (1, 16, 1, dims.latent_height, dims.latent_width),
+            (1, 1, 16, dims.latent_height, dims.latent_width),
             device,
         )?
     };
