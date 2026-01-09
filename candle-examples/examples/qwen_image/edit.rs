@@ -15,7 +15,7 @@ use candle_transformers::models::{
         Qwen25VLVisionModel, VisionConfig, DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS,
     },
     qwen_image::{
-        apply_true_cfg, pack_latents, unpack_latents, Config, TiledDecodeConfig,
+        apply_true_cfg, pack_latents, set_cfg_pass, unpack_latents, Config, TiledDecodeConfig,
         EDIT_DROP_TOKENS, EDIT_PROMPT_TEMPLATE,
     },
 };
@@ -72,6 +72,14 @@ pub fn run(
     println!("Negative prompt: {}", if args.negative_prompt.is_empty() { "(none)" } else { &args.negative_prompt });
     println!("CFG scale: {}", args.true_cfg_scale);
     println!("Steps: {}", args.num_inference_steps);
+
+    // Warn if CFG is specified but no negative prompt (matching Python behavior)
+    if args.negative_prompt.is_empty() && args.true_cfg_scale != 1.0 {
+        println!(
+            "Warning: true_cfg_scale is passed as {}, but classifier-free guidance is not enabled since no negative_prompt is provided.",
+            args.true_cfg_scale
+        );
+    }
 
     let api = hf_hub::api::sync::Api::new()?;
 
@@ -185,23 +193,26 @@ pub fn run(
     let pos_embeds = pos_embeds.to_dtype(dtype)?;
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
-    let neg_prompt = if args.negative_prompt.is_empty() {
-        ""
+    // Only encode negative prompt if one is provided (matching Python behavior)
+    let (neg_embeds, neg_mask) = if !args.negative_prompt.is_empty() {
+        let (neg_embeds, neg_mask) = encode_prompt_with_vision(
+            &tokenizer,
+            &mut text_model,
+            &args.negative_prompt,
+            &vision_embeds,
+            &image_grid_thw,
+            num_image_tokens,
+            device,
+        )?;
+        let neg_embeds = debug::checkpoint(&mut debug_ctx, "negative_prompt_embeds", neg_embeds)?;
+        let neg_mask = debug::checkpoint(&mut debug_ctx, "negative_prompt_mask", neg_mask)?;
+        let neg_embeds = neg_embeds.to_dtype(dtype)?;
+        println!("  Negative prompt embeddings: {:?}", neg_embeds.dims());
+        (Some(neg_embeds), Some(neg_mask))
     } else {
-        &args.negative_prompt
+        // No negative prompt → skip encoding entirely (Python skips CFG in this case)
+        (None, None)
     };
-    let (neg_embeds, neg_mask) = encode_prompt_with_vision(
-        &tokenizer,
-        &mut text_model,
-        neg_prompt,
-        &vision_embeds,
-        &image_grid_thw,
-        num_image_tokens,
-        device,
-    )?;
-    let neg_embeds = debug::checkpoint(&mut debug_ctx, "negative_prompt_embeds", neg_embeds)?;
-    let neg_mask = debug::checkpoint(&mut debug_ctx, "negative_prompt_mask", neg_mask)?;
-    let neg_embeds = neg_embeds.to_dtype(dtype)?;
 
     // Free text encoder from memory before loading transformer
     drop(text_model);
@@ -266,7 +277,10 @@ pub fn run(
         (1, dims.packed_height, dims.packed_width),  // Noise latents
         (1, dims.packed_height, dims.packed_width),  // Image latents
     ];
-    let txt_seq_lens = vec![pos_embeds.dim(1)?];
+    // Text sequence lengths for RoPE - must match actual embedding lengths!
+    // Positive and negative prompts may have different token counts.
+    let pos_txt_seq_lens = vec![pos_embeds.dim(1)?];
+    let neg_txt_seq_lens = neg_embeds.as_ref().map(|e| vec![e.dim(1).unwrap()]);
 
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
@@ -297,13 +311,25 @@ pub fn run(
             debug::checkpoint(&mut debug_ctx, "transformer_input_timestep", t.clone())?;
         }
 
-        let pos_pred = transformer.forward(
+        // Compute temb externally for debug substitution (edit mode uses doubled timestep)
+        let doubled_t = Tensor::cat(&[&t, &(&t * 0.0)?], 0)?;
+        let temb = transformer.compute_temb(&doubled_t, dtype)?;
+        let temb = if step == 0 {
+            debug::checkpoint(&mut debug_ctx, "block0_temb", temb)?
+        } else {
+            temb
+        };
+
+        // Set CFG pass for block override loading (positive = 0)
+        set_cfg_pass(0);
+        let pos_pred = transformer.forward_with_temb(
             &latent_model_input,
             &pos_embeds,
             &pos_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
+            &pos_txt_seq_lens,
+            Some(&temb),
         )?;
 
         // Debug: capture full transformer output at step 0 (before extraction)
@@ -311,47 +337,55 @@ pub fn run(
             debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_full", pos_pred.clone())?;
         }
 
-        let neg_pred = transformer.forward(
-            &latent_model_input,
-            &neg_embeds,
-            &neg_mask,
-            &t,
-            &img_shapes,
-            &txt_seq_lens,
-        )?;
-
         // Extract only the noise prediction part
         let noise_seq_len = latents.dim(1)?;
         let pos_pred = pos_pred.narrow(1, 0, noise_seq_len)?;
-        let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
 
-        // Debug: capture noise predictions at each step
-        let pos_name = format!("noise_pred_pos_step{}", step);
-        let neg_name = format!("noise_pred_neg_step{}", step);
-        debug::checkpoint(&mut debug_ctx, &pos_name, pos_pred.clone())?;
-        debug::checkpoint(&mut debug_ctx, &neg_name, neg_pred.clone())?;
+        // Debug: capture positive noise predictions at each step
+        let pos_name = format!("transformer_noise_pred_pos_step{}", step);
+        let pos_pred = debug::checkpoint(&mut debug_ctx, &pos_name, pos_pred)?;
 
-        // Keep backwards-compatible names for step 0
-        if step == 0 {
-            debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_pos_step0", pos_pred.clone())?;
-            debug::checkpoint(&mut debug_ctx, "transformer_noise_pred_neg_step0", neg_pred.clone())?;
-        }
+        // Only apply CFG if we have a negative prompt (matching Python behavior)
+        let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) = (&neg_embeds, &neg_mask, &neg_txt_seq_lens) {
+            // Set CFG pass for block override loading (negative = 1)
+            set_cfg_pass(1);
+            let neg_pred = transformer.forward_with_temb(
+                &latent_model_input,
+                neg_embeds,
+                neg_mask,
+                &t,
+                &img_shapes,
+                neg_seq_lens,
+                Some(&temb),
+            )?;
 
-        let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
+            let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
 
-        // Debug: capture guided prediction at each step
-        let guided_name = format!("guided_pred_step{}", step);
-        debug::checkpoint(&mut debug_ctx, &guided_name, guided_pred.clone())?;
+            // Debug: capture negative noise predictions
+            let neg_name = format!("transformer_noise_pred_neg_step{}", step);
+            let neg_pred = debug::checkpoint(&mut debug_ctx, &neg_name, neg_pred)?;
 
-        if step == 0 {
-            debug::checkpoint(&mut debug_ctx, "transformer_guided_pred_step0", guided_pred.clone())?;
-        }
+            let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
 
-        // Convert guided_pred to F32 for scheduler arithmetic (matching PyTorch behavior)
-        let guided_pred = guided_pred.to_dtype(DType::F32)?;
+            // Debug: capture guided prediction at each step
+            let guided_name = format!("guided_pred_step{}", step);
+            debug::checkpoint(&mut debug_ctx, &guided_name, guided_pred.clone())?;
+
+            if step == 0 {
+                debug::checkpoint(&mut debug_ctx, "transformer_guided_pred_step0", guided_pred.clone())?;
+            }
+            guided_pred
+        } else {
+            // No negative prompt → skip CFG, use positive prediction directly
+            // (CFG requires both pos and neg predictions to compute the guidance direction)
+            pos_pred
+        };
+
+        // Convert model_pred to F32 for scheduler arithmetic (matching PyTorch behavior)
+        let model_pred = model_pred.to_dtype(DType::F32)?;
 
         // Scheduler operates on PACKED latents (matching PyTorch diffusers)
-        latents = scheduler.step(&guided_pred, &latents)?;
+        latents = scheduler.step(&model_pred, &latents)?;
 
         // Debug: capture latents after each step
         let step_name = format!("latents_after_step{}", step);

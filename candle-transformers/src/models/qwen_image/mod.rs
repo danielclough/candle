@@ -65,6 +65,9 @@ pub mod vae;
 mod blocks;
 mod model;
 
+// Re-export debug types for block overrides
+pub use debug::{BlockOverrides, load_block_overrides, is_block_override_enabled, set_cfg_pass};
+
 pub use config::{Config, SchedulerConfig, VaeConfig};
 pub use controlnet::{ControlNetConfig, ControlNetOutput, QwenImageControlNetModel};
 pub use edit_helpers::{

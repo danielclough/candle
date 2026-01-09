@@ -12,7 +12,7 @@
 use candle::{DType, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 
-use super::debug::debug_tensor;
+use super::debug::{debug_tensor, BlockOverrides};
 use super::rope::apply_rotary_emb_qwen;
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -61,10 +61,13 @@ impl ModulationOut {
 /// - Index 0: use modulation from actual timestep (for noise latents)
 /// - Index 1: use modulation from zero timestep (for reference image latents)
 ///
+/// When `debug` is true, prints detailed trace information about the selection.
+///
 /// # Arguments
 /// * `xs` - Input tensor [batch, seq, dim]
 /// * `mod_out` - Modulation output with shape [2*batch, 1, dim] (doubled for zero_cond_t)
 /// * `modulate_index` - Per-token index tensor [batch, seq] with values 0 or 1
+/// * `debug` - If true, print detailed debug output
 ///
 /// # Returns
 /// Tuple of (modulated_x, gate) where modulated_x = x * (1 + scale) + shift
@@ -72,6 +75,7 @@ pub fn apply_modulation_with_index(
     xs: &Tensor,
     mod_out: &ModulationOut,
     modulate_index: &Tensor,
+    debug: bool,
 ) -> Result<(Tensor, Tensor)> {
     let dtype = xs.dtype();
     let batch_size = xs.dim(0)?;
@@ -117,6 +121,15 @@ pub fn apply_modulation_with_index(
     // Apply modulation: x * (1 + scale) + shift
     let modulated = xs.broadcast_mul(&(&scale_result + 1.0)?)?
         .broadcast_add(&shift_result)?;
+
+    if debug {
+        use super::debug::debug_modulation_with_index;
+        let _ = debug_modulation_with_index(
+            xs, shift_all, scale_all, modulate_index,
+            &shift_0, &shift_1, &scale_0, &scale_1,
+            &shift_result, &scale_result, &modulated,
+        );
+    }
 
     Ok((modulated, gate_result))
 }
@@ -182,8 +195,24 @@ impl FeedForward {
 
 impl Module for FeedForward {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // GELU-approximate activation
+        // GELU-approximate activation (tanh approximation, matches PyTorch gelu-approximate)
         xs.apply(&self.proj_in)?.gelu()?.apply(&self.proj_out)
+    }
+}
+
+impl FeedForward {
+    /// Forward with debug output to capture intermediate tensors.
+    pub fn forward_with_debug(&self, xs: &Tensor, prefix: &str) -> Result<Tensor> {
+        let proj_in_out = xs.apply(&self.proj_in)?;
+        debug_tensor(&format!("{}_proj_in_output", prefix), &proj_in_out);
+
+        let gelu_out = proj_in_out.gelu()?;
+        debug_tensor(&format!("{}_gelu_output", prefix), &gelu_out);
+
+        let proj_out = gelu_out.apply(&self.proj_out)?;
+        debug_tensor(&format!("{}_proj_out_output", prefix), &proj_out);
+
+        Ok(proj_out)
     }
 }
 
@@ -250,10 +279,16 @@ impl AddedQkNorm {
     }
 }
 
-/// Scaled dot-product attention.
+/// Scaled dot-product attention with optional overrides for debugging.
 ///
 /// Input shapes: Q, K, V are [batch, heads, seq, head_dim]
-fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+fn scaled_dot_product_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    overrides: Option<&BlockOverrides>,
+    debug: bool,
+) -> Result<Tensor> {
     let head_dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (head_dim as f64).sqrt();
 
@@ -269,18 +304,41 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let attn_logits = q.matmul(&k_t)?;
     let attn_weights = (&attn_logits * scale_factor)?;
 
-    // Debug: compute std as sqrt(var)
-    let logits_flat = attn_logits.flatten_all()?;
-    let logits_mean = logits_flat.mean_all()?.to_scalar::<f32>()?;
-    let logits_var = logits_flat.broadcast_sub(&logits_flat.mean_all()?)?.sqr()?.mean_all()?.to_scalar::<f32>()?;
+    if debug {
+        debug_tensor("[BLOCK0.ATTN] attn_weights (Q@K.T/sqrt(d))", &attn_weights);
+    }
+
+    // Override attention weights if provided
+    let attn_weights = if let Some(BlockOverrides { attn_weights: Some(ref ovr), .. }) = overrides {
+        if debug {
+            eprintln!("[BLOCK0.ATTN] SUBSTITUTING attn_weights from override");
+        }
+        ovr.to_dtype(DType::F32)?.contiguous()?
+    } else {
+        attn_weights
+    };
 
     let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
-    // Entropy: lower = more peaked attention
-    let log_probs = attn_probs.clamp(1e-10, 1.0)?.log()?;
-    let entropy = ((&attn_probs * &log_probs)? * -1.0)?.sum(D::Minus1)?.mean_all()?;
+    if debug {
+        debug_tensor("[BLOCK0.ATTN] attn_probs (softmax)", &attn_probs);
+    }
+
+    // Override attention probs if provided
+    let attn_probs = if let Some(BlockOverrides { attn_probs: Some(ref ovr), .. }) = overrides {
+        if debug {
+            eprintln!("[BLOCK0.ATTN] SUBSTITUTING attn_probs from override");
+        }
+        ovr.to_dtype(DType::F32)?.contiguous()?
+    } else {
+        attn_probs
+    };
 
     let attn_output = attn_probs.matmul(&v)?;
+
+    if debug {
+        debug_tensor("[BLOCK0.ATTN] attn_output (probs @ V)", &attn_output);
+    }
 
     Ok(attn_output)
 }
@@ -370,7 +428,7 @@ impl QwenDoubleStreamAttention {
         encoder_hidden_states: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, false)
+        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, false, None)
     }
 
     /// Forward pass with debug logging for attention internals.
@@ -380,7 +438,22 @@ impl QwenDoubleStreamAttention {
         encoder_hidden_states: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, true)
+        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, true, None)
+    }
+
+    /// Forward pass with optional Q/K/V overrides for debugging.
+    ///
+    /// # Arguments
+    /// * `overrides` - Optional Q/K/V tensor overrides from PyTorch for debugging
+    pub fn forward_with_overrides(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        debug: bool,
+        overrides: Option<&BlockOverrides>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, image_rotary_emb, debug, overrides)
     }
 
     fn forward_impl(
@@ -389,6 +462,7 @@ impl QwenDoubleStreamAttention {
         encoder_hidden_states: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
         debug: bool,
+        overrides: Option<&BlockOverrides>,
     ) -> Result<(Tensor, Tensor)> {
         let (b_sz, img_seq, _) = hidden_states.dims3()?;
         let txt_seq = encoder_hidden_states.dim(1)?;
@@ -404,6 +478,34 @@ impl QwenDoubleStreamAttention {
             debug_tensor("[BLOCK0.ATTN] img_v_proj", &img_v);
         }
 
+        // Apply Q/K/V overrides for image stream if provided
+        let img_q = if let Some(BlockOverrides { img_q: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING img_q from override");
+                debug_tensor("[BLOCK0.ATTN] img_q (original)", &img_q);
+                debug_tensor("[BLOCK0.ATTN] img_q (override)", ovr);
+            }
+            ovr.clone()
+        } else {
+            img_q
+        };
+        let img_k = if let Some(BlockOverrides { img_k: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING img_k from override");
+            }
+            ovr.clone()
+        } else {
+            img_k
+        };
+        let img_v = if let Some(BlockOverrides { img_v: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING img_v from override");
+            }
+            ovr.clone()
+        } else {
+            img_v
+        };
+
         // Compute QKV for text stream
         let txt_q = encoder_hidden_states.apply(&self.add_q_proj)?;
         let txt_k = encoder_hidden_states.apply(&self.add_k_proj)?;
@@ -414,6 +516,32 @@ impl QwenDoubleStreamAttention {
             debug_tensor("[BLOCK0.ATTN] txt_k_proj", &txt_k);
             debug_tensor("[BLOCK0.ATTN] txt_v_proj", &txt_v);
         }
+
+        // Apply Q/K/V overrides for text stream if provided
+        let txt_q = if let Some(BlockOverrides { txt_q: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING txt_q from override");
+            }
+            ovr.clone()
+        } else {
+            txt_q
+        };
+        let txt_k = if let Some(BlockOverrides { txt_k: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING txt_k from override");
+            }
+            ovr.clone()
+        } else {
+            txt_k
+        };
+        let txt_v = if let Some(BlockOverrides { txt_v: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING txt_v from override");
+            }
+            ovr.clone()
+        } else {
+            txt_v
+        };
 
         // Reshape for multi-head attention: [batch, seq, heads, head_dim]
         let img_q = img_q.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
@@ -472,15 +600,30 @@ impl QwenDoubleStreamAttention {
         let joint_k = joint_k.transpose(1, 2)?;
         let joint_v = joint_v.transpose(1, 2)?;
 
-        // Compute attention
-        let joint_attn = scaled_dot_product_attention(&joint_q, &joint_k, &joint_v)?;
+        // Compute attention (pass overrides for debugging)
+        let joint_attn = scaled_dot_product_attention(&joint_q, &joint_k, &joint_v, overrides, debug)?;
 
         if debug {
             debug_tensor("[BLOCK0.ATTN] joint_attn_output", &joint_attn);
         }
 
-        // Transpose back and flatten: [B, H, S, D] -> [B, S, H, D] -> [B, S, H*D]
-        let joint_attn = joint_attn.transpose(1, 2)?.flatten_from(2)?;
+        // Transpose back: [B, H, S, D] -> [B, S, H, D]
+        let joint_attn = joint_attn.transpose(1, 2)?;
+
+        // Override attention output if provided (shape: [B, S, H, D])
+        let joint_attn = if let Some(BlockOverrides { attn_output: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0.ATTN] SUBSTITUTING attn_output from override");
+                debug_tensor("[BLOCK0.ATTN] attn_output (original)", &joint_attn);
+                debug_tensor("[BLOCK0.ATTN] attn_output (override)", ovr);
+            }
+            ovr.to_dtype(joint_attn.dtype())?.to_device(joint_attn.device())?
+        } else {
+            joint_attn
+        };
+
+        // Flatten: [B, S, H, D] -> [B, S, H*D]
+        let joint_attn = joint_attn.flatten_from(2)?;
         let joint_attn = joint_attn.to_dtype(hidden_states.dtype())?;
 
         // Split back to text and image
@@ -592,7 +735,7 @@ impl QwenImageTransformerBlock {
         temb: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, None, false)
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, None, false, None)
     }
 
     /// Forward pass with modulate_index for edit mode (zero_cond_t).
@@ -609,7 +752,7 @@ impl QwenImageTransformerBlock {
         image_rotary_emb: Option<&(Tensor, Tensor)>,
         modulate_index: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, false)
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, false, None)
     }
 
     /// Forward pass with optional debug logging (for block 0 analysis).
@@ -622,7 +765,26 @@ impl QwenImageTransformerBlock {
         modulate_index: Option<&Tensor>,
         debug: bool,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, debug)
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, debug, None)
+    }
+
+    /// Forward pass with debug AND optional tensor overrides for debugging substitution.
+    ///
+    /// # Arguments
+    /// * `overrides` - Optional overrides for intermediate tensors:
+    ///   - `img_modulated`: Override the modulated image tensor before attention
+    ///   - `img_gate2`: Override the MLP gate tensor
+    pub fn forward_with_overrides(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        modulate_index: Option<&Tensor>,
+        debug: bool,
+        overrides: Option<&BlockOverrides>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index, debug, overrides)
     }
 
     /// Internal forward implementation handling both standard and edit modes.
@@ -634,6 +796,7 @@ impl QwenImageTransformerBlock {
         image_rotary_emb: Option<&(Tensor, Tensor)>,
         modulate_index: Option<&Tensor>,
         debug: bool,
+        overrides: Option<&BlockOverrides>,
     ) -> Result<(Tensor, Tensor)> {
         let orig_dtype = hidden_states.dtype();
         let batch_size = hidden_states.dim(0)?;
@@ -670,12 +833,24 @@ impl QwenImageTransformerBlock {
 
         let (img_modulated, img_gate1) = if let Some(mod_idx) = modulate_index {
             // Per-token modulation for edit mode
-            apply_modulation_with_index(&img_normed, &img_mod1, mod_idx)?
+            apply_modulation_with_index(&img_normed, &img_mod1, mod_idx, debug)?
         } else {
             // Standard modulation
             let modulated = img_mod1.scale_shift(&img_normed)?;
             let gate = img_mod1.gate.clone();
             (modulated, gate)
+        };
+
+        // Allow override for debugging
+        let img_modulated = if let Some(BlockOverrides { img_modulated: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0] SUBSTITUTING img_modulated from override");
+                debug_tensor("[BLOCK0] img_modulated (original)", &img_modulated);
+                debug_tensor("[BLOCK0] img_modulated (override)", ovr);
+            }
+            ovr.clone()
+        } else {
+            img_modulated
         };
 
         if debug {
@@ -693,9 +868,9 @@ impl QwenImageTransformerBlock {
             debug_tensor("[BLOCK0] txt_modulated", &txt_modulated);
         }
 
-        // Joint attention
-        let (img_attn_out, txt_attn_out) = if debug {
-            self.attn.forward_with_debug(&img_modulated, &txt_modulated, image_rotary_emb)?
+        // Joint attention (pass overrides for Q/K/V substitution debugging)
+        let (img_attn_out, txt_attn_out) = if debug || overrides.map(|o| o.has_qkv_overrides()).unwrap_or(false) {
+            self.attn.forward_with_overrides(&img_modulated, &txt_modulated, image_rotary_emb, debug, overrides)?
         } else {
             self.attn.forward(&img_modulated, &txt_modulated, image_rotary_emb)?
         };
@@ -735,25 +910,57 @@ impl QwenImageTransformerBlock {
 
         // Image: norm2 + modulate + MLP + gated residual
         let img_normed2 = hidden_states.apply(&self.img_norm2)?;
+        if debug {
+            debug_tensor("[BLOCK0] img_norm2_output", &img_normed2);
+        }
 
         let (img_modulated2, img_gate2) = if let Some(mod_idx) = modulate_index {
-            apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx)?
+            apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx, debug)?
         } else {
             let modulated = img_mod2.scale_shift(&img_normed2)?;
             let gate = img_mod2.gate.clone();
             (modulated, gate)
         };
+        if debug {
+            debug_tensor("[BLOCK0] img_modulated2", &img_modulated2);
+            debug_tensor("[BLOCK0] img_mod2.shift", &img_mod2.shift);
+            debug_tensor("[BLOCK0] img_mod2.scale", &img_mod2.scale);
+            debug_tensor("[BLOCK0] img_mod2.gate", &img_mod2.gate);
+        }
 
-        let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
+        // Allow override for debugging
+        let img_gate2 = if let Some(BlockOverrides { img_gate2: Some(ref ovr), .. }) = overrides {
+            if debug {
+                eprintln!("[BLOCK0] SUBSTITUTING img_gate2 from override");
+                debug_tensor("[BLOCK0] img_gate2 (original)", &img_gate2);
+                debug_tensor("[BLOCK0] img_gate2 (override)", ovr);
+            }
+            ovr.clone()
+        } else {
+            img_gate2
+        };
+
+        let img_mlp_out = if debug {
+            self.img_mlp.forward_with_debug(&img_modulated2, "[BLOCK0] img_mlp")?
+        } else {
+            self.img_mlp.forward(&img_modulated2)?
+        };
         if debug {
             debug_tensor("[BLOCK0] img_mlp_output", &img_mlp_out);
+            debug_tensor("[BLOCK0] img_gate2", &img_gate2);
         }
         let gated_img_mlp = img_gate2.broadcast_mul(&img_mlp_out)?;
+        if debug {
+            debug_tensor("[BLOCK0] gated_img_mlp", &gated_img_mlp);
+        }
 
         // Residual add in F32
         let hidden_states = (hidden_states.to_dtype(DType::F32)?
             + gated_img_mlp.to_dtype(DType::F32)?)?
             .to_dtype(orig_dtype)?;
+        if debug {
+            debug_tensor("[BLOCK0] after_mlp_residual_img", &hidden_states);
+        }
 
         // Text: norm2 + modulate + MLP + gated residual (always standard)
         let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;

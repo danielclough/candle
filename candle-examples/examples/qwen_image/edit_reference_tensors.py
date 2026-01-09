@@ -63,7 +63,7 @@ def main():
                         help="Input image to edit")
     parser.add_argument("--prompt", type=str, default="Make the sky more colorful",
                         help="Edit instruction")
-    parser.add_argument("--negative-prompt", type=str, default="blurry, low quality",
+    parser.add_argument("--negative-prompt", type=str, default="",
                         help="Negative prompt for CFG")
     parser.add_argument("--steps", type=int, default=20, help="Number of inference steps")
     parser.add_argument("--true-cfg-scale", type=float, default=4.0,
@@ -673,6 +673,7 @@ def main():
             # kwargs: temb, image_rotary_emb
             hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
             encoder_hidden_states = args[1] if len(args) > 1 else kwargs.get("encoder_hidden_states")
+            temb = kwargs.get("temb")
 
             if hidden_states is not None:
                 block0_captures["input_img"] = hidden_states.detach().clone()
@@ -682,6 +683,10 @@ def main():
                 block0_captures["input_txt"] = encoder_hidden_states.detach().clone()
                 print(f"  [BLOCK0] input_txt: shape={list(encoder_hidden_states.shape)}, "
                       f"mean={encoder_hidden_states.float().mean():.6f}, std={encoder_hidden_states.float().std():.6f}")
+            if temb is not None:
+                block0_captures["temb"] = temb.detach().clone()
+                print(f"  [BLOCK0] temb: shape={list(temb.shape)}, "
+                      f"mean={temb.float().mean():.6f}, std={temb.float().std():.6f}")
 
             # output is tuple: (encoder_hidden_states, hidden_states)
             enc_out, hid_out = output
@@ -696,7 +701,117 @@ def main():
     # =========================================================================
     # Hook to capture BLOCK 0 INTERNAL tensors (modulation, norm, attention)
     # =========================================================================
-    block0_internal_captures = {}
+    # Separate captures for positive (call 0) and negative (call 1) CFG passes
+    block0_internal_captures_pos = {}
+    block0_internal_captures_neg = {}
+
+    def get_block0_captures(call_in_step):
+        """Return the appropriate capture dict based on CFG pass."""
+        return block0_internal_captures_pos if call_in_step == 0 else block0_internal_captures_neg
+
+    # =========================================================================
+    # Monkey-patch _modulate to capture per-token modulation details
+    # =========================================================================
+    def setup_modulate_capture(block0):
+        """Monkey-patch _modulate to capture intermediate values for debugging."""
+        original_modulate = block0._modulate
+        modulate_call_counter = {"count": 0}
+
+        def captured_modulate(x, mod_params, index=None):
+            """Wrapper around _modulate that captures intermediate values."""
+            step = transformer_step_counter["count"]
+            call_in_step = transformer_call_counter["count"]
+            modulate_call_idx = modulate_call_counter["count"]
+
+            # Capture on step 0, for BOTH transformer calls (pos and neg CFG passes):
+            # idx 0 = img_mod1 (attention), idx 1 = txt_mod1 (attention)
+            # idx 2 = img_mod2 (MLP), idx 3 = txt_mod2 (MLP)
+            should_capture = (step == 0 and call_in_step in [0, 1] and modulate_call_idx < 4)
+            pass_name = "pos" if call_in_step == 0 else "neg"
+            captures = get_block0_captures(call_in_step)
+
+            if should_capture:
+                # Parse modulation parameters (same logic as _modulate)
+                shift, scale, gate = mod_params.chunk(3, dim=-1)
+
+                # idx 0 = img_mod1, idx 1 = txt_mod1, idx 2 = img_mod2, idx 3 = txt_mod2
+                if modulate_call_idx == 0:
+                    prefix = "img_mod1"
+                elif modulate_call_idx == 1:
+                    prefix = "txt_mod1"
+                elif modulate_call_idx == 2:
+                    prefix = "img_mod2"
+                else:
+                    prefix = "txt_mod2"
+
+                # Capture input x (normed hidden states)
+                captures[f"{prefix}_normed"] = x.detach().clone()
+                print(f"  [MODULATE-{pass_name.upper()}] {prefix}_normed: shape={list(x.shape)}, "
+                      f"mean={x.float().mean():.6f}, std={x.float().std():.6f}")
+
+                if index is not None:
+                    # Per-token modulation mode (edit mode with zero_cond_t)
+                    actual_batch = shift.size(0) // 2
+                    shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]
+                    scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
+                    gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
+
+                    captures[f"{prefix}_shift_0"] = shift_0.detach().clone()
+                    captures[f"{prefix}_shift_1"] = shift_1.detach().clone()
+                    captures[f"{prefix}_scale_0"] = scale_0.detach().clone()
+                    captures[f"{prefix}_scale_1"] = scale_1.detach().clone()
+                    captures[f"{prefix}_gate_0"] = gate_0.detach().clone()
+                    captures[f"{prefix}_gate_1"] = gate_1.detach().clone()
+                    captures[f"{prefix}_modulate_index"] = index.detach().clone()
+
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_shift_0[0..5]: {shift_0.flatten()[:5].tolist()}")
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_shift_1[0..5]: {shift_1.flatten()[:5].tolist()}")
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_scale_0[0..5]: {scale_0.flatten()[:5].tolist()}")
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_scale_1[0..5]: {scale_1.flatten()[:5].tolist()}")
+
+                    num_zeros = (index == 0).sum().item()
+                    num_ones = (index == 1).sum().item()
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_index: {num_zeros} zeros, {num_ones} ones, total {index.numel()}")
+                    print(f"  [MODULATE-{pass_name.upper()}] {prefix}_index[0..10]: {index.flatten()[:10].tolist()}")
+                else:
+                    captures[f"{prefix}_shift"] = shift.detach().clone()
+                    captures[f"{prefix}_scale"] = scale.detach().clone()
+                    captures[f"{prefix}_gate"] = gate.detach().clone()
+
+            # Call original _modulate
+            modulated, gate_result = original_modulate(x, mod_params, index)
+
+            if should_capture:
+                captures[f"{prefix}_modulated"] = modulated.detach().clone()
+                captures[f"{prefix}_gate_result"] = gate_result.detach().clone()
+
+                print(f"  [MODULATE-{pass_name.upper()}] {prefix}_modulated: shape={list(modulated.shape)}, "
+                      f"mean={modulated.float().mean():.6f}, std={modulated.float().std():.6f}")
+                print(f"  [MODULATE-{pass_name.upper()}] {prefix}_modulated[0..5]: {modulated.flatten()[:5].tolist()}")
+
+                # Also capture shift_result for first and last tokens
+                seq_len = x.shape[1]
+                dim = modulated.shape[-1]
+                print(f"  [MODULATE-{pass_name.upper()}] {prefix}_modulated[token0, 0..5]: {modulated[0, 0, :5].tolist()}")
+                print(f"  [MODULATE-{pass_name.upper()}] {prefix}_modulated[last_token, 0..5]: {modulated[0, -1, :5].tolist()}")
+
+            modulate_call_counter["count"] += 1
+            return modulated, gate_result
+
+        # Reset counter at each transformer call
+        original_forward = block0.forward
+        def wrapped_forward(*args, **kwargs):
+            modulate_call_counter["count"] = 0
+            return original_forward(*args, **kwargs)
+
+        block0.forward = wrapped_forward
+        block0._modulate = captured_modulate
+        return original_modulate, original_forward
+
+    # Set up _modulate capture
+    block0 = pipe.transformer.transformer_blocks[0]
+    original_modulate, original_forward = setup_modulate_capture(block0)
+    print("  [HOOK] Installed _modulate capture wrapper on block 0")
 
     def capture_block0_internals():
         """Set up hooks to capture internal block 0 tensors"""
@@ -707,7 +822,10 @@ def main():
         # Note: diffusers modulation returns a single tensor [B, 1, 6*dim] that gets chunked later,
         # not a tuple of (mod1, mod2). We chunk it here to extract the parameters.
         def capture_img_mod(module, args, output):
-            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
                 # Output is a single tensor [B, 1, 6*dim] - chunk into 6 parts
                 if isinstance(output, tuple):
                     mod1, mod2 = output
@@ -715,14 +833,17 @@ def main():
                 else:
                     chunks = output.chunk(6, dim=-1)
                     shift, scale, gate = chunks[0], chunks[1], chunks[2]
-                block0_internal_captures["img_mod1_shift"] = shift.detach().clone()
-                block0_internal_captures["img_mod1_scale"] = scale.detach().clone()
-                block0_internal_captures["img_mod1_gate"] = gate.detach().clone()
-                print(f"  [BLOCK0.INTERNAL] img_mod1_scale: mean={scale.float().mean():.6f}")
+                captures["img_mod1_shift"] = shift.detach().clone()
+                captures["img_mod1_scale"] = scale.detach().clone()
+                captures["img_mod1_gate"] = gate.detach().clone()
+                print(f"  [BLOCK0.INTERNAL-{pass_name.upper()}] img_mod1_scale: mean={scale.float().mean():.6f}")
             return output
 
         def capture_txt_mod(module, args, output):
-            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
                 # Output is a single tensor [B, 1, 6*dim] - chunk into 6 parts
                 if isinstance(output, tuple):
                     mod1, mod2 = output
@@ -730,20 +851,239 @@ def main():
                 else:
                     chunks = output.chunk(6, dim=-1)
                     shift, scale, gate = chunks[0], chunks[1], chunks[2]
-                block0_internal_captures["txt_mod1_shift"] = shift.detach().clone()
-                block0_internal_captures["txt_mod1_scale"] = scale.detach().clone()
-                block0_internal_captures["txt_mod1_gate"] = gate.detach().clone()
-                print(f"  [BLOCK0.INTERNAL] txt_mod1_scale: mean={scale.float().mean():.6f}")
+                captures["txt_mod1_shift"] = shift.detach().clone()
+                captures["txt_mod1_scale"] = scale.detach().clone()
+                captures["txt_mod1_gate"] = gate.detach().clone()
+                print(f"  [BLOCK0.INTERNAL-{pass_name.upper()}] txt_mod1_scale: mean={scale.float().mean():.6f}")
             return output
+
+        # =========================================================================
+        # Capture Q/K/V projections INSIDE attention
+        # =========================================================================
+        def capture_img_q_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["img_q_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_q_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}, "
+                      f"min={output.float().min():.1f}, max={output.float().max():.1f}")
+            return output
+
+        def capture_img_k_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["img_k_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_k_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}, "
+                      f"min={output.float().min():.1f}, max={output.float().max():.1f}")
+            return output
+
+        def capture_img_v_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["img_v_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_v_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}, "
+                      f"min={output.float().min():.1f}, max={output.float().max():.1f}")
+            return output
+
+        def capture_txt_q_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["txt_q_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_q_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}")
+            return output
+
+        def capture_txt_k_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["txt_k_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_k_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}")
+            return output
+
+        def capture_txt_v_proj(module, args, output):
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+                captures["txt_v_proj"] = output.detach().clone()
+                print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_v_proj: shape={list(output.shape)}, "
+                      f"mean={output.float().mean():.6f}, std={output.float().std():.6f}")
+            return output
+
+        # =========================================================================
+        # Capture Q/K AFTER RMSNorm by wrapping the attention forward
+        # =========================================================================
+        original_attn_forward = block0.attn.forward
+
+        def wrapped_attn_forward(hidden_states, encoder_hidden_states=None, **kwargs):
+            """Wrapped attention forward that captures intermediate tensors."""
+            from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
+
+            attn = block0.attn
+            image_rotary_emb = kwargs.get('image_rotary_emb')
+            call_in_step = transformer_call_counter["count"]
+            should_capture = transformer_step_counter["count"] == 0 and call_in_step in [0, 1]
+
+            if should_capture:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
+
+                # Compute QKV for image stream
+                img_query = attn.to_q(hidden_states)
+                img_key = attn.to_k(hidden_states)
+                img_value = attn.to_v(hidden_states)
+
+                # Reshape for multi-head attention (before norm)
+                img_query_reshaped = img_query.unflatten(-1, (attn.heads, -1))
+                img_key_reshaped = img_key.unflatten(-1, (attn.heads, -1))
+                img_value_reshaped = img_value.unflatten(-1, (attn.heads, -1))
+
+                # Apply QK normalization
+                if attn.norm_q is not None:
+                    img_q_after_norm = attn.norm_q(img_query_reshaped)
+                    captures["img_q_after_norm"] = img_q_after_norm.detach().clone()
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_q_after_norm: shape={list(img_q_after_norm.shape)}, "
+                          f"mean={img_q_after_norm.float().mean():.6f}, std={img_q_after_norm.float().std():.6f}, "
+                          f"min={img_q_after_norm.float().min():.1f}, max={img_q_after_norm.float().max():.1f}")
+                else:
+                    img_q_after_norm = img_query_reshaped
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] norm_q is None!")
+
+                if attn.norm_k is not None:
+                    img_k_after_norm = attn.norm_k(img_key_reshaped)
+                    captures["img_k_after_norm"] = img_k_after_norm.detach().clone()
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_k_after_norm: shape={list(img_k_after_norm.shape)}, "
+                          f"mean={img_k_after_norm.float().mean():.6f}, std={img_k_after_norm.float().std():.6f}, "
+                          f"min={img_k_after_norm.float().min():.1f}, max={img_k_after_norm.float().max():.1f}")
+                else:
+                    img_k_after_norm = img_key_reshaped
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] norm_k is None!")
+
+                # Apply RoPE to image Q/K
+                if image_rotary_emb is not None:
+                    img_freqs, txt_freqs = image_rotary_emb
+                    img_q_after_rope = apply_rotary_emb_qwen(img_q_after_norm, img_freqs, use_real=False)
+                    img_k_after_rope = apply_rotary_emb_qwen(img_k_after_norm, img_freqs, use_real=False)
+
+                    captures["img_q_after_rope"] = img_q_after_rope.detach().clone()
+                    captures["img_k_after_rope"] = img_k_after_rope.detach().clone()
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_q_after_rope: shape={list(img_q_after_rope.shape)}, "
+                          f"mean={img_q_after_rope.float().mean():.6f}, std={img_q_after_rope.float().std():.6f}, "
+                          f"min={img_q_after_rope.float().min():.1f}, max={img_q_after_rope.float().max():.1f}")
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] img_k_after_rope: shape={list(img_k_after_rope.shape)}, "
+                          f"mean={img_k_after_rope.float().mean():.6f}, std={img_k_after_rope.float().std():.6f}, "
+                          f"min={img_k_after_rope.float().min():.1f}, max={img_k_after_rope.float().max():.1f}")
+                else:
+                    print(f"  [BLOCK0.ATTN-{pass_name.upper()}] image_rotary_emb is None!")
+
+                # Text stream norms and RoPE
+                if encoder_hidden_states is not None:
+                    txt_query = attn.add_q_proj(encoder_hidden_states)
+                    txt_key = attn.add_k_proj(encoder_hidden_states)
+                    txt_query_reshaped = txt_query.unflatten(-1, (attn.heads, -1))
+                    txt_key_reshaped = txt_key.unflatten(-1, (attn.heads, -1))
+
+                    if attn.norm_added_q is not None:
+                        txt_q_after_norm = attn.norm_added_q(txt_query_reshaped)
+                        captures["txt_q_after_norm"] = txt_q_after_norm.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_q_after_norm: shape={list(txt_q_after_norm.shape)}, "
+                              f"mean={txt_q_after_norm.float().mean():.6f}, std={txt_q_after_norm.float().std():.6f}")
+                    else:
+                        txt_q_after_norm = txt_query_reshaped
+
+                    if attn.norm_added_k is not None:
+                        txt_k_after_norm = attn.norm_added_k(txt_key_reshaped)
+                        captures["txt_k_after_norm"] = txt_k_after_norm.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_k_after_norm: shape={list(txt_k_after_norm.shape)}, "
+                              f"mean={txt_k_after_norm.float().mean():.6f}, std={txt_k_after_norm.float().std():.6f}")
+                    else:
+                        txt_k_after_norm = txt_key_reshaped
+
+                    # Apply RoPE to text Q/K
+                    if image_rotary_emb is not None:
+                        txt_q_after_rope = apply_rotary_emb_qwen(txt_q_after_norm, txt_freqs, use_real=False)
+                        txt_k_after_rope = apply_rotary_emb_qwen(txt_k_after_norm, txt_freqs, use_real=False)
+
+                        captures["txt_q_after_rope"] = txt_q_after_rope.detach().clone()
+                        captures["txt_k_after_rope"] = txt_k_after_rope.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_q_after_rope: shape={list(txt_q_after_rope.shape)}, "
+                              f"mean={txt_q_after_rope.float().mean():.6f}, std={txt_q_after_rope.float().std():.6f}")
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] txt_k_after_rope: shape={list(txt_k_after_rope.shape)}, "
+                              f"mean={txt_k_after_rope.float().mean():.6f}, std={txt_k_after_rope.float().std():.6f}")
+
+                        # Capture concatenated joint Q/K/V (order: [txt, img])
+                        joint_q = torch.cat([txt_q_after_rope, img_q_after_rope], dim=1)
+                        joint_k = torch.cat([txt_k_after_rope, img_k_after_rope], dim=1)
+                        txt_value_reshaped = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+                        joint_v = torch.cat([txt_value_reshaped, img_value_reshaped], dim=1)
+
+                        captures["joint_q"] = joint_q.detach().clone()
+                        captures["joint_k"] = joint_k.detach().clone()
+                        captures["joint_v"] = joint_v.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] joint_q: shape={list(joint_q.shape)}, "
+                              f"mean={joint_q.float().mean():.6f}, std={joint_q.float().std():.6f}")
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] joint_k: shape={list(joint_k.shape)}, "
+                              f"mean={joint_k.float().mean():.6f}, std={joint_k.float().std():.6f}")
+
+                        # Compute attention scores manually to debug
+                        # PyTorch SDPA expects [B, H, S, D], so transpose
+                        q_for_attn = joint_q.transpose(1, 2)  # [B, H, S, D]
+                        k_for_attn = joint_k.transpose(1, 2)  # [B, H, S, D]
+                        v_for_attn = joint_v.transpose(1, 2)  # [B, H, S, D]
+
+                        # Compute Q @ K.T / sqrt(d)
+                        scale = 1.0 / (q_for_attn.size(-1) ** 0.5)
+                        attn_weights = torch.matmul(q_for_attn, k_for_attn.transpose(-2, -1)) * scale
+                        captures["attn_weights"] = attn_weights.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] attn_weights (Q@K.T/sqrt(d)): shape={list(attn_weights.shape)}, "
+                              f"mean={attn_weights.float().mean():.6f}, std={attn_weights.float().std():.6f}, "
+                              f"min={attn_weights.float().min():.2f}, max={attn_weights.float().max():.2f}")
+
+                        # Softmax
+                        attn_probs = torch.softmax(attn_weights, dim=-1)
+                        captures["attn_probs"] = attn_probs.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] attn_probs (softmax): shape={list(attn_probs.shape)}, "
+                              f"mean={attn_probs.float().mean():.6f}, std={attn_probs.float().std():.6f}, "
+                              f"min={attn_probs.float().min():.6f}, max={attn_probs.float().max():.6f}")
+
+                        # Attention output
+                        attn_out = torch.matmul(attn_probs, v_for_attn)  # [B, H, S, D]
+                        attn_out_transposed = attn_out.transpose(1, 2)  # [B, S, H, D]
+                        captures["attn_output_pre_split"] = attn_out_transposed.detach().clone()
+                        print(f"  [BLOCK0.ATTN-{pass_name.upper()}] attn_output (pre-split): shape={list(attn_out_transposed.shape)}, "
+                              f"mean={attn_out_transposed.float().mean():.6f}, std={attn_out_transposed.float().std():.6f}")
+
+            # Call original forward
+            return original_attn_forward(hidden_states, encoder_hidden_states, **kwargs)
+
+        # Install the wrapped forward
+        block0.attn.forward = wrapped_attn_forward
+        print("  [HOOK] Installed wrapped attention forward for block 0")
 
         # Capture attention internals
         def capture_attn(module, args, kwargs, output):
-            if transformer_step_counter["count"] == 0 and transformer_call_counter["count"] == 0:
+            call_in_step = transformer_call_counter["count"]
+            if transformer_step_counter["count"] == 0 and call_in_step in [0, 1]:
+                captures = get_block0_captures(call_in_step)
+                pass_name = "pos" if call_in_step == 0 else "neg"
                 img_out, txt_out = output
-                block0_internal_captures["attn_img_out"] = img_out.detach().clone()
-                block0_internal_captures["attn_txt_out"] = txt_out.detach().clone()
-                print(f"  [BLOCK0.INTERNAL] attn_img_out: mean={img_out.float().mean():.6f}, std={img_out.float().std():.6f}")
-                print(f"  [BLOCK0.INTERNAL] attn_txt_out: mean={txt_out.float().mean():.6f}, std={txt_out.float().std():.6f}")
+                captures["attn_img_out"] = img_out.detach().clone()
+                captures["attn_txt_out"] = txt_out.detach().clone()
+                print(f"  [BLOCK0.INTERNAL-{pass_name.upper()}] attn_img_out: mean={img_out.float().mean():.6f}, std={img_out.float().std():.6f}")
+                print(f"  [BLOCK0.INTERNAL-{pass_name.upper()}] attn_txt_out: mean={txt_out.float().mean():.6f}, std={txt_out.float().std():.6f}")
             return output
 
         # Register hooks
@@ -753,11 +1093,89 @@ def main():
             hooks.append(block0.txt_mod.register_forward_hook(capture_txt_mod))
         if hasattr(block0, 'attn'):
             hooks.append(block0.attn.register_forward_hook(capture_attn, with_kwargs=True))
+            # Hook into Q/K/V projection layers inside attention
+            if hasattr(block0.attn, 'to_q'):
+                hooks.append(block0.attn.to_q.register_forward_hook(capture_img_q_proj))
+            if hasattr(block0.attn, 'to_k'):
+                hooks.append(block0.attn.to_k.register_forward_hook(capture_img_k_proj))
+            if hasattr(block0.attn, 'to_v'):
+                hooks.append(block0.attn.to_v.register_forward_hook(capture_img_v_proj))
+            if hasattr(block0.attn, 'add_q_proj'):
+                hooks.append(block0.attn.add_q_proj.register_forward_hook(capture_txt_q_proj))
+            if hasattr(block0.attn, 'add_k_proj'):
+                hooks.append(block0.attn.add_k_proj.register_forward_hook(capture_txt_k_proj))
+            if hasattr(block0.attn, 'add_v_proj'):
+                hooks.append(block0.attn.add_v_proj.register_forward_hook(capture_txt_v_proj))
+            # Note: norm_q/norm_k hooks don't work because they're called inside the processor.
+            # We use monkey-patching instead (see patched_processor_call above).
 
         return hooks
 
     block0_internal_hooks = capture_block0_internals()
     print("  [HOOK] Registered block 0 internal capture hooks")
+
+    # =========================================================================
+    # Hook to capture MLP intermediate values
+    # =========================================================================
+    mlp_captures_pos = {}
+    mlp_captures_neg = {}
+
+    def get_mlp_captures(call_in_step):
+        return mlp_captures_pos if call_in_step == 0 else mlp_captures_neg
+
+    def setup_mlp_capture(block0):
+        """Monkey-patch img_mlp.forward to capture intermediate values."""
+        original_forward = block0.img_mlp.forward
+
+        def captured_forward(hidden_states):
+            step = transformer_step_counter["count"]
+            call_in_step = transformer_call_counter["count"]
+            should_capture = (step == 0 and call_in_step in [0, 1])
+            pass_name = "pos" if call_in_step == 0 else "neg"
+            captures = get_mlp_captures(call_in_step)
+
+            if should_capture:
+                # Capture input to MLP (after modulation)
+                captures["img_mlp_input"] = hidden_states.detach().clone()
+                print(f"  [MLP-{pass_name.upper()}] img_mlp_input: shape={list(hidden_states.shape)}, "
+                      f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}, "
+                      f"min={hidden_states.float().min():.1f}, max={hidden_states.float().max():.1f}")
+
+            # net[0] is GELU module (includes proj_in + gelu)
+            x = hidden_states
+            gelu_module = block0.img_mlp.net[0]  # GELU module
+
+            if should_capture:
+                # Capture after proj (before gelu)
+                proj_out = gelu_module.proj(x)
+                captures["img_mlp_proj_in_output"] = proj_out.detach().clone()
+                print(f"  [MLP-{pass_name.upper()}] img_mlp_proj_in_output: shape={list(proj_out.shape)}, "
+                      f"mean={proj_out.float().mean():.6f}, std={proj_out.float().std():.6f}, "
+                      f"min={proj_out.float().min():.1f}, max={proj_out.float().max():.1f}")
+
+                # Capture after gelu
+                gelu_out = gelu_module.gelu(proj_out)
+                captures["img_mlp_gelu_output"] = gelu_out.detach().clone()
+                print(f"  [MLP-{pass_name.upper()}] img_mlp_gelu_output: shape={list(gelu_out.shape)}, "
+                      f"mean={gelu_out.float().mean():.6f}, std={gelu_out.float().std():.6f}, "
+                      f"min={gelu_out.float().min():.1f}, max={gelu_out.float().max():.1f}")
+
+            # Run the full forward
+            result = original_forward(hidden_states)
+
+            if should_capture:
+                captures["img_mlp_output"] = result.detach().clone()
+                print(f"  [MLP-{pass_name.upper()}] img_mlp_output: shape={list(result.shape)}, "
+                      f"mean={result.float().mean():.6f}, std={result.float().std():.6f}, "
+                      f"min={result.float().min():.1f}, max={result.float().max():.1f}")
+
+            return result
+
+        block0.img_mlp.forward = captured_forward
+        return original_forward
+
+    original_mlp_forward = setup_mlp_capture(pipe.transformer.transformer_blocks[0])
+    print("  [HOOK] Installed img_mlp capture wrapper on block 0")
 
     block0_hook = None
     if hasattr(pipe.transformer, 'transformer_blocks') and len(pipe.transformer.transformer_blocks) > 0:
@@ -890,14 +1308,34 @@ def main():
     for name, tensor in block0_captures.items():
         save_tensor(f"block0_{name}", tensor, args.output_dir)
 
-    # Save block0 internal captures
-    print("\n  Saving block 0 internal captures...")
-    for name, tensor in block0_internal_captures.items():
-        save_tensor(f"block0_internal_{name}", tensor, args.output_dir)
+    # Save block0 internal captures (positive pass)
+    print("\n  Saving block 0 internal captures (positive pass)...")
+    for name, tensor in block0_internal_captures_pos.items():
+        save_tensor(f"block0_internal_{name}_pos", tensor, args.output_dir)
+
+    # Save block0 internal captures (negative pass)
+    print("\n  Saving block 0 internal captures (negative pass)...")
+    for name, tensor in block0_internal_captures_neg.items():
+        save_tensor(f"block0_internal_{name}_neg", tensor, args.output_dir)
+
+    # Save MLP captures (positive pass)
+    print("\n  Saving MLP captures (positive pass)...")
+    for name, tensor in mlp_captures_pos.items():
+        save_tensor(f"block0_mlp_{name}_pos", tensor, args.output_dir)
+
+    # Save MLP captures (negative pass)
+    print("\n  Saving MLP captures (negative pass)...")
+    for name, tensor in mlp_captures_neg.items():
+        save_tensor(f"block0_mlp_{name}_neg", tensor, args.output_dir)
 
     # Cleanup internal hooks
     for hook in block0_internal_hooks:
         hook.remove()
+
+    # Restore original _modulate function
+    block0._modulate = original_modulate
+    block0.forward = original_forward
+    block0.img_mlp.forward = original_mlp_forward
 
     # Save final latents
     final_latents_packed = result.images

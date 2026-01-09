@@ -321,6 +321,19 @@ impl SubstituteMode {
                 .collect();
                 Ok(SubstituteMode::Only(names))
             }
+            "noise_pred" => {
+                // Substitute transformer noise predictions at each step
+                // This isolates: if fixed → bug is in transformer; if broken → bug is in scheduler/CFG
+                let mut names: HashSet<String> = HashSet::new();
+                for step in 0..20 {
+                    // Support up to 20 steps
+                    names.insert(format!("transformer_noise_pred_pos_step{}", step));
+                    names.insert(format!("transformer_noise_pred_neg_step{}", step));
+                }
+                // Also include the legacy name for step 0
+                names.insert("transformer_noise_pred_full".to_string());
+                Ok(SubstituteMode::Only(names))
+            }
             s if s.starts_with("only:") => {
                 let names: HashSet<String> = s[5..]
                     .split(',')
@@ -344,7 +357,7 @@ impl SubstituteMode {
                 Ok(SubstituteMode::Except(names))
             }
             _ => Err(anyhow!(
-                "Invalid substitution mode: '{}'. Use 'none', 'all', 'prompt', 'latents', 'vae', 'vae_input', 'vision', 'vision_input', 'noise', 'transformer', 'rope', 'block0', 'only:name1,name2', or 'except:name1,name2'",
+                "Invalid substitution mode: '{}'. Use 'none', 'all', 'prompt', 'latents', 'vae', 'vae_input', 'vision', 'vision_input', 'noise', 'transformer', 'rope', 'block0', 'noise_pred', 'only:name1,name2', or 'except:name1,name2'",
                 mode_str
             )),
         }

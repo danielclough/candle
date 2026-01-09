@@ -131,9 +131,15 @@ impl FlowMatchEulerDiscreteScheduler {
         let mut sigmas = if let Some(s) = sigmas {
             s.to_vec()
         } else {
-            // Default: linspace from 1.0 to 1/n (not including 0 yet)
+            // Match PyTorch: linspace from sigma_max (1.0) to sigma_min (1/num_train_timesteps)
+            // This ensures the schedule reaches near-zero noise at the final step
+            let sigma_max = 1.0;
+            let sigma_min = 1.0 / self.num_train_timesteps as f64;
             (0..num_inference_steps)
-                .map(|i| 1.0 - i as f64 / num_inference_steps as f64)
+                .map(|i| {
+                    sigma_max
+                        - (sigma_max - sigma_min) * i as f64 / (num_inference_steps - 1).max(1) as f64
+                })
                 .collect()
         };
 
@@ -308,6 +314,43 @@ mod tests {
         // First sigma should be 1.0, last should be 0.0
         assert!((scheduler_no_shift.sigmas()[0] - 1.0).abs() < 1e-6);
         assert!((scheduler_no_shift.sigmas()[10] - 0.0).abs() < 1e-6);
+
+        // Second sigma should be linspace from 1.0 to sigma_min
+        // For 10 steps: sigma[1] = 1.0 - (1.0 - 0.001) * 1/9 ≈ 0.889
+        let sigma_min = 1.0 / 1000.0; // num_train_timesteps = 1000
+        let expected_sigma_1 = 1.0 - (1.0 - sigma_min) / 9.0;
+        assert!(
+            (scheduler_no_shift.sigmas()[1] - expected_sigma_1).abs() < 1e-6,
+            "sigma[1] should be {}, got {}",
+            expected_sigma_1,
+            scheduler_no_shift.sigmas()[1]
+        );
+    }
+
+    #[test]
+    fn test_scheduler_sigmas_match_pytorch() {
+        // Test that 5-step schedule with dynamic shifting matches PyTorch exactly
+        let config = SchedulerConfig::default();
+        let mut scheduler = FlowMatchEulerDiscreteScheduler::new(&config);
+
+        // mu = 0.5 for 256×256 image (image_seq_len = 256)
+        scheduler.set_timesteps(5, None, Some(0.5));
+
+        // PyTorch reference values (from scheduling_flow_match_euler_discrete.py)
+        let pytorch_sigmas = [1.0, 0.832, 0.623, 0.356, 0.0016, 0.0];
+
+        for (i, &py_sigma) in pytorch_sigmas.iter().enumerate() {
+            let rust_sigma = scheduler.sigmas()[i];
+            let diff = (rust_sigma - py_sigma).abs();
+            assert!(
+                diff < 0.001,
+                "sigma[{}]: Rust={:.4}, PyTorch={:.4}, diff={:.6}",
+                i,
+                rust_sigma,
+                py_sigma,
+                diff
+            );
+        }
     }
 
     #[test]

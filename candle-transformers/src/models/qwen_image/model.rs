@@ -226,6 +226,14 @@ impl QwenImageTransformer2DModel {
         })
     }
 
+    /// Compute the timestep embedding (temb) for a given timestep.
+    ///
+    /// This allows computing temb externally for debugging/substitution purposes.
+    /// In zero_cond_t mode (edit), the timestep should already be doubled: [t, 0].
+    pub fn compute_temb(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
+        self.time_text_embed.forward(timestep, dtype)
+    }
+
     /// Forward pass through the transformer.
     ///
     /// # Arguments
@@ -255,6 +263,30 @@ impl QwenImageTransformer2DModel {
             img_shapes,
             txt_seq_lens,
             None,
+            None, // No temb override
+        )
+    }
+
+    /// Forward pass with optional pre-computed temb (for debugging).
+    pub fn forward_with_temb(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        encoder_hidden_states_mask: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        txt_seq_lens: &[usize],
+        temb_override: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_with_controlnet(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            img_shapes,
+            txt_seq_lens,
+            None,
+            temb_override,
         )
     }
 
@@ -271,6 +303,7 @@ impl QwenImageTransformer2DModel {
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
     /// * `txt_seq_lens` - Text sequence lengths per batch item
     /// * `controlnet_residuals` - Optional residuals from ControlNet, one per block
+    /// * `temb_override` - Optional pre-computed temb (for debugging/substitution)
     ///
     /// # Returns
     /// Output predictions [batch, img_seq, patch_size² × out_channels]
@@ -290,6 +323,7 @@ impl QwenImageTransformer2DModel {
         img_shapes: &[(usize, usize, usize)],
         _txt_seq_lens: &[usize],
         controlnet_residuals: Option<&[Tensor]>,
+        temb_override: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
         let device = hidden_states.device();
@@ -330,9 +364,15 @@ impl QwenImageTransformer2DModel {
             (timestep, None)
         };
 
-        // Compute timestep embedding (doubled if zero_cond_t)
-        let temb = self.time_text_embed.forward(&timestep, dtype)?;
-        debug_tensor("temb", &temb);
+        // Compute timestep embedding (doubled if zero_cond_t), or use override if provided
+        let temb = if let Some(override_temb) = temb_override {
+            debug_tensor("temb_override", override_temb);
+            override_temb.clone()
+        } else {
+            let computed = self.time_text_embed.forward(&timestep, dtype)?;
+            debug_tensor("temb", &computed);
+            computed
+        };
 
         // Derive text sequence length from actual encoder_hidden_states shape
         let txt_seq_len = encoder_hidden_states.dim(1)?;
@@ -343,18 +383,27 @@ impl QwenImageTransformer2DModel {
         debug_tensor("rope_img_freqs", &image_rotary_emb.0);
         debug_tensor("rope_txt_freqs", &image_rotary_emb.1);
 
+        // Load block overrides if QWEN_BLOCK_OVERRIDE is set
+        // Uses thread-local CFG pass to determine which tensors to load (_pos or _neg)
+        let block_overrides = super::debug::load_block_overrides(
+            hidden_states.device(),
+            hidden_states.dtype(),
+            None,  // Use thread-local CFG pass suffix
+        )?;
+
         // Process through transformer blocks
         let num_blocks = self.transformer_blocks.len();
         for (idx, block) in self.transformer_blocks.iter().enumerate() {
-            // Use debug mode for block 0 to see internal values
+            // Use debug mode and overrides for block 0 to see internal values
             let (enc_out, hid_out) = if idx == 0 {
-                block.forward_with_debug(
+                block.forward_with_overrides(
                     &hidden_states,
                     &encoder_hidden_states,
                     &temb,
                     Some(&image_rotary_emb),
                     modulate_index.as_ref(),
                     true,  // Enable debug for block 0
+                    block_overrides.as_ref(),
                 )?
             } else {
                 block.forward_with_modulate_index(

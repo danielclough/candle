@@ -214,6 +214,7 @@ pub fn run(
             &img_shapes,
             &txt_seq_lens,
             Some(&controlnet_output.block_residuals),
+            None, // No temb override for controlnet
         )?;
 
         // Negative prediction (without ControlNet for True CFG)
