@@ -346,17 +346,11 @@ pub fn run(
             debug::checkpoint(&mut debug_ctx, "transformer_guided_pred_step0", guided_pred.clone())?;
         }
 
-        // Unpack and step
-        // unpack_latents outputs [B, C, T, H, W] to match PyTorch checkpoints
-        // NOTE: Noise predictions use output/target dimensions
-        let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
-        // Convert back to F32 for scheduler arithmetic
-        let unpacked = unpacked.to_dtype(DType::F32)?;
-        let unpacked_latents =
-            unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
-        let stepped = scheduler.step(&unpacked, &unpacked_latents)?;
-        // stepped is [B, C, T, H, W], matching pack_latents expectation
-        latents = pack_latents(&stepped, dims.latent_height, dims.latent_width)?;
+        // Convert guided_pred to F32 for scheduler arithmetic (matching PyTorch behavior)
+        let guided_pred = guided_pred.to_dtype(DType::F32)?;
+
+        // Scheduler operates on PACKED latents (matching PyTorch diffusers)
+        latents = scheduler.step(&guided_pred, &latents)?;
 
         // Debug: capture latents after each step
         let step_name = format!("latents_after_step{}", step);

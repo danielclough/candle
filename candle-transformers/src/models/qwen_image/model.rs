@@ -356,19 +356,18 @@ impl QwenImageTransformer2DModel {
     }
 }
 
-/// Pack latents from [batch, channels, 1, height, width] to [batch, (H/2)×(W/2), channels×4].
+/// Pack latents from [batch, 1, channels, height, width] to [batch, (H/2)×(W/2), channels×4].
 ///
-/// Input uses (B, C, T, H, W) convention matching PyTorch's _pack_latents internal data layout.
-/// Note: While PyTorch creates latents as [B, T, C, H, W], the pack operation's view()
-/// interprets the flat data as [B, C, H, W] due to T=1 collapsing. This function expects
-/// the data to be in that layout.
+/// Input uses (B, T, C, H, W) convention matching PyTorch's diffusers pipeline.
+/// The view() operation interprets the flat data as [B, C, H/2, 2, W/2, 2] since T=1.
 /// The 2×2 spatial patches are flattened into the channel dimension.
 pub fn pack_latents(latents: &Tensor, height: usize, width: usize) -> Result<Tensor> {
-    let (batch, channels, _frames, h, w) = latents.dims5()?;
+    let (batch, _frames, channels, h, w) = latents.dims5()?;
     assert_eq!(h, height, "Height mismatch");
     assert_eq!(w, width, "Width mismatch");
 
-    // [batch, channels, 1, height, width] -> [batch, channels, height/2, 2, width/2, 2]
+    // [batch, 1, channels, height, width] -> [batch, channels, height/2, 2, width/2, 2]
+    // This reinterprets the flat data (works because T=1)
     let latents = latents.reshape((batch, channels, height / 2, 2, width / 2, 2))?;
 
     // Permute to [batch, height/2, width/2, channels, 2, 2]
@@ -417,10 +416,10 @@ mod tests {
         let height = 64;
         let width = 64;
 
-        // Create random latents in [B, C, T, H, W] format (matching pack_latents input)
-        let latents = Tensor::randn(0f32, 1f32, (batch, channels, 1, height, width), &device)?;
+        // Create random latents in [B, T, C, H, W] format (matching PyTorch diffusers)
+        let latents = Tensor::randn(0f32, 1f32, (batch, 1, channels, height, width), &device)?;
 
-        // Pack: [B, C, T, H, W] -> [B, num_patches, C*4]
+        // Pack: [B, T, C, H, W] -> [B, num_patches, C*4]
         let packed = pack_latents(&latents, height, width)?;
         assert_eq!(packed.dims(), &[batch, (height / 2) * (width / 2), channels * 4]);
 
@@ -428,9 +427,11 @@ mod tests {
         let unpacked = unpack_latents(&packed, height, width, channels)?;
         assert_eq!(unpacked.dims(), &[batch, channels, 1, height, width]);
 
-        // Pack and unpack should be true inverses
-        let diff = (&latents - &unpacked)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(diff < 1e-5, "Pack/unpack should be lossless, diff: {}", diff);
+        // PyTorch: pack takes [B, T, C, H, W], unpack gives [B, C, T, H, W]
+        // Verify data is preserved by comparing with permuted input
+        let latents_bcthw = latents.permute([0, 2, 1, 3, 4])?;
+        let diff = (&latents_bcthw - &unpacked)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "Pack/unpack should preserve data, diff: {}", diff);
 
         Ok(())
     }

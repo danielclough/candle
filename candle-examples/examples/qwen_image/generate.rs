@@ -145,21 +145,21 @@ pub fn run(
     } else if let Some(seed) = args.seed {
         // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-        // Use [B, C, T, H, W] format to match pack_latents expectation
+        // Use [B, T, C, H, W] format to match PyTorch diffusers
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
-            &[1, 16, 1, dims.latent_height, dims.latent_width],
+            &[1, 1, 16, dims.latent_height, dims.latent_width],
             device,
             DType::F32,
         )?
     } else {
         // Use Candle's default RNG (not reproducible across frameworks)
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-        // Use [B, C, T, H, W] format to match pack_latents expectation
+        // Use [B, T, C, H, W] format to match PyTorch diffusers
         Tensor::randn(
             0f32,
             1f32,
-            (1, 16, 1, dims.latent_height, dims.latent_width),
+            (1, 1, 16, dims.latent_height, dims.latent_width),
             device,
         )?
     };
@@ -184,7 +184,10 @@ pub fn run(
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
     let txt_seq_lens = vec![pos_embeds.dim(1)?];
     let timesteps = scheduler.timesteps().to_vec();
-    let mut latents = latents;
+
+    // Pack latents immediately - PyTorch keeps latents packed throughout the loop
+    // latents is [B, T, C, H, W], pack to [B, seq, C*4]
+    let mut latents = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
 
     println!("  Running {} denoising steps...", num_actual_steps);
     for (step_idx, &timestep) in timesteps
@@ -203,31 +206,28 @@ pub fn run(
             );
         }
 
-        let packed = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         // Convert F32 latents to BF16 for transformer (weights are BF16)
-        let packed = packed.to_dtype(dtype)?;
+        let latents_bf16 = latents.to_dtype(dtype)?;
 
         let noise_pred =
-            transformer.forward(&packed, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens)?;
+            transformer.forward(&latents_bf16, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens)?;
 
         // Apply True CFG only if negative prompt was provided
         let noise_pred = if let Some((ref neg_embeds, ref neg_mask)) = neg_data {
             let neg_pred =
-                transformer.forward(&packed, neg_embeds, neg_mask, &t, &img_shapes, &txt_seq_lens)?;
+                transformer.forward(&latents_bf16, neg_embeds, neg_mask, &t, &img_shapes, &txt_seq_lens)?;
             apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred
         };
 
-        // Unpack noise prediction: 3D packed -> [B, C, T, H, W]
-        let unpacked = unpack_latents(&noise_pred, dims.latent_height, dims.latent_width, 16)?;
-        // Convert noise prediction back to F32 for scheduler arithmetic
-        let unpacked = unpacked.to_dtype(DType::F32)?;
+        // Convert noise_pred to F32 for scheduler arithmetic (matching PyTorch behavior)
+        let noise_pred = noise_pred.to_dtype(DType::F32)?;
 
-        // Both unpacked and latents are [B, C, T, H, W], scheduler does element-wise ops
-        latents = scheduler.step(&unpacked, &latents)?;
+        // Scheduler operates on PACKED latents (matching PyTorch diffusers)
+        latents = scheduler.step(&noise_pred, &latents)?;
     }
 
     drop(transformer);
@@ -238,7 +238,8 @@ pub fn run(
     // =========================================================================
     println!("\n[5/5] Decoding latents...");
 
-    // latents are already in [B, C, T, H, W] format (matching VAE expectation)
+    // Unpack latents for VAE: [B, seq, C*4] -> [B, C, T, H, W]
+    let latents = unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
     let denormalized = vae.denormalize_latents(&latents)?;
 
     // Use decode_image for single-frame output (matches PyTorch: vae.decode(z)[:, :, 0])
