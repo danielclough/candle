@@ -10,6 +10,7 @@ use crate::{
 
 pub(super) struct Conv3D<'a>(pub(super) &'a ParamsConv3D);
 
+#[allow(dead_code)]
 enum Conv3dImpl {
     TiledIm2Col,
     FullIm2Col,

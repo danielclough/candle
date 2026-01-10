@@ -491,3 +491,367 @@ pub fn load_block_overrides(device: &Device, dtype: DType, pass_suffix: Option<&
 
     Ok(Some(overrides))
 }
+
+// ============================================================================
+// Attention Debug Functions for CFG Bug Investigation
+// ============================================================================
+
+/// Check if attention debug mode is enabled (via QWEN_DEBUG_ATTENTION environment variable).
+pub fn is_attention_debug() -> bool {
+    std::env::var("QWEN_DEBUG_ATTENTION").is_ok()
+}
+
+/// Debug attention internals to isolate where divergence occurs.
+///
+/// This function captures and compares tensors at each step of the attention computation:
+/// 1. Q@K.T (raw matmul output)
+/// 2. attn_weights (after scaling by 1/sqrt(head_dim))
+/// 3. attn_probs (after softmax)
+///
+/// By comparing with PyTorch reference at each step, we can identify exactly where
+/// the Rust implementation diverges.
+///
+/// # Arguments
+/// * `name` - Identifier for this attention (e.g., "block0")
+/// * `attn_logits` - Q@K.T raw output before scaling
+/// * `attn_weights` - Scaled attention weights before softmax
+/// * `attn_probs` - Attention probabilities after softmax
+/// * `pytorch_dir` - Optional path to directory containing PyTorch reference tensors
+pub fn debug_attention_internals(
+    name: &str,
+    attn_logits: &Tensor,
+    attn_weights: &Tensor,
+    attn_probs: &Tensor,
+    pytorch_dir: Option<&str>,
+) -> Result<()> {
+    if !is_attention_debug() {
+        return Ok(());
+    }
+
+    let suffix = get_cfg_pass_suffix();
+    let pass_name = if suffix == "_pos" { "POSITIVE" } else { "NEGATIVE" };
+
+    eprintln!("\n[ATTN_DEBUG] {} {} pass attention internals:", name, pass_name);
+    eprintln!("[ATTN_DEBUG] ─────────────────────────────────────────────");
+
+    // Compute stats for each stage
+    let logits_stats = tensor_stats(attn_logits)?;
+    let weights_stats = tensor_stats(attn_weights)?;
+    let probs_stats = tensor_stats(attn_probs)?;
+
+    eprintln!("[ATTN_DEBUG] Q@K.T (raw):     mean={:10.4}, std={:10.4}, min={:10.4}, max={:10.4}",
+        logits_stats.0, logits_stats.1, logits_stats.2, logits_stats.3);
+    eprintln!("[ATTN_DEBUG] scaled weights:  mean={:10.4}, std={:10.4}, min={:10.4}, max={:10.4}",
+        weights_stats.0, weights_stats.1, weights_stats.2, weights_stats.3);
+    eprintln!("[ATTN_DEBUG] softmax probs:   mean={:10.4}, std={:10.4}, min={:10.4}, max={:10.4}",
+        probs_stats.0, probs_stats.1, probs_stats.2, probs_stats.3);
+
+    // Load and compare with PyTorch if available
+    if let Some(dir) = pytorch_dir {
+        let tensor_dir = Path::new(dir);
+
+        // Try to load PyTorch reference tensors
+        let logits_path = tensor_dir.join(format!("{}_attn_logits{}.npy", name, suffix));
+        let weights_path = tensor_dir.join(format!("{}_attn_weights{}.npy", name, suffix));
+        let probs_path = tensor_dir.join(format!("{}_attn_probs{}.npy", name, suffix));
+
+        if logits_path.exists() {
+            let py_logits = Tensor::read_npy(&logits_path)?;
+            let diff = compare_tensors(attn_logits, &py_logits)?;
+            eprintln!("[ATTN_DEBUG] Q@K.T vs PyTorch: max_diff={:.6}, mean_diff={:.6} {}",
+                diff.0, diff.1, if diff.0 < 0.01 { "✅" } else { "⚠️" });
+        }
+
+        if weights_path.exists() {
+            let py_weights = Tensor::read_npy(&weights_path)?;
+            let diff = compare_tensors(attn_weights, &py_weights)?;
+            eprintln!("[ATTN_DEBUG] scaled vs PyTorch: max_diff={:.6}, mean_diff={:.6} {}",
+                diff.0, diff.1, if diff.0 < 0.01 { "✅" } else { "⚠️" });
+        }
+
+        if probs_path.exists() {
+            let py_probs = Tensor::read_npy(&probs_path)?;
+            let diff = compare_tensors(attn_probs, &py_probs)?;
+            eprintln!("[ATTN_DEBUG] softmax vs PyTorch: max_diff={:.6}, mean_diff={:.6} {}",
+                diff.0, diff.1, if diff.0 < 0.01 { "✅" } else { "❌ BUG HERE?" });
+        }
+    }
+
+    eprintln!("[ATTN_DEBUG] ─────────────────────────────────────────────\n");
+    Ok(())
+}
+
+/// Compare two tensors and return (max_diff, mean_diff).
+fn compare_tensors(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
+    let a_f32 = a.to_dtype(DType::F32)?.flatten_all()?;
+    let b_f32 = b.to_dtype(DType::F32)?.flatten_all()?;
+
+    // Handle shape mismatch gracefully
+    if a_f32.elem_count() != b_f32.elem_count() {
+        return Ok((f32::INFINITY, f32::INFINITY));
+    }
+
+    let diff = (&a_f32 - &b_f32)?.abs()?;
+    let max_diff = diff.max(0)?.to_scalar::<f32>()?;
+    let mean_diff = diff.mean_all()?.to_scalar::<f32>()?;
+    Ok((max_diff, mean_diff))
+}
+
+/// Analyze attention probabilities per head to identify which heads diverge most.
+///
+/// # Arguments
+/// * `attn_probs` - Attention probabilities [batch, heads, seq, seq]
+/// * `name` - Identifier for logging
+pub fn debug_per_head_stats(
+    attn_probs: &Tensor,
+    name: &str,
+) -> Result<()> {
+    if !is_attention_debug() {
+        return Ok(());
+    }
+
+    let suffix = get_cfg_pass_suffix();
+    let pass_name = if suffix == "_pos" { "POSITIVE" } else { "NEGATIVE" };
+
+    eprintln!("\n[HEAD_DEBUG] {} {} pass - Per-head attention analysis:", name, pass_name);
+    eprintln!("[HEAD_DEBUG] Shape: {:?}", attn_probs.dims());
+
+    let dims = attn_probs.dims();
+    if dims.len() != 4 {
+        eprintln!("[HEAD_DEBUG] Warning: Expected 4D tensor [batch, heads, seq, seq], got {:?}", dims);
+        return Ok(());
+    }
+
+    let num_heads = dims[1];
+    let probs_f32 = attn_probs.to_dtype(DType::F32)?;
+
+    eprintln!("[HEAD_DEBUG] ┌────────┬───────────┬───────────┬───────────┬───────────┐");
+    eprintln!("[HEAD_DEBUG] │  Head  │   Mean    │   Std     │   Min     │   Max     │");
+    eprintln!("[HEAD_DEBUG] ├────────┼───────────┼───────────┼───────────┼───────────┤");
+
+    let mut heads_with_max_1 = 0;
+    let mut total_max = 0.0f32;
+
+    for h in 0..num_heads {
+        // Extract attention for this head: [batch, seq, seq]
+        let head_attn = probs_f32.narrow(1, h, 1)?.squeeze(1)?;
+        let stats = tensor_stats(&head_attn)?;
+
+        // Check if any attention weight is close to 1.0 (focused attention)
+        if stats.3 > 0.99 {
+            heads_with_max_1 += 1;
+        }
+        total_max += stats.3;
+
+        let max_indicator = if stats.3 > 0.99 { "★" } else if stats.3 > 0.9 { "●" } else { " " };
+        eprintln!("[HEAD_DEBUG] │ {:>4}   │ {:>9.6} │ {:>9.6} │ {:>9.6} │ {:>9.6} │ {}",
+            h, stats.0, stats.1, stats.2, stats.3, max_indicator);
+    }
+
+    eprintln!("[HEAD_DEBUG] └────────┴───────────┴───────────┴───────────┴───────────┘");
+    eprintln!("[HEAD_DEBUG] Summary: {}/{} heads have max ≈ 1.0 (focused attention)",
+        heads_with_max_1, num_heads);
+    eprintln!("[HEAD_DEBUG] Average max across heads: {:.6}", total_max / num_heads as f32);
+    eprintln!("[HEAD_DEBUG] (★ = max > 0.99, ● = max > 0.9)");
+
+    Ok(())
+}
+
+/// Compare attention patterns between positive and negative CFG passes.
+///
+/// This helps understand if errors are correlated or anti-correlated between passes,
+/// which affects how CFG amplifies the errors.
+///
+/// # Arguments
+/// * `pos_attn` - Attention probs from positive prompt pass [batch, heads, seq, seq]
+/// * `neg_attn` - Attention probs from negative prompt pass [batch, heads, seq, seq]
+pub fn debug_cfg_attention_comparison(
+    pos_attn: &Tensor,
+    neg_attn: &Tensor,
+) -> Result<()> {
+    if !is_attention_debug() {
+        return Ok(());
+    }
+
+    eprintln!("\n[CFG_DEBUG] Comparing positive vs negative attention patterns:");
+
+    let pos_stats = tensor_stats(pos_attn)?;
+    let neg_stats = tensor_stats(neg_attn)?;
+
+    eprintln!("[CFG_DEBUG] Positive: mean={:.6}, std={:.6}, max={:.6}",
+        pos_stats.0, pos_stats.1, pos_stats.3);
+    eprintln!("[CFG_DEBUG] Negative: mean={:.6}, std={:.6}, max={:.6}",
+        neg_stats.0, neg_stats.1, neg_stats.3);
+
+    // Check if shapes match for detailed comparison
+    if pos_attn.dims() != neg_attn.dims() {
+        eprintln!("[CFG_DEBUG] Warning: Shape mismatch - pos: {:?}, neg: {:?}",
+            pos_attn.dims(), neg_attn.dims());
+        eprintln!("[CFG_DEBUG] (This is expected if prompts have different token counts)");
+        return Ok(());
+    }
+
+    let diff = compare_tensors(pos_attn, neg_attn)?;
+    eprintln!("[CFG_DEBUG] Attention diff: max={:.6}, mean={:.6}", diff.0, diff.1);
+
+    // Compute correlation between errors
+    // If errors are anti-correlated (opposite signs), CFG will amplify them
+    let pos_f32 = pos_attn.to_dtype(DType::F32)?.flatten_all()?;
+    let neg_f32 = neg_attn.to_dtype(DType::F32)?.flatten_all()?;
+
+    // Compute element-wise product to check correlation direction
+    let product = (&pos_f32 * &neg_f32)?;
+    let product_mean = product.mean_all()?.to_scalar::<f32>()?;
+    let pos_neg_product_sign = if product_mean > 0.0 { "positive (correlated)" } else { "negative (anti-correlated)" };
+
+    eprintln!("[CFG_DEBUG] Error correlation: {} - mean(pos*neg) = {:.6}",
+        pos_neg_product_sign, product_mean);
+
+    if product_mean < 0.0 {
+        eprintln!("[CFG_DEBUG] ⚠️ Anti-correlated errors will be AMPLIFIED by CFG!");
+        eprintln!("[CFG_DEBUG]    CFG formula: guided = neg + scale*(pos - neg)");
+        eprintln!("[CFG_DEBUG]    If pos ≈ -neg, then guided ≈ (1+2*scale)*pos");
+    }
+
+    Ok(())
+}
+
+/// Save attention tensors to disk for external analysis.
+///
+/// # Arguments
+/// * `name` - Base name for the files
+/// * `attn_logits` - Q@K.T raw output
+/// * `attn_weights` - Scaled attention weights
+/// * `attn_probs` - Attention probabilities after softmax
+pub fn save_attention_tensors(
+    name: &str,
+    attn_logits: &Tensor,
+    attn_weights: &Tensor,
+    attn_probs: &Tensor,
+) -> Result<()> {
+    let suffix = get_cfg_pass_suffix();
+    let output_dir = "debug_tensors/rust_edit";
+    std::fs::create_dir_all(output_dir)?;
+
+    let logits_path = format!("{}/{}_attn_logits{}.npy", output_dir, name, suffix);
+    let weights_path = format!("{}/{}_attn_weights{}.npy", output_dir, name, suffix);
+    let probs_path = format!("{}/{}_attn_probs{}.npy", output_dir, name, suffix);
+
+    attn_logits.write_npy(&logits_path)?;
+    attn_weights.write_npy(&weights_path)?;
+    attn_probs.write_npy(&probs_path)?;
+
+    eprintln!("[ATTN_DEBUG] Saved attention tensors to {}/*{}.npy", output_dir, suffix);
+    Ok(())
+}
+
+// ============================================================================
+// Q/K Pipeline Debug Functions for Stage-by-Stage Comparison
+// ============================================================================
+
+/// Check if Q/K pipeline saving is enabled (via QWEN_SAVE_QK environment variable).
+pub fn is_qk_save_enabled() -> bool {
+    std::env::var("QWEN_SAVE_QK").is_ok()
+}
+
+/// Save Q/K tensors at a specific pipeline stage.
+///
+/// This enables stage-by-stage comparison with PyTorch to identify where divergence occurs:
+/// - Stage 1 (proj): After linear projection, before reshape
+/// - Stage 2 (norm): After QkNorm (RMSNorm), before RoPE
+/// - Stage 3 (rope): After RoPE application
+///
+/// # Arguments
+/// * `block_name` - Block identifier (e.g., "block0")
+/// * `stage` - Pipeline stage: "proj", "norm", or "rope"
+/// * `img_q` - Image stream Q tensor
+/// * `img_k` - Image stream K tensor
+/// * `txt_q` - Text stream Q tensor
+/// * `txt_k` - Text stream K tensor
+pub fn save_qk_pipeline_tensors(
+    block_name: &str,
+    stage: &str,
+    img_q: &Tensor,
+    img_k: &Tensor,
+    txt_q: &Tensor,
+    txt_k: &Tensor,
+) -> Result<()> {
+    if !is_qk_save_enabled() {
+        return Ok(());
+    }
+
+    let suffix = get_cfg_pass_suffix();
+    let output_dir = "debug_tensors/rust_edit";
+    std::fs::create_dir_all(output_dir)?;
+
+    // Save each tensor with descriptive names matching PyTorch convention
+    // Convert to F32 before saving (NumPy doesn't support BF16)
+    let tensors = [
+        (format!("{}_{}_img_q{}.npy", block_name, stage, suffix), img_q),
+        (format!("{}_{}_img_k{}.npy", block_name, stage, suffix), img_k),
+        (format!("{}_{}_txt_q{}.npy", block_name, stage, suffix), txt_q),
+        (format!("{}_{}_txt_k{}.npy", block_name, stage, suffix), txt_k),
+    ];
+
+    for (filename, tensor) in &tensors {
+        let path = format!("{}/{}", output_dir, filename);
+        tensor.to_dtype(DType::F32)?.write_npy(&path)?;
+    }
+
+    // Print summary statistics for quick comparison
+    let img_q_stats = tensor_stats(img_q)?;
+    let img_k_stats = tensor_stats(img_k)?;
+    let txt_q_stats = tensor_stats(txt_q)?;
+    let txt_k_stats = tensor_stats(txt_k)?;
+
+    eprintln!("\n[QK_SAVE] {} stage '{}' {}:", block_name, stage, suffix.trim_start_matches('_'));
+    eprintln!("[QK_SAVE] img_q: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        img_q.dims(), img_q_stats.0, img_q_stats.1, img_q_stats.2, img_q_stats.3);
+    eprintln!("[QK_SAVE] img_k: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        img_k.dims(), img_k_stats.0, img_k_stats.1, img_k_stats.2, img_k_stats.3);
+    eprintln!("[QK_SAVE] txt_q: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        txt_q.dims(), txt_q_stats.0, txt_q_stats.1, txt_q_stats.2, txt_q_stats.3);
+    eprintln!("[QK_SAVE] txt_k: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        txt_k.dims(), txt_k_stats.0, txt_k_stats.1, txt_k_stats.2, txt_k_stats.3);
+    eprintln!("[QK_SAVE] Saved to {}/{}_{}_*{}.npy", output_dir, block_name, stage, suffix);
+
+    Ok(())
+}
+
+/// Save RoPE frequency tensors for debugging.
+///
+/// # Arguments
+/// * `name` - Identifier (e.g., "diffusion_rope")
+/// * `img_freqs` - Image/video frequency tensor [seq, dim/2, 2]
+/// * `txt_freqs` - Text frequency tensor [seq, dim/2, 2]
+pub fn save_rope_freqs(
+    name: &str,
+    img_freqs: &Tensor,
+    txt_freqs: &Tensor,
+) -> Result<()> {
+    if !is_qk_save_enabled() {
+        return Ok(());
+    }
+
+    let output_dir = "debug_tensors/rust_edit";
+    std::fs::create_dir_all(output_dir)?;
+
+    let img_path = format!("{}/{}_img_freqs.npy", output_dir, name);
+    let txt_path = format!("{}/{}_txt_freqs.npy", output_dir, name);
+
+    // Convert to F32 before saving (NumPy doesn't support BF16)
+    img_freqs.to_dtype(DType::F32)?.write_npy(&img_path)?;
+    txt_freqs.to_dtype(DType::F32)?.write_npy(&txt_path)?;
+
+    let img_stats = tensor_stats(img_freqs)?;
+    let txt_stats = tensor_stats(txt_freqs)?;
+
+    eprintln!("\n[ROPE_SAVE] {} frequencies:", name);
+    eprintln!("[ROPE_SAVE] img_freqs: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        img_freqs.dims(), img_stats.0, img_stats.1, img_stats.2, img_stats.3);
+    eprintln!("[ROPE_SAVE] txt_freqs: shape={:?}, mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+        txt_freqs.dims(), txt_stats.0, txt_stats.1, txt_stats.2, txt_stats.3);
+    eprintln!("[ROPE_SAVE] Saved to {}/{}_*.npy", output_dir, name);
+
+    Ok(())
+}

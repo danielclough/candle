@@ -22,6 +22,8 @@
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 
+use super::debug::save_rope_freqs;
+
 /// Maximum sequence length for precomputed frequencies.
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -279,6 +281,9 @@ impl QwenEmbedRope {
             .pos_freqs
             .narrow(0, max_vid_index, max_txt_len)?
             .contiguous()?;
+
+        // Save frequency tensors for debugging
+        save_rope_freqs("diffusion_rope", &vid_freqs, &txt_freqs)?;
 
         Ok((vid_freqs, txt_freqs))
     }

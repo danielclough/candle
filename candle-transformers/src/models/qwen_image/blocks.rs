@@ -12,7 +12,12 @@
 use candle::{DType, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 
-use super::debug::{debug_tensor, BlockOverrides};
+use super::debug::{
+    debug_tensor, BlockOverrides,
+    is_attention_debug, debug_attention_internals,
+    debug_per_head_stats, save_attention_tensors,
+    save_qk_pipeline_tensors, is_qk_save_enabled,
+};
 use super::rope::apply_rotary_emb_qwen;
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -324,6 +329,19 @@ fn scaled_dot_product_attention(
         debug_tensor("[BLOCK0.ATTN] attn_probs (softmax)", &attn_probs);
     }
 
+    // Deep attention debug: full internals comparison + per-head analysis (only for block 0)
+    if debug && is_attention_debug() {
+        debug_attention_internals(
+            "block0",
+            &attn_logits,
+            &attn_weights,
+            &attn_probs,
+            Some("debug_tensors/pytorch_edit"),
+        )?;
+        debug_per_head_stats(&attn_probs, "block0")?;
+        save_attention_tensors("block0", &attn_logits, &attn_weights, &attn_probs)?;
+    }
+
     // Override attention probs if provided
     let attn_probs = if let Some(BlockOverrides { attn_probs: Some(ref ovr), .. }) = overrides {
         if debug {
@@ -473,6 +491,22 @@ impl QwenDoubleStreamAttention {
         let img_v = hidden_states.apply(&self.to_v)?;
 
         if debug {
+            // Debug: Print weight statistics to verify loading
+            let to_q_weight = self.to_q.weight();
+            let w_mean = to_q_weight.mean_all()?.to_scalar::<f32>().unwrap_or(0.0);
+            let w_flat = to_q_weight.flatten_all()?.to_dtype(DType::F32)?;
+            let w_std = (w_flat.sqr()?.mean_all()?.to_scalar::<f32>().unwrap_or(0.0) - w_mean.powi(2)).sqrt();
+            eprintln!("[BLOCK0.ATTN] to_q.weight: shape={:?}, mean={:.6}, std={:.6}",
+                to_q_weight.dims(), w_mean, w_std);
+            if let Some(bias) = self.to_q.bias() {
+                let b_mean = bias.mean_all()?.to_scalar::<f32>().unwrap_or(0.0);
+                let b_flat = bias.flatten_all()?.to_dtype(DType::F32)?;
+                let b_std = (b_flat.sqr()?.mean_all()?.to_scalar::<f32>().unwrap_or(0.0) - b_mean.powi(2)).sqrt();
+                eprintln!("[BLOCK0.ATTN] to_q.bias: shape={:?}, mean={:.6}, std={:.6}",
+                    bias.dims(), b_mean, b_std);
+            } else {
+                eprintln!("[BLOCK0.ATTN] to_q.bias: NONE");
+            }
             debug_tensor("[BLOCK0.ATTN] img_q_proj", &img_q);
             debug_tensor("[BLOCK0.ATTN] img_k_proj", &img_k);
             debug_tensor("[BLOCK0.ATTN] img_v_proj", &img_v);
@@ -515,6 +549,13 @@ impl QwenDoubleStreamAttention {
             debug_tensor("[BLOCK0.ATTN] txt_q_proj", &txt_q);
             debug_tensor("[BLOCK0.ATTN] txt_k_proj", &txt_k);
             debug_tensor("[BLOCK0.ATTN] txt_v_proj", &txt_v);
+        }
+
+        // Save Q/K at projection stage (before reshape, before overrides)
+        // Note: This captures the raw projection output for comparison with PyTorch
+        // Only save for first attention call (block 0) by checking debug flag
+        if debug && is_qk_save_enabled() {
+            save_qk_pipeline_tensors("block0", "proj", &img_q, &img_k, &txt_q, &txt_k)?;
         }
 
         // Apply Q/K/V overrides for text stream if provided
@@ -565,6 +606,12 @@ impl QwenDoubleStreamAttention {
             debug_tensor("[BLOCK0.ATTN] txt_k_after_norm", &txt_k);
         }
 
+        // Save Q/K after normalization (before RoPE)
+        // Only save for block 0 (debug flag is only true for block 0)
+        if debug && is_qk_save_enabled() {
+            save_qk_pipeline_tensors("block0", "norm", &img_q, &img_k, &txt_q, &txt_k)?;
+        }
+
         // Apply RoPE
         let (img_q, img_k, txt_q, txt_k) = if let Some((img_freqs, txt_freqs)) = image_rotary_emb {
             let img_q = apply_rotary_emb_qwen(&img_q, img_freqs)?;
@@ -581,6 +628,12 @@ impl QwenDoubleStreamAttention {
             debug_tensor("[BLOCK0.ATTN] img_k_after_rope", &img_k);
             debug_tensor("[BLOCK0.ATTN] txt_q_after_rope", &txt_q);
             debug_tensor("[BLOCK0.ATTN] txt_k_after_rope", &txt_k);
+        }
+
+        // Save Q/K after RoPE (final Q/K used in attention)
+        // Only save for block 0 (debug flag is only true for block 0)
+        if debug && is_qk_save_enabled() {
+            save_qk_pipeline_tensors("block0", "rope", &img_q, &img_k, &txt_q, &txt_k)?;
         }
 
         // Concatenate for joint attention in [B, S, H, D] format: order is [text, image]
