@@ -857,9 +857,12 @@ pub struct DiagonalGaussianDistribution {
 
 impl DiagonalGaussianDistribution {
     pub fn new(parameters: &Tensor) -> Result<Self> {
+        debug_vae_tensor("DiagonalGaussian input", parameters);
         let chunks = parameters.chunk(2, 1)?;
         let mean = chunks[0].clone();
+        debug_vae_tensor("DiagonalGaussian mean (chunk 0)", &mean);
         let logvar = chunks[1].clamp(-30.0, 20.0)?;
+        debug_vae_tensor("DiagonalGaussian logvar (chunk 1, clamped)", &logvar);
         let std = (&logvar * 0.5)?.exp()?;
         Ok(Self { mean, logvar, std })
     }
@@ -940,7 +943,9 @@ impl AutoencoderKLQwenImage {
     /// Encode an image to latent distribution.
     pub fn encode(&self, x: &Tensor) -> Result<DiagonalGaussianDistribution> {
         let h = self.encoder.forward(x)?;
+        debug_vae_tensor("after_conv_out (encoder output)", &h);
         let h = self.quant_conv.forward(&h, None)?;
+        debug_vae_tensor("after_quant_conv", &h);
         DiagonalGaussianDistribution::new(&h)
     }
 

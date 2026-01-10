@@ -92,7 +92,13 @@ pub fn tensor_stats_string(t: &Tensor) -> Result<String> {
     ))
 }
 
+/// Check if VAE tensor saving is enabled (via VAE_SAVE environment variable).
+pub fn is_vae_save() -> bool {
+    std::env::var("VAE_SAVE").is_ok()
+}
+
 /// Print VAE tensor statistics (only if VAE_DEBUG is set).
+/// Also saves tensors to debug_tensors/rust_edit/ if VAE_SAVE is set.
 pub fn debug_vae_tensor(name: &str, t: &Tensor) {
     if !is_vae_debug() {
         return;
@@ -104,6 +110,21 @@ pub fn debug_vae_tensor(name: &str, t: &Tensor) {
         }
         Err(e) => {
             eprintln!("[VAE] {}: shape={:?}, stats error: {}", name, t.dims(), e);
+        }
+    }
+
+    // Save tensor if VAE_SAVE is enabled
+    if is_vae_save() {
+        let output_dir = "debug_tensors/rust_edit";
+        if let Err(e) = std::fs::create_dir_all(output_dir) {
+            eprintln!("[VAE_SAVE] Failed to create dir: {}", e);
+            return;
+        }
+        let path = format!("{}/vae_{}.npy", output_dir, name);
+        if let Err(e) = t.write_npy(&path) {
+            eprintln!("[VAE_SAVE] Failed to save {}: {}", name, e);
+        } else {
+            eprintln!("[VAE_SAVE] Saved {}", path);
         }
     }
 }
