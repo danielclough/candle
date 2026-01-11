@@ -53,13 +53,13 @@ pub struct FlowMatchEulerDiscreteScheduler {
     base_shift: f64,
 
     /// Maximum shift value for the largest supported resolution.
-    max_shift: f64,
+    _max_shift: f64,
 
     /// Base image sequence length for shift interpolation.
-    base_image_seq_len: usize,
+    _base_image_seq_len: usize,
 
     /// Maximum image sequence length for shift interpolation.
-    max_image_seq_len: usize,
+    _max_image_seq_len: usize,
 
     /// Current sigma values (noise levels) for each step.
     sigmas: Vec<f64>,
@@ -81,9 +81,9 @@ impl FlowMatchEulerDiscreteScheduler {
             num_train_timesteps: config.num_train_timesteps,
             use_dynamic_shifting: config.use_dynamic_shifting,
             base_shift: config.base_shift,
-            max_shift: config.max_shift,
-            base_image_seq_len: config.base_image_seq_len,
-            max_image_seq_len: config.max_image_seq_len,
+            _max_shift: config.max_shift,
+            _base_image_seq_len: config.base_image_seq_len,
+            _max_image_seq_len: config.max_image_seq_len,
             sigmas: Vec::new(),
             timesteps: Vec::new(),
             step_index: 0,

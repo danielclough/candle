@@ -50,7 +50,6 @@ extern crate intel_mkl_src;
 
 mod common;
 mod controlnet;
-mod debug;
 mod edit;
 mod generate;
 mod inpaint;
@@ -106,15 +105,6 @@ struct Cli {
     #[arg(long, global = true)]
     tokenizer_path: Option<String>,
 
-    /// Enable debug mode: save tensors for comparison with PyTorch.
-    #[arg(long, global = true)]
-    debug: bool,
-
-    /// Debug substitution mode (requires --debug).
-    /// Presets: none, all, prompt, latents, vae, vision, noise, transformer.
-    /// Custom: only:name1,name2 or except:name1,name2
-    #[arg(long, global = true, default_value = "none")]
-    debug_substitute: String,
 }
 
 #[derive(Subcommand)]
@@ -394,7 +384,7 @@ fn main() -> Result<()> {
                 num_inference_steps,
                 true_cfg_scale,
                 model_id,
-                vae_model_id,
+                _vae_model_id: vae_model_id,
                 height,
                 width,
                 max_resolution,
@@ -411,15 +401,7 @@ fn main() -> Result<()> {
                 tokenizer_path: cli.tokenizer_path,
             };
 
-            // Setup debug context if enabled
-            let mut debug_ctx = if cli.debug {
-                let mode = debug::SubstituteMode::parse(&cli.debug_substitute)?;
-                Some(debug::setup_debug_context_for_edit_with_mode(&device, mode)?)
-            } else {
-                None
-            };
-
-            edit::run(args, paths, &device, dtype, debug_ctx.as_mut())
+            edit::run(args, paths, &device, dtype)
         }
 
         Command::Inpaint {

@@ -8,7 +8,7 @@
 //! - Scheduler setup
 
 use anyhow::{anyhow, Result};
-use candle::{DType, Device, IndexOp, Tensor, D};
+use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
@@ -469,7 +469,7 @@ pub struct LatentDims {
 
 /// Validate that dimensions are divisible by 16.
 pub fn validate_dimensions(height: usize, width: usize) -> Result<()> {
-    if height % 16 != 0 || width % 16 != 0 {
+    if !height.is_multiple_of(16) || !width.is_multiple_of(16) {
         return Err(anyhow!(
             "Height ({}) and width ({}) must be divisible by 16",
             height,
@@ -481,8 +481,8 @@ pub fn validate_dimensions(height: usize, width: usize) -> Result<()> {
 
 /// Round dimensions to nearest multiple of 16.
 pub fn round_to_16(height: usize, width: usize) -> (usize, usize) {
-    let h = ((height + 15) / 16) * 16;
-    let w = ((width + 15) / 16) * 16;
+    let h = height.div_ceil(16) * 16;
+    let w = width.div_ceil(16) * 16;
     (h, w)
 }
 
@@ -523,7 +523,7 @@ pub fn calculate_output_dims(
 /// width = round(width / 32) * 32
 /// height = round(height / 32) * 32
 /// ```
-pub fn calculate_source_image_dims(orig_width: usize, orig_height: usize) -> (usize, usize) {
+pub fn _calculate_source_image_dims(orig_width: usize, orig_height: usize) -> (usize, usize) {
     const TARGET_AREA: f64 = 1024.0 * 1024.0; // 1M pixels, matching PyTorch
 
     let ratio = orig_width as f64 / orig_height as f64;

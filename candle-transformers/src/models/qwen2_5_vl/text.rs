@@ -1270,7 +1270,7 @@ impl Qwen25VLTextModel {
     }
 
     /// Debug helper: Check tensor for NaN/Inf and print statistics.
-    fn check_tensor_health(name: &str, tensor: &Tensor) -> Result<bool> {
+    fn _check_tensor_health(name: &str, tensor: &Tensor) -> Result<bool> {
         let t_f32 = tensor.to_dtype(DType::F32)?;
         let vec: Vec<f32> = t_f32.flatten_all()?.to_vec1()?;
         let nan_count = vec.iter().filter(|x| x.is_nan()).count();
@@ -1583,8 +1583,7 @@ impl Qwen25VLTextModel {
         };
 
         // Forward through all transformer layers
-        let num_layers = self.layers.len();
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+        for layer in self.layers.iter_mut() {
             hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
         }
 

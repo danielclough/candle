@@ -325,9 +325,8 @@ pub fn extract_and_pad_embeddings(
     let mut padded_embeds = Vec::new();
     let mut padded_masks = Vec::new();
 
-    for b in 0..batch_size {
+    for (b, &valid_len) in valid_lengths.iter().enumerate() {
         let batch_hidden = hidden_states.i(b)?;
-        let valid_len = valid_lengths[b];
 
         // Extract valid embeddings (skip first `drop_first` tokens)
         let extracted = batch_hidden.narrow(0, drop_first, seq_len - drop_first)?;

@@ -55,7 +55,6 @@
 
 pub mod config;
 pub mod controlnet;
-pub mod debug;
 pub mod edit_helpers;
 pub mod pipeline;
 pub mod rope;
@@ -64,18 +63,6 @@ pub mod vae;
 
 mod blocks;
 mod model;
-
-// Re-export debug types for block overrides
-pub use debug::{BlockOverrides, load_block_overrides, is_block_override_enabled, set_cfg_pass};
-
-// Re-export attention debug functions for CFG bug investigation
-pub use debug::{
-    is_attention_debug,
-    debug_attention_internals,
-    debug_per_head_stats,
-    debug_cfg_attention_comparison,
-    save_attention_tensors,
-};
 
 pub use config::{Config, SchedulerConfig, VaeConfig};
 pub use controlnet::{ControlNetConfig, ControlNetOutput, QwenImageControlNetModel};

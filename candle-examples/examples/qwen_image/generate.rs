@@ -248,6 +248,7 @@ pub fn run(
 }
 
 /// Create initial latents for img2img by encoding the init image and adding noise.
+#[allow(clippy::too_many_arguments)]
 fn create_img2img_latents(
     init_path: &str,
     vae: &candle_transformers::models::qwen_image::AutoencoderKLQwenImage,

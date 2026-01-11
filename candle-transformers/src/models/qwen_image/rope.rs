@@ -22,8 +22,6 @@
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 
-use super::debug::save_rope_freqs;
-
 /// Maximum sequence length for precomputed frequencies.
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -33,7 +31,7 @@ const MAX_SEQ_LEN: usize = 4096;
 /// allowing efficient lookup during forward passes.
 #[derive(Debug, Clone)]
 pub struct QwenEmbedRope {
-    theta: usize,
+    _theta: usize,
     axes_dim: Vec<usize>,
     scale_rope: bool,
     /// Positive frequency cache: shape [MAX_SEQ_LEN, total_dim/2, 2]
@@ -76,7 +74,7 @@ impl QwenEmbedRope {
         let neg_freqs = Self::compute_all_freqs(&neg_index, &axes_dim, theta, device, dtype)?;
 
         Ok(Self {
-            theta,
+            _theta: theta,
             axes_dim,
             scale_rope,
             pos_freqs,
@@ -281,9 +279,6 @@ impl QwenEmbedRope {
             .pos_freqs
             .narrow(0, max_vid_index, max_txt_len)?
             .contiguous()?;
-
-        // Save frequency tensors for debugging
-        save_rope_freqs("diffusion_rope", &vid_freqs, &txt_freqs)?;
 
         Ok((vid_freqs, txt_freqs))
     }

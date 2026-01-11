@@ -25,10 +25,9 @@ use candle::{Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 
 use super::config::VaeConfig;
-use super::debug::debug_vae_tensor;
 
 /// Cache size for temporal causality (number of frames to cache).
-const CACHE_T: usize = 2;
+const _CACHE_T: usize = 2;
 
 /// 3D Causal Convolution with feature caching support.
 ///
@@ -53,7 +52,7 @@ pub struct QwenImageCausalConv3d {
     /// Optional bias: [out_channels]
     bias: Option<Tensor>,
     /// Kernel size: (temporal, height, width)
-    kernel_size: (usize, usize, usize),
+    _kernel_size: (usize, usize, usize),
     /// Stride: (temporal, height, width)
     stride: (usize, usize, usize),
     /// Original padding (used to compute causal padding)
@@ -83,7 +82,7 @@ impl QwenImageCausalConv3d {
         Ok(Self {
             weight,
             bias,
-            kernel_size,
+            _kernel_size: kernel_size,
             stride,
             padding,
         })
@@ -340,11 +339,9 @@ impl QwenImageAttentionBlock {
         // Reshape to [batch*time, channels, height, width]
         let x = x.permute([0, 2, 1, 3, 4])?.reshape((b * t, c, h, w))?;
         let x = self.norm.forward(&x)?;
-        debug_vae_tensor("attn after norm", &x);
 
         // Compute QKV
         let qkv = self.to_qkv.forward(&x)?;
-        debug_vae_tensor("attn qkv", &qkv);
 
         // Reshape for attention: [batch*time, 1, h*w, 3*dim] -> split to q, k, v
         let qkv = qkv.reshape((b * t, 1, c * 3, h * w))?;
@@ -352,22 +349,15 @@ impl QwenImageAttentionBlock {
 
         let chunks = qkv.chunk(3, D::Minus1)?;
         let (q, k, v) = (&chunks[0], &chunks[1], &chunks[2]);
-        debug_vae_tensor("attn Q", q);
-        debug_vae_tensor("attn K", k);
-        debug_vae_tensor("attn V", v);
 
         // Scaled dot-product attention
         // NOTE: k.t() does a FULL transpose (reverses all dims), which is wrong for 4D tensors!
         // We need to transpose only the last two dimensions: [B*T, 1, H*W, C] -> [B*T, 1, C, H*W]
         let scale = (self.dim as f64).sqrt();
         let k_t = k.transpose(D::Minus2, D::Minus1)?;
-        debug_vae_tensor("attn K^T", &k_t);
         let attn = (q.matmul(&k_t)? / scale)?;
-        debug_vae_tensor("attn weights (pre-softmax)", &attn);
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        debug_vae_tensor("attn weights (post-softmax)", &attn);
         let out = attn.matmul(v)?;
-        debug_vae_tensor("attn output", &out);
 
         // Reshape back
         let out = out.squeeze(1)?.permute([0, 2, 1])?; // [batch*time, dim, h*w]
@@ -375,7 +365,6 @@ impl QwenImageAttentionBlock {
 
         // Output projection
         let out = self.proj.forward(&out)?;
-        debug_vae_tensor("attn proj output", &out);
 
         // Reshape back to 5D and add residual
         let out = out.reshape((b, t, c, h, w))?.permute([0, 2, 1, 3, 4])?;
@@ -596,28 +585,19 @@ impl QwenImageEncoder3d {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        debug_vae_tensor("encoder_input", x);
-
         let mut x = self.conv_in.forward(x, None)?;
-        debug_vae_tensor("after_conv_in", &x);
 
-        for (i, block) in self.down_blocks.iter().enumerate() {
+        for block in self.down_blocks.iter() {
             x = match block {
                 DownBlock::Residual(res) => res.forward(&x, None, &mut 0)?,
                 DownBlock::Downsample2D(down) => down.forward(&x)?,
                 DownBlock::Downsample3D(down) => down.forward(&x, None)?,
             };
-            debug_vae_tensor(&format!("after_down_block_{}", i), &x);
         }
 
         x = self.mid_block.forward(&x, None, &mut 0)?;
-        debug_vae_tensor("after_mid_block", &x);
-
         x = self.norm_out.forward(&x)?;
-        debug_vae_tensor("after_norm_out", &x);
-
         x = x.silu()?;
-        debug_vae_tensor("after_silu", &x);
 
         self.conv_out.forward(&x, None)
     }
@@ -814,33 +794,24 @@ impl QwenImageDecoder3d {
 
     pub fn forward(&self, z: &Tensor) -> Result<Tensor> {
         let mut x = self.conv_in.forward(z, None)?;
-        debug_vae_tensor("after conv_in", &x);
 
         x = self.mid_block.forward(&x, None, &mut 0)?;
-        debug_vae_tensor("after mid_block", &x);
 
-        for (i, block) in self.up_blocks.iter().enumerate() {
-            for (j, resnet) in block.resnets.iter().enumerate() {
+        for block in self.up_blocks.iter() {
+            for resnet in block.resnets.iter() {
                 x = resnet.forward(&x, None, &mut 0)?;
-                if j == 0 {
-                    debug_vae_tensor(&format!("after up_block[{}].resnet[0]", i), &x);
-                }
             }
             if let Some(upsampler) = &block.upsampler {
                 x = match upsampler {
                     Upsample::Upsample2D(up) => up.forward(&x)?,
                     Upsample::Upsample3D(up) => up.forward(&x, None)?,
                 };
-                debug_vae_tensor(&format!("after up_block[{}].upsample", i), &x);
             }
         }
 
         x = self.norm_out.forward(&x)?;
-        debug_vae_tensor("after norm_out", &x);
-
         x = x.silu()?;
         let x = self.conv_out.forward(&x, None)?;
-        debug_vae_tensor("after conv_out (pre-clamp)", &x);
 
         // Clamp output to [-1, 1]
         x.clamp(-1.0, 1.0)
@@ -851,20 +822,17 @@ impl QwenImageDecoder3d {
 #[derive(Debug, Clone)]
 pub struct DiagonalGaussianDistribution {
     mean: Tensor,
-    logvar: Tensor,
+    _logvar: Tensor,
     std: Tensor,
 }
 
 impl DiagonalGaussianDistribution {
     pub fn new(parameters: &Tensor) -> Result<Self> {
-        debug_vae_tensor("DiagonalGaussian input", parameters);
         let chunks = parameters.chunk(2, 1)?;
         let mean = chunks[0].clone();
-        debug_vae_tensor("DiagonalGaussian mean (chunk 0)", &mean);
         let logvar = chunks[1].clamp(-30.0, 20.0)?;
-        debug_vae_tensor("DiagonalGaussian logvar (chunk 1, clamped)", &logvar);
         let std = (&logvar * 0.5)?.exp()?;
-        Ok(Self { mean, logvar, std })
+        Ok(Self { mean, _logvar: logvar, std })
     }
 
     /// Sample from the distribution (reparameterization trick).
@@ -943,9 +911,7 @@ impl AutoencoderKLQwenImage {
     /// Encode an image to latent distribution.
     pub fn encode(&self, x: &Tensor) -> Result<DiagonalGaussianDistribution> {
         let h = self.encoder.forward(x)?;
-        debug_vae_tensor("after_conv_out (encoder output)", &h);
         let h = self.quant_conv.forward(&h, None)?;
-        debug_vae_tensor("after_quant_conv", &h);
         DiagonalGaussianDistribution::new(&h)
     }
 

@@ -250,6 +250,7 @@ impl QwenImageControlNetModel {
     ///
     /// # Returns
     /// ControlNetOutput containing residuals for each transformer block
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         hidden_states: &Tensor,

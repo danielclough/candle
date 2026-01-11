@@ -14,7 +14,6 @@ use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 use super::blocks::QwenImageTransformerBlock;
 use super::config::Config;
-use super::debug::debug_tensor;
 use super::rope::{timestep_embedding, QwenEmbedRope};
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -126,9 +125,9 @@ impl AdaLayerNormContinuous {
 #[derive(Debug, Clone)]
 pub struct QwenImageTransformer2DModel {
     /// Inner dimension = num_heads × head_dim = 3072
-    inner_dim: usize,
-    out_channels: usize,
-    patch_size: usize,
+    _inner_dim: usize,
+    _out_channels: usize,
+    _patch_size: usize,
 
     /// RoPE embeddings for 3D positioning
     pos_embed: QwenEmbedRope,
@@ -211,9 +210,9 @@ impl QwenImageTransformer2DModel {
         )?;
 
         Ok(Self {
-            inner_dim,
-            out_channels: config.out_channels,
-            patch_size: config.patch_size,
+            _inner_dim: inner_dim,
+            _out_channels: config.out_channels,
+            _patch_size: config.patch_size,
             pos_embed,
             time_text_embed,
             txt_norm,
@@ -268,6 +267,7 @@ impl QwenImageTransformer2DModel {
     }
 
     /// Forward pass with optional pre-computed temb (for debugging).
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_temb(
         &self,
         hidden_states: &Tensor,
@@ -314,6 +314,7 @@ impl QwenImageTransformer2DModel {
     /// corresponding block's output. Typically, ControlNet only provides residuals
     /// for a subset of blocks (e.g., first 5 of 60), so residuals are applied
     /// to blocks at matching indices.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_controlnet(
         &self,
         hidden_states: &Tensor,
@@ -323,25 +324,17 @@ impl QwenImageTransformer2DModel {
         img_shapes: &[(usize, usize, usize)],
         _txt_seq_lens: &[usize],
         controlnet_residuals: Option<&[Tensor]>,
-        temb_override: Option<&Tensor>,
+        _temb_override: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
         let device = hidden_states.device();
 
-        debug_tensor("input_hidden_states", hidden_states);
-        debug_tensor("input_encoder_hidden_states", encoder_hidden_states);
-        debug_tensor("input_timestep", timestep);
-
         // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
         let mut hidden_states = hidden_states.apply(&self.img_in)?;
-        debug_tensor("after_img_in", &hidden_states);
-        super::debug::save_debug_tensor("after_img_in", &hidden_states)?;
 
         // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
         let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
-        debug_tensor("after_txt_norm", &encoder_hidden_states);
         encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
-        debug_tensor("after_txt_in", &encoder_hidden_states);
 
         // Handle zero_cond_t for edit mode:
         // - Double the timestep: [t, 0] creates two modulation sets
@@ -351,29 +344,20 @@ impl QwenImageTransformer2DModel {
             // Double timestep: [t, 0] for two different modulation parameter sets
             let zero_timestep = (&timestep * 0.0)?;
             let doubled_timestep = Tensor::cat(&[&timestep, &zero_timestep], 0)?;
-            debug_tensor("doubled_timestep", &doubled_timestep);
 
             // Create modulate_index: marks which tokens use which modulation
             // In edit mode, img_shapes is [(noise_f, noise_h, noise_w), (img_f, img_h, img_w), ...]
             // - First shape (index 0): noise latents -> use timestep modulation (index 0)
             // - Remaining shapes (index 1+): reference images -> use zero-timestep modulation (index 1)
             let modulate_idx = Self::create_modulate_index(img_shapes, device)?;
-            debug_tensor("modulate_index", &modulate_idx);
 
             (doubled_timestep, Some(modulate_idx))
         } else {
             (timestep, None)
         };
 
-        // Compute timestep embedding (doubled if zero_cond_t), or use override if provided
-        let temb = if let Some(override_temb) = temb_override {
-            debug_tensor("temb_override", override_temb);
-            override_temb.clone()
-        } else {
-            let computed = self.time_text_embed.forward(&timestep, dtype)?;
-            debug_tensor("temb", &computed);
-            computed
-        };
+        // Compute timestep embedding (doubled if zero_cond_t)
+        let temb = self.time_text_embed.forward(&timestep, dtype)?;
 
         // Derive text sequence length from actual encoder_hidden_states shape
         let txt_seq_len = encoder_hidden_states.dim(1)?;
@@ -381,69 +365,24 @@ impl QwenImageTransformer2DModel {
 
         // Compute RoPE frequencies
         let image_rotary_emb = self.pos_embed.forward(img_shapes, txt_seq_lens)?;
-        debug_tensor("rope_img_freqs", &image_rotary_emb.0);
-        debug_tensor("rope_txt_freqs", &image_rotary_emb.1);
-
-        // Load block overrides if QWEN_BLOCK_OVERRIDE is set
-        // Uses thread-local CFG pass to determine which tensors to load (_pos or _neg)
-        let block_overrides = super::debug::load_block_overrides(
-            hidden_states.device(),
-            hidden_states.dtype(),
-            None,  // Use thread-local CFG pass suffix
-        )?;
 
         // Process through transformer blocks
-        let num_blocks = self.transformer_blocks.len();
         for (idx, block) in self.transformer_blocks.iter().enumerate() {
-            // Use debug mode and overrides for block 0 to see internal values
-            let (enc_out, hid_out) = if idx == 0 {
-                block.forward_with_overrides(
-                    &hidden_states,
-                    &encoder_hidden_states,
-                    &temb,
-                    Some(&image_rotary_emb),
-                    modulate_index.as_ref(),
-                    true,  // Enable debug for block 0
-                    block_overrides.as_ref(),
-                )?
-            } else {
-                block.forward_with_modulate_index(
-                    &hidden_states,
-                    &encoder_hidden_states,
-                    &temb,
-                    Some(&image_rotary_emb),
-                    modulate_index.as_ref(),
-                )?
-            };
+            let (enc_out, hid_out) = block.forward_with_modulate_index(
+                &hidden_states,
+                &encoder_hidden_states,
+                &temb,
+                Some(&image_rotary_emb),
+                modulate_index.as_ref(),
+            )?;
             encoder_hidden_states = enc_out;
             hidden_states = hid_out;
-
-            // Substitute block 0 output if override is set
-            if idx == 0 {
-                if let Some(ref overrides) = block_overrides {
-                    if let Some(ref img_override) = overrides.block0_output_img {
-                        eprintln!("[DEBUG] SUBSTITUTING block0_output_img: Rust shape={:?}, PyTorch shape={:?}",
-                            hidden_states.dims(), img_override.dims());
-                        hidden_states = img_override.clone();
-                    }
-                    if let Some(ref txt_override) = overrides.block0_output_txt {
-                        eprintln!("[DEBUG] SUBSTITUTING block0_output_txt: Rust shape={:?}, PyTorch shape={:?}",
-                            encoder_hidden_states.dims(), txt_override.dims());
-                        encoder_hidden_states = txt_override.clone();
-                    }
-                }
-            }
 
             // Apply ControlNet residual if available for this block
             if let Some(residuals) = controlnet_residuals {
                 if idx < residuals.len() {
                     hidden_states = (&hidden_states + &residuals[idx])?;
                 }
-            }
-
-            // Debug at key blocks: 0, 1, 10, 30, last
-            if idx == 0 || idx == 1 || idx == 10 || idx == 30 || idx == num_blocks - 1 {
-                debug_tensor(&format!("after_block_{}", idx), &hidden_states);
             }
         }
 
@@ -457,11 +396,9 @@ impl QwenImageTransformer2DModel {
 
         // Final normalization with AdaLN
         let hidden_states = self.norm_out.forward(&hidden_states, &temb_for_norm)?;
-        debug_tensor("after_norm_out", &hidden_states);
 
         // Project to output: [batch, seq, patch_size² × out_channels]
         let output = hidden_states.apply(&self.proj_out)?;
-        debug_tensor("output", &output);
 
         Ok(output)
     }
@@ -486,12 +423,12 @@ impl QwenImageTransformer2DModel {
         // First shape (noise latents) -> index 0
         let (f0, h0, w0) = img_shapes[0];
         let noise_seq_len = f0 * h0 * w0;
-        indices.extend(std::iter::repeat(0i64).take(noise_seq_len));
+        indices.extend(std::iter::repeat_n(0i64, noise_seq_len));
 
         // Remaining shapes (reference images) -> index 1
         for &(f, h, w) in img_shapes.iter().skip(1) {
             let seq_len = f * h * w;
-            indices.extend(std::iter::repeat(1i64).take(seq_len));
+            indices.extend(std::iter::repeat_n(1i64, seq_len));
         }
 
         // Create tensor with shape [1, total_seq_len] (batch dim = 1 for now)
