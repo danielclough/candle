@@ -29,8 +29,10 @@ pub struct GenerateArgs {
 /// Shared model path arguments.
 pub struct ModelPaths {
     pub transformer_path: Option<String>,
+    pub gguf_transformer_path: Option<String>,
     pub vae_path: Option<String>,
     pub text_encoder_path: Option<String>,
+    pub gguf_text_encoder_path: Option<String>,
     pub tokenizer_path: Option<String>,
 }
 
@@ -60,19 +62,21 @@ pub fn run(
     println!("\n[1/5] Loading text encoder...");
 
     let tokenizer = common::load_tokenizer(paths.tokenizer_path.as_deref(), &api)?;
-    let mut text_model = common::load_text_encoder(
+    let mut text_model = common::load_text_encoder_variant(
         paths.text_encoder_path.as_deref(),
+        paths.gguf_text_encoder_path.as_deref(),
         &api,
         device,
     )?;
-    println!("  Text encoder loaded");
+    let encoder_type = if text_model.is_quantized() { "quantized GGUF" } else { "FP16" };
+    println!("  Text encoder loaded ({})", encoder_type);
 
     // =========================================================================
     // Stage 2: Encode prompts
     // =========================================================================
     println!("\n[2/5] Encoding prompts...");
 
-    let (pos_embeds, pos_mask) = common::encode_text_prompt(
+    let (pos_embeds, pos_mask) = common::encode_text_prompt_variant(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -85,7 +89,7 @@ pub fn run(
     // Only encode negative prompt if provided - True CFG requires an explicit negative prompt
     let do_true_cfg = args.true_cfg_scale > 1.0 && !args.negative_prompt.is_empty();
     let neg_data = if do_true_cfg {
-        let (neg_embeds, neg_mask) = common::encode_text_prompt(
+        let (neg_embeds, neg_mask) = common::encode_text_prompt_variant(
             &tokenizer,
             &mut text_model,
             &args.negative_prompt,
@@ -166,15 +170,17 @@ pub fn run(
     println!("\n[4/5] Loading transformer and denoising...");
 
     let config = Config::qwen_image();
-    let transformer = common::load_transformer(
+    let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
+        paths.gguf_transformer_path.as_deref(),
         common::DEFAULT_TRANSFORMER_ID,
         &config,
         &api,
         device,
         dtype,
     )?;
-    println!("  Transformer loaded ({} layers)", config.num_layers);
+    let model_type = if transformer.is_quantized() { "quantized GGUF" } else { "FP16" };
+    println!("  Transformer loaded ({} layers, {})", config.num_layers, model_type);
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
     let txt_seq_lens = vec![pos_embeds.dim(1)?];
@@ -207,12 +213,12 @@ pub fn run(
         let latents_bf16 = latents.to_dtype(dtype)?;
 
         let noise_pred =
-            transformer.forward(&latents_bf16, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens)?;
+            transformer.forward(&latents_bf16, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens, dtype)?;
 
         // Apply True CFG only if negative prompt was provided
         let noise_pred = if let Some((ref neg_embeds, ref neg_mask)) = neg_data {
             let neg_pred =
-                transformer.forward(&latents_bf16, neg_embeds, neg_mask, &t, &img_shapes, &txt_seq_lens)?;
+                transformer.forward(&latents_bf16, neg_embeds, neg_mask, &t, &img_shapes, &txt_seq_lens, dtype)?;
             apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred

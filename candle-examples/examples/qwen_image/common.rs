@@ -10,12 +10,13 @@
 use anyhow::{anyhow, Result};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
+use candle::quantized::gguf_file;
 use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
     qwen_image::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
-        FlowMatchEulerDiscreteScheduler, PromptMode, QwenImageTransformer2DModel, SchedulerConfig,
-        VaeConfig,
+        FlowMatchEulerDiscreteScheduler, PromptMode, QwenImageTransformer2DModel,
+        QwenImageTransformer2DModelQuantized, SchedulerConfig, VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -28,10 +29,59 @@ pub const VAE_SCALE_FACTOR: usize = 8;
 /// Patch size for latent packing (2x2 patches).
 pub const PATCH_SIZE: usize = 2;
 
-/// Default HuggingFace model IDs.
+/// Default HuggingFace model IDs (FP16 safetensors).
 pub const DEFAULT_TEXT_ENCODER_ID: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
 pub const DEFAULT_VAE_MODEL_ID: &str = "Qwen/Qwen-Image";
 pub const DEFAULT_TRANSFORMER_ID: &str = "Qwen/Qwen-Image";
+
+/// Default GGUF model paths (HuggingFace format: owner/repo/filename).
+/// Text encoder and vision encoder use Qwen2.5-VL GGUF files.
+pub const DEFAULT_GGUF_TEXT_ENCODER: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf";
+pub const DEFAULT_GGUF_VISION_ENCODER: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf";
+/// Default GGUF transformer from city96/Qwen-Image-gguf.
+/// Available quants: Q2_K (7GB), Q3_K_M (9.7GB), Q4_K_M (13GB), Q5_K_M (15GB), Q8_0 (22GB), BF16 (41GB)
+pub const DEFAULT_GGUF_TRANSFORMER: &str = "city96/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf";
+
+// ============================================================================
+// GGUF Path Resolution
+// ============================================================================
+
+/// Resolve a GGUF path to a local file, downloading from HuggingFace if needed.
+///
+/// Accepts:
+/// - "auto" → uses the provided default
+/// - Local path → returns as-is if exists
+/// - "owner/repo/filename.gguf" → downloads from HuggingFace
+pub fn resolve_gguf_path(
+    value: &str,
+    default: &str,
+    api: &hf_hub::api::sync::Api,
+) -> Result<std::path::PathBuf> {
+    let path_str = if value == "auto" { default } else { value };
+
+    // Check if it's a local file
+    let local_path = std::path::Path::new(path_str);
+    if local_path.exists() {
+        return Ok(local_path.to_path_buf());
+    }
+
+    // Parse as HuggingFace: owner/repo/filename
+    let parts: Vec<&str> = path_str.splitn(3, '/').collect();
+    if parts.len() == 3 {
+        let repo_id = format!("{}/{}", parts[0], parts[1]);
+        let filename = parts[2];
+        println!("Downloading {} from {}...", filename, repo_id);
+        let repo = api.repo(hf_hub::Repo::model(repo_id));
+        let path = repo.get(filename)?;
+        return Ok(path);
+    }
+
+    // If we get here, it's neither a local file nor valid HF format
+    Err(anyhow!(
+        "GGUF path '{}' not found locally and not in owner/repo/file format",
+        path_str
+    ))
+}
 
 // ============================================================================
 // Setup utilities
@@ -300,11 +350,279 @@ pub fn load_transformer(
     Ok(QwenImageTransformer2DModel::new(config, vb)?)
 }
 
+/// Load the quantized transformer model from GGUF file.
+///
+/// # Arguments
+/// * `gguf_path` - Path to the GGUF transformer file
+/// * `device` - Device to load on
+///
+/// # Returns
+/// Quantized transformer model
+pub fn load_transformer_quantized(
+    gguf_path: &str,
+    device: &Device,
+) -> Result<QwenImageTransformer2DModelQuantized> {
+    println!("Loading quantized transformer from {}...", gguf_path);
+    let mut file = std::fs::File::open(gguf_path)?;
+    let content = gguf_file::Content::read(&mut file)?;
+    Ok(QwenImageTransformer2DModelQuantized::from_gguf(content, &mut file, device)?)
+}
+
+// ============================================================================
+// TransformerVariant - Unified interface for FP16 and quantized transformers
+// ============================================================================
+
+/// Unified transformer variant that abstracts over FP16 and quantized models.
+///
+/// This enum provides a common interface for both model types, handling the
+/// differences in their forward signatures internally.
+pub enum TransformerVariant {
+    FP16(QwenImageTransformer2DModel),
+    Quantized(QwenImageTransformer2DModelQuantized),
+}
+
+impl TransformerVariant {
+    /// Unified forward pass.
+    ///
+    /// Note: The `txt_mask` parameter is used by FP16 but ignored by quantized.
+    pub fn forward(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        txt_mask: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        txt_lens: &[usize],
+        dtype: DType,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::FP16(model) => model.forward(img, txt, txt_mask, timestep, img_shapes, txt_lens),
+            Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes, txt_lens, dtype),
+        }
+    }
+
+    /// Returns true if this is a quantized model.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized(_))
+    }
+}
+
+/// Load the transformer model, choosing FP16 or quantized based on provided paths.
+///
+/// If `gguf_path` is provided, loads a quantized GGUF model.
+/// Otherwise, loads the FP16 safetensors model.
+pub fn load_transformer_variant(
+    transformer_path: Option<&str>,
+    gguf_path: Option<&str>,
+    model_id: &str,
+    config: &TransformerConfig,
+    api: &hf_hub::api::sync::Api,
+    device: &Device,
+    dtype: DType,
+) -> Result<TransformerVariant> {
+    if let Some(gguf_value) = gguf_path {
+        // Resolve GGUF path (handles "auto", local paths, and HF paths)
+        let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TRANSFORMER, api)?;
+        println!("Loading quantized transformer from {:?}...", resolved_path);
+        let model = load_transformer_quantized(resolved_path.to_str().unwrap(), device)?;
+        Ok(TransformerVariant::Quantized(model))
+    } else {
+        let model = load_transformer(transformer_path, model_id, config, api, device, dtype)?;
+        Ok(TransformerVariant::FP16(model))
+    }
+}
+
+// ============================================================================
+// TextEncoderVariant - Unified interface for FP16 and quantized text encoders
+// ============================================================================
+
+use candle_transformers::models::quantized_qwen2_5_vl::{
+    ModelWeights as QuantizedTextModel, load_vision_from_mmproj, ImageGrid,
+};
+use candle_transformers::models::qwen2_5_vl::Qwen25VLVisionModel;
+
+/// Unified text encoder variant that abstracts over FP16 and quantized models.
+pub enum TextEncoderVariant {
+    FP16(Qwen25VLTextModel),
+    Quantized(QuantizedTextModel),
+}
+
+impl TextEncoderVariant {
+    /// Forward pass for text-only input, returning hidden states.
+    pub fn forward_text_only(
+        &mut self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::FP16(model) => model.forward_text_only(input_ids, attention_mask),
+            Self::Quantized(model) => model.forward_text_only(input_ids, attention_mask),
+        }
+    }
+
+    /// Forward pass with vision embeddings, returning hidden states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_vision(
+        &mut self,
+        input_ids: &Tensor,
+        vision_embeds: &Tensor,
+        image_grid_thw: &Tensor,
+        attention_mask: Option<&Tensor>,
+        spatial_merge_size: usize,
+        image_token_id: u32,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::FP16(model) => model.forward_with_vision(
+                input_ids, vision_embeds, image_grid_thw, attention_mask, spatial_merge_size, image_token_id
+            ),
+            Self::Quantized(model) => model.forward_with_vision(
+                input_ids, vision_embeds, image_grid_thw, attention_mask, spatial_merge_size, image_token_id
+            ),
+        }
+    }
+
+    /// Returns true if this is a quantized model.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized(_))
+    }
+}
+
+/// Load the text encoder, choosing FP16 or quantized based on provided paths.
+///
+/// If `gguf_path` is provided (and not None), loads a quantized GGUF model.
+/// Otherwise, loads the FP16 safetensors model.
+pub fn load_text_encoder_variant(
+    text_encoder_path: Option<&str>,
+    gguf_path: Option<&str>,
+    api: &hf_hub::api::sync::Api,
+    device: &Device,
+) -> Result<TextEncoderVariant> {
+    if let Some(gguf_value) = gguf_path {
+        // Resolve GGUF path (handles "auto", local paths, and HF paths)
+        let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TEXT_ENCODER, api)?;
+        println!("Loading quantized text encoder from {:?}...", resolved_path);
+
+        let mut file = std::fs::File::open(&resolved_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let model = QuantizedTextModel::from_gguf(content, &mut file, device)?;
+        println!("  Quantized text encoder loaded");
+        Ok(TextEncoderVariant::Quantized(model))
+    } else {
+        let model = load_text_encoder(text_encoder_path, api, device)?;
+        Ok(TextEncoderVariant::FP16(model))
+    }
+}
+
+/// Load the vision encoder from mmproj GGUF or safetensors.
+///
+/// If `gguf_path` is provided, loads from mmproj GGUF file.
+/// Otherwise, loads from safetensors.
+pub fn load_vision_encoder_variant(
+    vision_encoder_path: Option<&str>,
+    gguf_path: Option<&str>,
+    api: &hf_hub::api::sync::Api,
+    device: &Device,
+    dtype: DType,
+) -> Result<Qwen25VLVisionModel> {
+    if let Some(gguf_value) = gguf_path {
+        // Resolve GGUF path (handles "auto", local paths, and HF paths)
+        let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_VISION_ENCODER, api)?;
+        println!("Loading vision encoder from mmproj GGUF: {:?}...", resolved_path);
+
+        let mut file = std::fs::File::open(&resolved_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let (vision_model, _config) = load_vision_from_mmproj(&content, &mut file, device, dtype)?;
+        println!("  Vision encoder loaded from mmproj");
+        Ok(vision_model)
+    } else {
+        // Load from safetensors
+        load_vision_encoder(vision_encoder_path, api, device, dtype)
+    }
+}
+
+/// Load vision encoder from safetensors.
+pub fn load_vision_encoder(
+    vision_encoder_path: Option<&str>,
+    api: &hf_hub::api::sync::Api,
+    device: &Device,
+    dtype: DType,
+) -> Result<Qwen25VLVisionModel> {
+    use candle_transformers::models::qwen2_5_vl::VisionConfig;
+
+    let vision_config = VisionConfig::default();
+    let model_files = match vision_encoder_path {
+        Some(path) => {
+            candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+        }
+        None => {
+            let repo = api.repo(hf_hub::Repo::model(DEFAULT_TEXT_ENCODER_ID.to_string()));
+            candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+        }
+    };
+
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, device)? };
+    let vb_vision = vb.pp("visual");
+    Ok(Qwen25VLVisionModel::new(&vision_config, vb_vision)?)
+}
+
 // ============================================================================
 // Prompt encoding utilities
 // ============================================================================
 
-/// Encode a text-only prompt using the specified mode.
+/// Encode a text-only prompt using the specified mode (variant-aware version).
+///
+/// This handles the standard text-only encoding flow:
+/// 1. Apply the prompt template for the given mode
+/// 2. Tokenize
+/// 3. Run through text encoder (FP16 or quantized)
+/// 4. Drop the system prefix tokens
+/// 5. Convert embeddings to target dtype (for downstream BF16 transformer)
+///
+/// Returns (embeddings, attention_mask).
+pub fn encode_text_prompt_variant(
+    tokenizer: &Tokenizer,
+    text_model: &mut TextEncoderVariant,
+    prompt: &str,
+    mode: PromptMode,
+    device: &Device,
+    target_dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let templated = mode.template().replace("{}", prompt);
+    let drop_tokens = mode.drop_tokens();
+
+    let encoding = tokenizer
+        .encode(templated, false)
+        .map_err(|e| anyhow!("Tokenizer error: {}", e))?;
+
+    let tokens = encoding.get_ids();
+    let attention_mask = encoding.get_attention_mask();
+
+    let input_ids = Tensor::new(tokens, device)?.unsqueeze(0)?;
+    let attention_mask_tensor = Tensor::new(attention_mask, device)?
+        .to_dtype(DType::F32)?
+        .unsqueeze(0)?;
+
+    let hidden_states = text_model.forward_text_only(&input_ids, Some(&attention_mask_tensor))?;
+
+    let seq_len = hidden_states.dim(1)?;
+    if seq_len <= drop_tokens {
+        return Err(anyhow!(
+            "Prompt too short: {} tokens after encoding, need more than {}",
+            seq_len,
+            drop_tokens
+        ));
+    }
+
+    let embeddings = hidden_states.narrow(1, drop_tokens, seq_len - drop_tokens)?;
+    let mask = attention_mask_tensor.narrow(1, drop_tokens, seq_len - drop_tokens)?;
+
+    // Convert embeddings to target dtype (typically BF16) for the downstream transformer
+    let embeddings = embeddings.to_dtype(target_dtype)?;
+
+    Ok((embeddings, mask))
+}
+
+/// Encode a text-only prompt using the specified mode (FP16-only version).
 ///
 /// This handles the standard text-only encoding flow:
 /// 1. Apply the prompt template for the given mode

@@ -860,12 +860,19 @@ impl crate::Module for QMatMul {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
+                let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
                     _ => w.t()?,
                 };
-                xs.matmul(&w)
+                // Handle dtype mismatch between input and dequantized weights
+                if in_dtype != w.dtype() {
+                    let w = w.to_dtype(in_dtype)?;
+                    xs.matmul(&w)
+                } else {
+                    xs.matmul(&w)
+                }
             }
             Self::TensorF16(w) => {
                 let in_dtype = xs.dtype();

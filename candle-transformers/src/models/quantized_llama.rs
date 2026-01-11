@@ -175,6 +175,7 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
+        // cos/sin are preconverted to target dtype during model loading
         // The call to contiguous below is only necessary when processing the prompt.
         // When the seq_len is 1 in the inference loop, this is a no-op.
         candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
@@ -244,6 +245,7 @@ impl LayerWeights {
                 None => att,
                 Some(mask) => {
                     let mask = mask.broadcast_as(att.shape())?;
+                    // neg_inf is preconverted to target dtype during model loading
                     masked_fill(&att, &mask, &self.neg_inf)?
                 }
             };
@@ -267,6 +269,8 @@ pub struct ModelWeights {
     masks: HashMap<usize, Tensor>,
     span: tracing::Span,
     span_output: tracing::Span,
+    #[allow(dead_code)]
+    dtype: DType,
 }
 
 fn precomput_freqs_cis(
@@ -289,13 +293,17 @@ fn precomput_freqs_cis(
 }
 
 impl ModelWeights {
-    pub fn from_ggml(mut ct: ggml_file::Content, gqa: usize) -> Result<Self> {
+    pub fn from_ggml(mut ct: ggml_file::Content, gqa: usize, dtype: DType) -> Result<Self> {
         let head_dim = (ct.hparams.n_embd / ct.hparams.n_head) as usize;
         let (cos, sin) = precomput_freqs_cis(head_dim, 10000., &ct.device)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, &ct.device)?;
+        // Preconvert cos/sin/neg_inf to target dtype to avoid runtime conversion overhead
+        let cos = cos.to_dtype(dtype)?;
+        let sin = sin.to_dtype(dtype)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, &ct.device)?.to_dtype(dtype)?;
         let tok_embeddings = ct.remove("tok_embeddings.weight")?;
-        let tok_embeddings = tok_embeddings.dequantize(&ct.device)?;
-        let norm = RmsNorm::from_qtensor(ct.remove("norm.weight")?, 1e-5)?;
+        // Dequantize embeddings directly to target dtype
+        let tok_embeddings = tok_embeddings.dequantize(&ct.device)?.to_dtype(dtype)?;
+        let norm = RmsNorm::from_qtensor_with_dtype(ct.remove("norm.weight")?, 1e-5, dtype)?;
         let output = ct.remove("output.weight")?;
         let mut layers = Vec::with_capacity(ct.hparams.n_layer as usize);
         for layer_idx in 0..ct.hparams.n_layer {
@@ -324,9 +332,10 @@ impl ModelWeights {
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
-                attention_norm: RmsNorm::from_qtensor(attention_norm, 1e-5)?,
+                // Use dtype-converted RmsNorm weights to avoid runtime conversion overhead
+                attention_norm: RmsNorm::from_qtensor_with_dtype(attention_norm, 1e-5, dtype)?,
                 mlp_or_moe,
-                ffn_norm: RmsNorm::from_qtensor(ffn_norm, 1e-5)?,
+                ffn_norm: RmsNorm::from_qtensor_with_dtype(ffn_norm, 1e-5, dtype)?,
                 n_head: ct.hparams.n_head as usize,
                 n_kv_head: ct.hparams.n_head as usize / gqa,
                 head_dim: (ct.hparams.n_embd / ct.hparams.n_head) as usize,
@@ -349,6 +358,7 @@ impl ModelWeights {
             masks: HashMap::new(),
             span,
             span_output,
+            dtype,
         })
     }
 
@@ -356,6 +366,7 @@ impl ModelWeights {
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+        dtype: DType,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -381,13 +392,19 @@ impl ModelWeights {
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
+        // Preconvert cos/sin/neg_inf to target dtype to avoid runtime conversion overhead
+        let cos = cos.to_dtype(dtype)?;
+        let sin = sin.to_dtype(dtype)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?.to_dtype(dtype)?;
 
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
-        let norm = RmsNorm::from_qtensor(
+        // Dequantize embeddings directly to target dtype
+        let tok_embeddings = tok_embeddings_q.dequantize(device)?.to_dtype(dtype)?;
+        // Use dtype-converted RmsNorm weights to avoid runtime conversion overhead
+        let norm = RmsNorm::from_qtensor_with_dtype(
             ct.tensor(reader, "output_norm.weight", device)?,
             rms_norm_eps,
+            dtype,
         )?;
         let output = match ct.tensor(reader, "output.weight", device) {
             Ok(tensor) => tensor,
@@ -447,9 +464,10 @@ impl ModelWeights {
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
-                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
+                // Use dtype-converted RmsNorm weights to avoid runtime conversion overhead
+                attention_norm: RmsNorm::from_qtensor_with_dtype(attention_norm, rms_norm_eps, dtype)?,
                 mlp_or_moe,
-                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
+                ffn_norm: RmsNorm::from_qtensor_with_dtype(ffn_norm, rms_norm_eps, dtype)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim: embedding_length / head_count,
@@ -472,6 +490,7 @@ impl ModelWeights {
             masks: HashMap::new(),
             span,
             span_output,
+            dtype,
         })
     }
 
@@ -496,6 +515,7 @@ impl ModelWeights {
             Some(self.mask(seq_len, x.device())?)
         };
         let _enter = self.span.enter();
+        // Embeddings are preconverted to target dtype during model loading
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
             let x = layer_in;

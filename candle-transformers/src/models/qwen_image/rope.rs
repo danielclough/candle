@@ -289,8 +289,9 @@ pub fn apply_rotary_emb_qwen(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
 
     // Extract cos and sin from freqs_cis: [seq, head_dim/2, 2]
     // Reshape for broadcasting: [1, seq, 1, head_dim/2]
-    let freqs_cos = freqs_cis.i((.., .., 0))?.unsqueeze(0)?.unsqueeze(2)?;
-    let freqs_sin = freqs_cis.i((.., .., 1))?.unsqueeze(0)?.unsqueeze(2)?;
+    // Convert to input dtype if needed (freqs are F32, input may be BF16)
+    let freqs_cos = freqs_cis.i((.., .., 0))?.unsqueeze(0)?.unsqueeze(2)?.to_dtype(x.dtype())?;
+    let freqs_sin = freqs_cis.i((.., .., 1))?.unsqueeze(0)?.unsqueeze(2)?.to_dtype(x.dtype())?;
 
     // Complex multiplication: (a + bi) × (c + di) = (ac - bd) + (ad + bc)i
     // where x = a + bi, freqs = c + di (c=cos, d=sin)

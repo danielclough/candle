@@ -262,31 +262,6 @@ impl QwenImageTransformer2DModel {
             img_shapes,
             txt_seq_lens,
             None,
-            None, // No temb override
-        )
-    }
-
-    /// Forward pass with optional pre-computed temb (for debugging).
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_temb(
-        &self,
-        hidden_states: &Tensor,
-        encoder_hidden_states: &Tensor,
-        encoder_hidden_states_mask: &Tensor,
-        timestep: &Tensor,
-        img_shapes: &[(usize, usize, usize)],
-        txt_seq_lens: &[usize],
-        temb_override: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        self.forward_with_controlnet(
-            hidden_states,
-            encoder_hidden_states,
-            encoder_hidden_states_mask,
-            timestep,
-            img_shapes,
-            txt_seq_lens,
-            None,
-            temb_override,
         )
     }
 
@@ -303,7 +278,6 @@ impl QwenImageTransformer2DModel {
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
     /// * `txt_seq_lens` - Text sequence lengths per batch item
     /// * `controlnet_residuals` - Optional residuals from ControlNet, one per block
-    /// * `temb_override` - Optional pre-computed temb (for debugging/substitution)
     ///
     /// # Returns
     /// Output predictions [batch, img_seq, patch_size² × out_channels]
@@ -314,7 +288,6 @@ impl QwenImageTransformer2DModel {
     /// corresponding block's output. Typically, ControlNet only provides residuals
     /// for a subset of blocks (e.g., first 5 of 60), so residuals are applied
     /// to blocks at matching indices.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_controlnet(
         &self,
         hidden_states: &Tensor,
@@ -324,7 +297,6 @@ impl QwenImageTransformer2DModel {
         img_shapes: &[(usize, usize, usize)],
         _txt_seq_lens: &[usize],
         controlnet_residuals: Option<&[Tensor]>,
-        _temb_override: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
         let device = hidden_states.device();

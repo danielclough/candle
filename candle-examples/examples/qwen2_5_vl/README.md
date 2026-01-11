@@ -25,6 +25,40 @@ Qwen2.5-VL combines:
 | 7B | ~7 billion | `Qwen/Qwen2.5-VL-7B-Instruct` (default) |
 | 72B | ~72 billion | `Qwen/Qwen2.5-VL-72B-Instruct` |
 
+## Quantized Models (GGUF)
+
+For lower memory usage, you can use GGUF quantized models. The model is split into two files:
+- **Text decoder**: Quantized (Q4_K_M, Q8_0, etc.) - the large language model
+- **Vision encoder**: F16 (not quantized) - preserves image understanding quality
+
+### Available Quantizations
+
+From [Mungert/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/Mungert/Qwen2.5-VL-7B-Instruct-GGUF):
+
+| Quantization | Size | Quality | Use Case |
+|--------------|------|---------|----------|
+| Q4_K_M | ~4.5 GB | Good | Recommended default |
+| Q5_K_M | ~5.5 GB | Better | Balance of size/quality |
+| Q8_0 | ~8 GB | Best | Near-FP16 quality |
+| Q2_K | ~3 GB | Lower | Minimum memory |
+
+### GGUF Usage
+
+The `--gguf-text` and `--gguf-vision` flags accept three formats:
+
+```bash
+# 1. Auto-download defaults (flag with no value)
+--gguf-text --gguf-vision
+
+# 2. HuggingFace path: owner/repo/filename (auto-downloads)
+--gguf-text Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q8_0.gguf
+
+# 3. Local file path
+--gguf-text /path/to/model.gguf
+```
+
+**Note**: Video mode is not supported with quantized models.
+
 ## CLI Reference
 
 ### Input Options
@@ -73,6 +107,15 @@ Qwen2.5-VL combines:
 |------|-------------|---------|
 | `--video-fps <F>` | Frame extraction rate | 2.0 |
 | `--max-frames <N>` | Maximum frames to extract | 32 |
+
+### Quantization Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gguf-text [PATH]` | GGUF text decoder. No value = auto-download Q4_K_M | - |
+| `--gguf-vision [PATH]` | GGUF vision encoder (F16). No value = auto-download | - |
+
+Path formats: local file, or `owner/repo/filename` for HuggingFace auto-download.
 
 ## Examples
 
@@ -229,4 +272,35 @@ cargo run --example qwen2_5_vl --release -- \
     --cpu \
     --image /Users/daniel/git/candle/candle-examples/examples/qwen2_5_vl/dice.png \
     --prompt "Describe this image"
+```
+
+### Quantized Models (GGUF)
+
+```bash
+# Auto-download default quantized models (Q4_K_M text + F16 vision)
+cargo run --example qwen2_5_vl --release -- \
+    --gguf-text --gguf-vision \
+    --image photo.jpg \
+    --prompt "What is in this image?"
+
+# Use Q8_0 for better quality (auto-downloads from HuggingFace)
+cargo run --example qwen2_5_vl --release -- \
+    --gguf-text Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q8_0.gguf \
+    --gguf-vision \
+    --image photo.jpg \
+    --prompt "Describe this image in detail"
+
+# Use local GGUF files
+cargo run --example qwen2_5_vl --release -- \
+    --gguf-text /path/to/text-model.gguf \
+    --gguf-vision /path/to/vision-model.gguf \
+    --image photo.jpg \
+    --prompt "What do you see?"
+
+# Mix: Q8 text from HuggingFace + default vision
+cargo run --example qwen2_5_vl --release -- \
+    --gguf-text Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q8_0.gguf \
+    --gguf-vision \
+    --image photo.jpg \
+    --prompt "Analyze this image"
 ```

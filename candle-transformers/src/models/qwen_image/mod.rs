@@ -57,6 +57,7 @@ pub mod config;
 pub mod controlnet;
 pub mod edit_helpers;
 pub mod pipeline;
+pub mod quantized;
 pub mod rope;
 pub mod scheduler;
 pub mod vae;
@@ -81,3 +82,4 @@ pub use pipeline::{
     VISION_TEMPORAL_PATCH_SIZE,
 };
 pub use vae::{AutoencoderKLQwenImage, TiledDecodeConfig};
+pub use quantized::QwenImageTransformer2DModelQuantized;

@@ -105,6 +105,22 @@ struct Cli {
     #[arg(long, global = true)]
     tokenizer_path: Option<String>,
 
+    /// Quantized GGUF diffusion transformer. Accepts:
+    /// - --gguf-transformer → uses default from HuggingFace
+    /// - --gguf-transformer=/path/to/model.gguf → local file
+    /// - --gguf-transformer=owner/repo/file.gguf → downloads from HuggingFace
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_transformer: Option<String>,
+
+    /// Quantized GGUF text encoder. Same format as --gguf-transformer.
+    /// Default: Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Q4_K_M
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_text_encoder: Option<String>,
+
+    /// GGUF vision encoder (mmproj F16). Same format as --gguf-transformer.
+    /// Default: Mungert/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_vision_encoder: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -354,8 +370,10 @@ fn main() -> Result<()> {
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,
+                gguf_transformer_path: cli.gguf_transformer,
                 vae_path: cli.vae_path,
                 text_encoder_path: cli.text_encoder_path,
+                gguf_text_encoder_path: cli.gguf_text_encoder,
                 tokenizer_path: cli.tokenizer_path,
             };
             generate::run(args, paths, &device, dtype)
@@ -395,9 +413,12 @@ fn main() -> Result<()> {
             };
             let paths = edit::EditModelPaths {
                 transformer_path: cli.transformer_path,
+                gguf_transformer_path: cli.gguf_transformer,
                 vae_path: cli.vae_path,
                 text_encoder_path: cli.text_encoder_path,
+                gguf_text_encoder_path: cli.gguf_text_encoder,
                 vision_encoder_path,
+                gguf_vision_encoder_path: cli.gguf_vision_encoder,
                 tokenizer_path: cli.tokenizer_path,
             };
 

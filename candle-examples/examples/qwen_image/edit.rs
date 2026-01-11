@@ -11,7 +11,7 @@ use candle_nn::VarBuilder;
 use crate::mt_box_muller_rng::MtBoxMullerRng;
 use candle_transformers::models::{
     qwen2_5_vl::{
-        get_image_grid_thw, normalize_image, patchify_image, smart_resize, Qwen25VLTextModel,
+        get_image_grid_thw, normalize_image, patchify_image, smart_resize,
         Qwen25VLVisionModel, VisionConfig, DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS,
     },
     qwen_image::{
@@ -50,9 +50,12 @@ pub struct EditArgs {
 /// Model paths for the edit pipeline.
 pub struct EditModelPaths {
     pub transformer_path: Option<String>,
+    pub gguf_transformer_path: Option<String>,
     pub vae_path: Option<String>,
     pub text_encoder_path: Option<String>,
+    pub gguf_text_encoder_path: Option<String>,
     pub vision_encoder_path: Option<String>,
+    pub gguf_vision_encoder_path: Option<String>,
     pub tokenizer_path: Option<String>,
 }
 
@@ -166,10 +169,15 @@ pub fn run(
     // Free vision encoder from memory before loading text encoder
     drop(vision_model);
 
-    // Load text encoder (always F32 for numerical precision)
-    let mut text_model =
-        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
-    println!("  Text encoder loaded");
+    // Load text encoder (FP16 or quantized GGUF)
+    let mut text_model = common::load_text_encoder_variant(
+        paths.text_encoder_path.as_deref(),
+        paths.gguf_text_encoder_path.as_deref(),
+        &api,
+        device,
+    )?;
+    let encoder_type = if text_model.is_quantized() { "quantized GGUF" } else { "FP16" };
+    println!("  Text encoder loaded ({})", encoder_type);
 
     // Encode prompts with vision (text encoder outputs F32, convert to transformer dtype)
     let (pos_embeds, pos_mask) = encode_prompt_with_vision(
@@ -237,15 +245,17 @@ pub fn run(
 
     // Load transformer
     let config = Config::qwen_image_edit();
-    let transformer = common::load_transformer(
+    let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
+        paths.gguf_transformer_path.as_deref(),
         &args.model_id,
         &config,
         &api,
         device,
         dtype,
     )?;
-    println!("  Transformer loaded ({} layers)", config.num_layers);
+    let model_type = if transformer.is_quantized() { "quantized GGUF" } else { "FP16" };
+    println!("  Transformer loaded ({} layers, {})", config.num_layers, model_type);
 
     // =========================================================================
     // Stage 5: Denoising loop
@@ -293,6 +303,7 @@ pub fn run(
             &t,
             &img_shapes,
             &pos_txt_seq_lens,
+            dtype,
         )?;
 
         // Extract only the noise prediction part
@@ -308,6 +319,7 @@ pub fn run(
                 &t,
                 &img_shapes,
                 neg_seq_lens,
+                dtype,
             )?;
 
             let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
@@ -433,7 +445,7 @@ fn preprocess_image_for_vision(
 /// Encode a prompt with vision embeddings.
 fn encode_prompt_with_vision(
     tokenizer: &Tokenizer,
-    text_model: &mut Qwen25VLTextModel,
+    text_model: &mut common::TextEncoderVariant,
     prompt: &str,
     vision_embeds: &Tensor,
     image_grid_thw: &Tensor,

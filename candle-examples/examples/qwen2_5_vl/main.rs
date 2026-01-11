@@ -47,6 +47,26 @@
 //!     --image photo.jpg --prompt "Describe this image" \
 //!     --repeat-penalty 1.1 --repeat-last-n 64
 //!
+//! # With quantized model (GGUF) - auto-download defaults
+//! cargo run --example qwen2_5_vl --release -- \
+//!     --gguf-text --gguf-vision \
+//!     --image photo.jpg \
+//!     --prompt "What is in this image?"
+//!
+//! # With quantized model - specify HuggingFace path (auto-downloads)
+//! cargo run --example qwen2_5_vl --release -- \
+//!     --gguf-text Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q8_0.gguf \
+//!     --gguf-vision \
+//!     --image photo.jpg \
+//!     --prompt "What is in this image?"
+//!
+//! # With quantized model - local files
+//! cargo run --example qwen2_5_vl --release -- \
+//!     --gguf-text /path/to/text.gguf \
+//!     --gguf-vision /path/to/vision.gguf \
+//!     --image photo.jpg \
+//!     --prompt "What is in this image?"
+//!
 //! # With Flash Attention (faster on CUDA, requires flash-attn feature)
 //! cargo run --example qwen2_5_vl --release --features flash-attn -- \
 //!     --flash-attn --image photo.jpg \
@@ -65,18 +85,196 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use candle::quantized::gguf_file;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::qwen2_5_vl::{
     patchify_image, patchify_video, smart_resize, Config, ImageGrid, Qwen25VLModel,
-    DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE, DEFAULT_MIN_PIXELS, DEFAULT_PATCH_SIZE,
-    DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
+    Qwen25VLVisionModel, VisionConfig, DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE,
+    DEFAULT_MIN_PIXELS, DEFAULT_PATCH_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
+};
+use candle_transformers::models::quantized_qwen2_5_vl::{
+    load_vision_from_mmproj, ModelWeights as QuantizedTextModel, Qwen25VLQuantized,
 };
 use candle_transformers::utils::apply_repeat_penalty;
 use clap::Parser;
 use std::io::Write;
 use tokenizers::Tokenizer;
+
+/// Unified model wrapper for FP16 and quantized models.
+enum Model {
+    Fp16(Qwen25VLModel),
+    Quantized(Qwen25VLQuantized),
+}
+
+impl Model {
+    fn is_quantized(&self) -> bool {
+        matches!(self, Model::Quantized(_))
+    }
+
+    /// Forward pass for image understanding.
+    fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        image_grid_thw: &Tensor,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Model::Fp16(m) => m.forward(input_ids, pixel_values, image_grid_thw),
+            Model::Quantized(m) => m.forward(input_ids, pixel_values, image_grid_thw),
+        }
+    }
+
+    /// Generate tokens for images with streaming output (FP16 only).
+    fn generate_streaming<F, G>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        image_grid_thw: &Tensor,
+        max_length: usize,
+        eos_token_id: u32,
+        sampler: F,
+        callback: G,
+    ) -> candle::Result<Vec<u32>>
+    where
+        F: FnMut(&Tensor, &[u32]) -> candle::Result<u32>,
+        G: FnMut(u32, bool),
+    {
+        match self {
+            Model::Fp16(m) => m.generate_streaming(
+                input_ids,
+                pixel_values,
+                image_grid_thw,
+                max_length,
+                eos_token_id,
+                sampler,
+                callback,
+            ),
+            Model::Quantized(_) => {
+                candle::bail!("Streaming generation not supported for quantized models. Use non-streaming mode.")
+            }
+        }
+    }
+
+    /// Generate tokens for images with custom sampler (FP16 only).
+    fn generate_with_sampler<F>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        image_grid_thw: &Tensor,
+        max_length: usize,
+        eos_token_id: u32,
+        sampler: F,
+    ) -> candle::Result<Vec<u32>>
+    where
+        F: FnMut(&Tensor, &[u32]) -> candle::Result<u32>,
+    {
+        match self {
+            Model::Fp16(m) => m.generate_with_sampler(
+                input_ids,
+                pixel_values,
+                image_grid_thw,
+                max_length,
+                eos_token_id,
+                sampler,
+            ),
+            Model::Quantized(_) => {
+                candle::bail!("Custom sampler not supported for quantized models yet")
+            }
+        }
+    }
+
+    /// Simple greedy generation for quantized models.
+    fn generate_greedy(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        image_grid_thw: &Tensor,
+        max_length: usize,
+        eos_token_id: u32,
+    ) -> candle::Result<Vec<u32>> {
+        match self {
+            Model::Fp16(m) => m.generate(
+                input_ids,
+                pixel_values,
+                image_grid_thw,
+                max_length,
+                eos_token_id,
+            ),
+            Model::Quantized(m) => m.generate(
+                input_ids,
+                pixel_values,
+                image_grid_thw,
+                max_length,
+                eos_token_id,
+            ),
+        }
+    }
+
+    /// Generate tokens for video (FP16 only).
+    fn generate_video_streaming<F, G>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        second_per_grid_t: f32,
+        max_length: usize,
+        eos_token_id: u32,
+        sampler: F,
+        callback: G,
+    ) -> candle::Result<Vec<u32>>
+    where
+        F: FnMut(&Tensor, &[u32]) -> candle::Result<u32>,
+        G: FnMut(u32, bool),
+    {
+        match self {
+            Model::Fp16(m) => m.generate_video_streaming(
+                input_ids,
+                pixel_values,
+                grid_thw,
+                second_per_grid_t,
+                max_length,
+                eos_token_id,
+                sampler,
+                callback,
+            ),
+            Model::Quantized(_) => {
+                candle::bail!("Video generation not supported for quantized models")
+            }
+        }
+    }
+
+    /// Generate tokens for video with sampler (FP16 only).
+    fn generate_video_with_sampler<F>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        second_per_grid_t: f32,
+        max_length: usize,
+        eos_token_id: u32,
+        sampler: F,
+    ) -> candle::Result<Vec<u32>>
+    where
+        F: FnMut(&Tensor, &[u32]) -> candle::Result<u32>,
+    {
+        match self {
+            Model::Fp16(m) => m.generate_video_with_sampler(
+                input_ids,
+                pixel_values,
+                grid_thw,
+                second_per_grid_t,
+                max_length,
+                eos_token_id,
+                sampler,
+            ),
+            Model::Quantized(_) => {
+                candle::bail!("Video generation not supported for quantized models")
+            }
+        }
+    }
+}
 
 const DEFAULT_MODEL_ID: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
 
@@ -172,6 +370,60 @@ struct Args {
     /// Enable streaming output (print tokens as they're generated)
     #[arg(long)]
     stream: bool,
+
+    // === Quantization options ===
+    /// Quantized GGUF text decoder. Accepts:
+    /// - Local path: /path/to/model.gguf
+    /// - HuggingFace: owner/repo/filename.gguf (auto-downloads)
+    /// - No value: uses default Mungert/Qwen2.5-VL-7B-Instruct-GGUF/q4_k_m
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+    gguf_text: Option<String>,
+
+    /// GGUF vision encoder (F16). Accepts same formats as --gguf-text.
+    /// No value: uses default Mungert/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+    gguf_vision: Option<String>,
+}
+
+// Default GGUF models (HuggingFace format: owner/repo/filename)
+const DEFAULT_GGUF_TEXT: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf";
+const DEFAULT_GGUF_VISION: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf";
+
+/// Resolve a GGUF path to a local file, downloading from HuggingFace if needed.
+///
+/// Accepts:
+/// - "auto" → uses the provided default
+/// - Local path → returns as-is if exists
+/// - "owner/repo/filename.gguf" → downloads from HuggingFace
+fn resolve_gguf_path(
+    value: &str,
+    default: &str,
+    api: &hf_hub::api::sync::Api,
+) -> anyhow::Result<std::path::PathBuf> {
+    let path_str = if value == "auto" { default } else { value };
+
+    // Check if it's a local file
+    let local_path = std::path::Path::new(path_str);
+    if local_path.exists() {
+        return Ok(local_path.to_path_buf());
+    }
+
+    // Parse as HuggingFace: owner/repo/filename
+    let parts: Vec<&str> = path_str.splitn(3, '/').collect();
+    if parts.len() == 3 {
+        let repo_id = format!("{}/{}", parts[0], parts[1]);
+        let filename = parts[2];
+        println!("Downloading {} from {}...", filename, repo_id);
+        let repo = api.repo(hf_hub::Repo::model(repo_id));
+        let path = repo.get(filename)?;
+        return Ok(path);
+    }
+
+    // If we get here, it's neither a local file nor valid HF format
+    Err(anyhow::anyhow!(
+        "GGUF path '{}' not found locally and not in owner/repo/file format",
+        path_str
+    ))
 }
 
 /// Load and preprocess image for Qwen2.5-VL.
@@ -676,62 +928,122 @@ fn main() -> Result<()> {
     let tokenizer_file = repo.get("tokenizer.json")?;
     let tokenizer = Tokenizer::from_file(&tokenizer_file).map_err(E::msg)?;
 
-    // Load model weights (handle sharded safetensors)
-    let model_files: Vec<_> = [
-        "model.safetensors",
-        "model-00001-of-00005.safetensors",
-        "model-00001-of-00004.safetensors",
-        "model-00001-of-00003.safetensors",
-        "model-00001-of-00002.safetensors",
-    ]
-    .iter()
-    .filter_map(|f| repo.get(f).ok())
-    .collect();
+    // Load model - either quantized (GGUF) or FP16 (safetensors)
+    let mut model = if let Some(gguf_text_value) = &args.gguf_text {
+        // === Quantized model loading ===
+        let text_path = resolve_gguf_path(gguf_text_value, DEFAULT_GGUF_TEXT, &api)?;
+        println!("Loading quantized text decoder from {:?}...", text_path);
 
-    if model_files.is_empty() {
-        return Err(E::msg("Could not find model weights"));
-    }
+        // Load text decoder from GGUF
+        let mut text_file = std::fs::File::open(&text_path)?;
+        let text_content = gguf_file::Content::read(&mut text_file)?;
+        let text_model = QuantizedTextModel::from_gguf(text_content, &mut text_file, &device)?;
 
-    // If first file is sharded, get all shards
-    let model_files = if model_files[0]
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .contains("-00001-of-")
-    {
-        // Count how many shards
-        let name = model_files[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let parts: Vec<&str> = name.split("-of-").collect();
-        if parts.len() == 2 {
-            let total: usize = parts[1]
-                .trim_end_matches(".safetensors")
-                .parse()
-                .unwrap_or(1);
-            let mut files = Vec::new();
-            for i in 1..=total {
-                let shard_name = format!(
-                    "model-{:05}-of-{:05}.safetensors",
-                    i, total
-                );
-                files.push(repo.get(&shard_name)?);
+        // Load vision encoder - either from GGUF or safetensors
+        let vision_model = if let Some(gguf_vision_value) = &args.gguf_vision {
+            let vision_path = resolve_gguf_path(gguf_vision_value, DEFAULT_GGUF_VISION, &api)?;
+            println!("Loading vision encoder from GGUF: {:?}", vision_path);
+            let mut vision_file = std::fs::File::open(&vision_path)?;
+            let vision_content = gguf_file::Content::read(&mut vision_file)?;
+            let (vision, _vision_config) =
+                load_vision_from_mmproj(&vision_content, &mut vision_file, &device, dtype)?;
+            vision
+        } else {
+            // Fall back to loading vision from safetensors
+            println!("Loading vision encoder from safetensors...");
+            let vision_files: Vec<_> = [
+                "model.safetensors",
+                "model-00001-of-00005.safetensors",
+                "model-00001-of-00004.safetensors",
+                "model-00001-of-00003.safetensors",
+                "model-00001-of-00002.safetensors",
+            ]
+            .iter()
+            .filter_map(|f| repo.get(f).ok())
+            .collect();
+
+            if vision_files.is_empty() {
+                return Err(E::msg(
+                    "Vision encoder requires either --mmproj or safetensors weights",
+                ));
             }
-            files
+
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&vision_files, dtype, &device)? };
+            let vb_vision = vb.pp("visual");
+            Qwen25VLVisionModel::new(&config.vision_config, vb_vision)?
+        };
+
+        // Get special token IDs from config
+        let image_token_id = config.image_token_id.unwrap_or(151655);
+        let video_token_id = config.video_token_id.unwrap_or(151656);
+
+        let quantized = Qwen25VLQuantized::new(
+            text_model,
+            vision_model,
+            image_token_id,
+            video_token_id,
+            config.vision_config.spatial_merge_size,
+            dtype,
+        );
+        println!("Quantized model loaded successfully!");
+        Model::Quantized(quantized)
+    } else {
+        // === FP16 model loading ===
+        // Load model weights (handle sharded safetensors)
+        let model_files: Vec<_> = [
+            "model.safetensors",
+            "model-00001-of-00005.safetensors",
+            "model-00001-of-00004.safetensors",
+            "model-00001-of-00003.safetensors",
+            "model-00001-of-00002.safetensors",
+        ]
+        .iter()
+        .filter_map(|f| repo.get(f).ok())
+        .collect();
+
+        if model_files.is_empty() {
+            return Err(E::msg("Could not find model weights"));
+        }
+
+        // If first file is sharded, get all shards
+        let model_files = if model_files[0]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .contains("-00001-of-")
+        {
+            // Count how many shards
+            let name = model_files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let parts: Vec<&str> = name.split("-of-").collect();
+            if parts.len() == 2 {
+                let total: usize = parts[1]
+                    .trim_end_matches(".safetensors")
+                    .parse()
+                    .unwrap_or(1);
+                let mut files = Vec::new();
+                for i in 1..=total {
+                    let shard_name = format!("model-{:05}-of-{:05}.safetensors", i, total);
+                    files.push(repo.get(&shard_name)?);
+                }
+                files
+            } else {
+                model_files
+            }
         } else {
             model_files
-        }
-    } else {
-        model_files
+        };
+
+        println!("Loading {} weight file(s)...", model_files.len());
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
+
+        let fp16_model = Qwen25VLModel::new(&config, vb)?;
+        println!("FP16 model loaded successfully!");
+        Model::Fp16(fp16_model)
     };
-
-    println!("Loading {} weight file(s)...", model_files.len());
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
-
-    let mut model = Qwen25VLModel::new(&config, vb)?;
-    println!("Model loaded successfully!");
 
     // Get EOS token
     let eos_token_id = tokenizer
@@ -797,7 +1109,13 @@ fn main() -> Result<()> {
     // Generate based on input type (image or video)
     let start = std::time::Instant::now();
     let generated_tokens = if let Some(video_path) = &args.video {
-        // Video mode
+        // Video mode - not supported for quantized models
+        if model.is_quantized() {
+            return Err(E::msg(
+                "Video mode is not supported with quantized models (--gguf). \
+                 Please use FP16 model for video processing.",
+            ));
+        }
         println!("Loading: {}", video_path);
         let (pixel_values, grid_thw, second_per_grid_t) =
             load_video(video_path, args.video_fps, args.max_frames, &device, dtype)?;
@@ -925,7 +1243,23 @@ fn main() -> Result<()> {
         println!("Input sequence length: {}", input_ids.dim(1)?);
 
         // Generate using image forward with sampling
-        if args.stream {
+        if model.is_quantized() {
+            // Quantized models use simpler greedy generation
+            if args.stream {
+                eprintln!("Note: Streaming not supported for quantized models, using batch generation");
+            }
+            if args.temperature.is_some() || args.top_k.is_some() || args.top_p.is_some() {
+                eprintln!("Note: Sampling parameters ignored for quantized models (greedy decoding)");
+            }
+            println!("\nGenerating (quantized, greedy, max {} tokens)...", args.max_length);
+            model.generate_greedy(
+                &input_ids,
+                &pixel_values,
+                &grid_thw,
+                args.max_length,
+                eos_token_id,
+            )?
+        } else if args.stream {
             println!("\nGenerating (streaming, max {} tokens)...\n", args.max_length);
             model.generate_streaming(
                 &input_ids,
