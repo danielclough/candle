@@ -142,25 +142,20 @@ pub fn run(
             device,
             dtype,
         )?
-    } else if let Some(seed) = args.seed {
-        // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
+    } else {
+        // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
         // Use [B, T, C, H, W] format to match PyTorch diffusers
+        let seed = args.seed.unwrap_or_else(|| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        });
+        println!("  Using seed: {}", seed);
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
             &[1, 1, 16, dims.latent_height, dims.latent_width],
             device,
             DType::F32,
-        )?
-    } else {
-        // Use Candle's default RNG (not reproducible across frameworks)
-        // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-        // Use [B, T, C, H, W] format to match PyTorch diffusers
-        Tensor::randn(
-            0f32,
-            1f32,
-            (1, 1, 16, dims.latent_height, dims.latent_width),
-            device,
         )?
     };
     println!("  Initial latents shape: {:?}", latents.dims());
@@ -276,11 +271,14 @@ fn create_img2img_latents(
 
     // Keep noise in F32 to avoid BF16 quantization error
     // Use [B, T, C, H, W] format to match transposed VAE output
-    let noise = Tensor::randn(
-        0f32,
-        1f32,
-        (1, 1, 16, dims.latent_height, dims.latent_width),
+    // Use PyTorch-compatible RNG for consistent noise distribution
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let mut rng = MtBoxMullerRng::new(seed);
+    let noise = rng.randn(
+        &[1, 1, 16, dims.latent_height, dims.latent_width],
         device,
+        DType::F32,
     )?;
 
     let sigmas = scheduler.sigmas();

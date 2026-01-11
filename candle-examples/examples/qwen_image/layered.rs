@@ -144,11 +144,14 @@ pub fn run(
 
     // Create initial noise for all layers: [batch, layers+1, channels, height, width]
     // Keep in F32 to avoid BF16 quantization error accumulating across steps
-    let noise_latents = Tensor::randn(
-        0f32,
-        1f32,
-        (1, args.layers + 1, 16, dims.latent_height, dims.latent_width),
+    // Use PyTorch-compatible RNG for consistent noise distribution
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
+    let noise_latents = rng.randn(
+        &[1, args.layers + 1, 16, dims.latent_height, dims.latent_width],
         device,
+        DType::F32,
     )?;
 
     // Pack layered latents

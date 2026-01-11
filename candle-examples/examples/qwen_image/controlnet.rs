@@ -114,11 +114,14 @@ pub fn run(
     let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
 
     // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
-    let latents = Tensor::randn(
-        0f32,
-        1f32,
-        (1, 16, 1, dims.latent_height, dims.latent_width),
+    // Use PyTorch-compatible RNG for consistent noise distribution
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
+    let latents = rng.randn(
+        &[1, 16, 1, dims.latent_height, dims.latent_width],
         device,
+        DType::F32,
     )?;
 
     println!("  Latent size: {}x{}", dims.latent_height, dims.latent_width);

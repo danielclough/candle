@@ -92,6 +92,52 @@ pub fn tensor_stats_string(t: &Tensor) -> Result<String> {
     ))
 }
 
+/// Save a tensor to the debug output directory with CFG pass suffix.
+///
+/// Saves to `debug_tensors/rust_edit/{name}_{pos|neg}.npy`
+/// Only saves if QWEN_DEBUG is enabled.
+/// Only saves ONCE per tensor name (first call wins) to capture step 0 values.
+pub fn save_debug_tensor(name: &str, t: &Tensor) -> Result<()> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static SAVED_TENSORS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    if !is_debug_mode() {
+        return Ok(());
+    }
+
+    let suffix = get_cfg_pass_suffix_pub();
+    let key = format!("{}{}", name, suffix);
+
+    // Check if we've already saved this tensor
+    let saved = SAVED_TENSORS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let mut set = saved.lock().unwrap();
+        if set.contains(&key) {
+            return Ok(()); // Already saved, skip
+        }
+        set.insert(key.clone());
+    }
+
+    let output_dir = "debug_tensors/rust_edit";
+    std::fs::create_dir_all(output_dir).map_err(|e| candle::Error::Msg(format!("Failed to create dir: {}", e)))?;
+
+    let path = format!("{}/{}{}.npy", output_dir, name, suffix);
+    t.to_dtype(DType::F32)?.write_npy(&path)?;
+
+    eprintln!("[DEBUG_SAVE] Saved {} (shape={:?})", path, t.dims());
+    Ok(())
+}
+
+/// Public version of get_cfg_pass_suffix for use from other modules.
+pub fn get_cfg_pass_suffix_pub() -> &'static str {
+    CFG_PASS.with(|p| {
+        if p.get() == 0 { "_pos" } else { "_neg" }
+    })
+}
+
 /// Check if VAE tensor saving is enabled (via VAE_SAVE environment variable).
 pub fn is_vae_save() -> bool {
     std::env::var("VAE_SAVE").is_ok()
@@ -250,6 +296,10 @@ pub struct BlockOverrides {
     pub attn_probs: Option<Tensor>,
     /// Override attention output before split [batch, seq, heads, head_dim]
     pub attn_output: Option<Tensor>,
+    /// Override block 0 output for image stream [batch, seq, dim]
+    pub block0_output_img: Option<Tensor>,
+    /// Override block 0 output for text stream [batch, seq, dim]
+    pub block0_output_txt: Option<Tensor>,
 }
 
 impl BlockOverrides {
@@ -270,12 +320,18 @@ impl BlockOverrides {
             || self.attn_output.is_some()
     }
 
+    /// Check if block 0 output overrides are set.
+    pub fn has_block0_output_overrides(&self) -> bool {
+        self.block0_output_img.is_some() || self.block0_output_txt.is_some()
+    }
+
     /// Check if any override is set.
     pub fn is_empty(&self) -> bool {
         self.img_modulated.is_none()
             && self.img_gate2.is_none()
             && !self.has_qkv_overrides()
             && !self.has_attn_overrides()
+            && !self.has_block0_output_overrides()
     }
 }
 
@@ -476,6 +532,39 @@ pub fn load_block_overrides(device: &Device, dtype: DType, pass_suffix: Option<&
                     overrides.attn_output = Some(tensor);
                 } else {
                     eprintln!("[DEBUG] Warning: {} not found, skipping attn_output override", path.display());
+                }
+            }
+            "block0_output" => {
+                // Load both img and txt block 0 outputs
+                // Try suffixed first, then unsuffixed (block0 is captured once without suffix)
+                let img_path_suffixed = tensor_dir.join(make_filename("block0_output_img"));
+                let img_path_unsuffixed = tensor_dir.join("block0_output_img.npy");
+                let img_path = if img_path_suffixed.exists() {
+                    img_path_suffixed
+                } else {
+                    img_path_unsuffixed
+                };
+                if img_path.exists() {
+                    let tensor = load_npy_tensor(&img_path, device, dtype)?;
+                    eprintln!("[DEBUG] Loaded block0_output_img override from {}: shape={:?}", img_path.display(), tensor.dims());
+                    overrides.block0_output_img = Some(tensor);
+                } else {
+                    eprintln!("[DEBUG] Warning: block0_output_img not found (tried both suffixed and unsuffixed), skipping");
+                }
+
+                let txt_path_suffixed = tensor_dir.join(make_filename("block0_output_txt"));
+                let txt_path_unsuffixed = tensor_dir.join("block0_output_txt.npy");
+                let txt_path = if txt_path_suffixed.exists() {
+                    txt_path_suffixed
+                } else {
+                    txt_path_unsuffixed
+                };
+                if txt_path.exists() {
+                    let tensor = load_npy_tensor(&txt_path, device, dtype)?;
+                    eprintln!("[DEBUG] Loaded block0_output_txt override from {}: shape={:?}", txt_path.display(), tensor.dims());
+                    overrides.block0_output_txt = Some(tensor);
+                } else {
+                    eprintln!("[DEBUG] Warning: block0_output_txt not found (tried both suffixed and unsuffixed), skipping");
                 }
             }
             other => {

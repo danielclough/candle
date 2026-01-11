@@ -335,6 +335,7 @@ impl QwenImageTransformer2DModel {
         // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
         let mut hidden_states = hidden_states.apply(&self.img_in)?;
         debug_tensor("after_img_in", &hidden_states);
+        super::debug::save_debug_tensor("after_img_in", &hidden_states)?;
 
         // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
         let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
@@ -416,6 +417,22 @@ impl QwenImageTransformer2DModel {
             };
             encoder_hidden_states = enc_out;
             hidden_states = hid_out;
+
+            // Substitute block 0 output if override is set
+            if idx == 0 {
+                if let Some(ref overrides) = block_overrides {
+                    if let Some(ref img_override) = overrides.block0_output_img {
+                        eprintln!("[DEBUG] SUBSTITUTING block0_output_img: Rust shape={:?}, PyTorch shape={:?}",
+                            hidden_states.dims(), img_override.dims());
+                        hidden_states = img_override.clone();
+                    }
+                    if let Some(ref txt_override) = overrides.block0_output_txt {
+                        eprintln!("[DEBUG] SUBSTITUTING block0_output_txt: Rust shape={:?}, PyTorch shape={:?}",
+                            encoder_hidden_states.dims(), txt_override.dims());
+                        encoder_hidden_states = txt_override.clone();
+                    }
+                }
+            }
 
             // Apply ControlNet residual if available for this block
             if let Some(residuals) = controlnet_residuals {

@@ -17,6 +17,7 @@ use super::debug::{
     is_attention_debug, debug_attention_internals,
     debug_per_head_stats, save_attention_tensors,
     save_qk_pipeline_tensors, is_qk_save_enabled,
+    save_debug_tensor,
 };
 use super::rope::apply_rotary_emb_qwen;
 
@@ -882,6 +883,7 @@ impl QwenImageTransformerBlock {
         let img_normed = hidden_states.apply(&self.img_norm1)?;
         if debug {
             debug_tensor("[BLOCK0] img_norm1_output", &img_normed);
+            save_debug_tensor("block0_img_norm1_output", &img_normed)?;
         }
 
         let (img_modulated, img_gate1) = if let Some(mod_idx) = modulate_index {
@@ -908,6 +910,7 @@ impl QwenImageTransformerBlock {
 
         if debug {
             debug_tensor("[BLOCK0] img_modulated", &img_modulated);
+            save_debug_tensor("block0_img_modulated", &img_modulated)?;
         }
 
         // Text: norm1 + modulate (always standard, no per-token selection)

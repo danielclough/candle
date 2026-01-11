@@ -227,24 +227,18 @@ pub fn run(
 
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use [B, T, C, H, W] format to match PyTorch diffusers
-    let noise_latents = if let Some(seed) = args.seed {
-        // Use PyTorch-compatible MT19937 + Box-Muller RNG for reproducibility
-        let mut rng = MtBoxMullerRng::new(seed);
-        rng.randn(
-            &[1, 1, 16, dims.latent_height, dims.latent_width],
-            &Device::Cpu,
-            DType::F32,
-        )?
-        .to_device(device)?
-    } else {
-        // Use Candle's default RNG (not reproducible across frameworks)
-        Tensor::randn(
-            0f32,
-            1f32,
-            (1, 1, 16, dims.latent_height, dims.latent_width),
-            device,
-        )?
-    };
+    // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
+    let seed = args.seed.unwrap_or_else(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    });
+    println!("  Using seed: {}", seed);
+    let mut rng = MtBoxMullerRng::new(seed);
+    let noise_latents = rng.randn(
+        &[1, 1, 16, dims.latent_height, dims.latent_width],
+        &Device::Cpu,
+        DType::F32,
+    )?.to_device(device)?;
     let noise_latents = debug::checkpoint(&mut debug_ctx, "noise_latents_unpacked", noise_latents)?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
@@ -311,25 +305,16 @@ pub fn run(
             debug::checkpoint(&mut debug_ctx, "transformer_input_timestep", t.clone())?;
         }
 
-        // Compute temb externally for debug substitution (edit mode uses doubled timestep)
-        let doubled_t = Tensor::cat(&[&t, &(&t * 0.0)?], 0)?;
-        let temb = transformer.compute_temb(&doubled_t, dtype)?;
-        let temb = if step == 0 {
-            debug::checkpoint(&mut debug_ctx, "block0_temb", temb)?
-        } else {
-            temb
-        };
-
         // Set CFG pass for block override loading (positive = 0)
         set_cfg_pass(0);
-        let pos_pred = transformer.forward_with_temb(
+        // Note: Timestep doubling for zero_cond_t is handled internally by the transformer
+        let pos_pred = transformer.forward(
             &latent_model_input,
             &pos_embeds,
             &pos_mask,
             &t,
             &img_shapes,
             &pos_txt_seq_lens,
-            Some(&temb),
         )?;
 
         // Debug: capture full transformer output at step 0 (before extraction)
@@ -349,14 +334,13 @@ pub fn run(
         let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) = (&neg_embeds, &neg_mask, &neg_txt_seq_lens) {
             // Set CFG pass for block override loading (negative = 1)
             set_cfg_pass(1);
-            let neg_pred = transformer.forward_with_temb(
+            let neg_pred = transformer.forward(
                 &latent_model_input,
                 neg_embeds,
                 neg_mask,
                 &t,
                 &img_shapes,
                 neg_seq_lens,
-                Some(&temb),
             )?;
 
             let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;

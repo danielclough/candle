@@ -127,7 +127,7 @@ impl Config {
     /// - Reference image latents (subsequent sequences) use zero-timestep modulation
     pub fn qwen_image_edit() -> Self {
         Self {
-            zero_cond_t: true, // Critical for edit mode - enables per-token modulation
+            zero_cond_t: true, // Enables per-token modulation for edit mode
             ..Self::qwen_image()
         }
     }
