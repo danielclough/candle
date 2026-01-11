@@ -91,8 +91,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::qwen2_5_vl::{
     patchify_image, patchify_video, smart_resize, Config, ImageGrid, Qwen25VLModel,
-    Qwen25VLVisionModel, VisionConfig, DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE,
-    DEFAULT_MIN_PIXELS, DEFAULT_PATCH_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
+    Qwen25VLVisionModel, DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE, DEFAULT_MIN_PIXELS,
+    DEFAULT_PATCH_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
 };
 use candle_transformers::models::quantized_qwen2_5_vl::{
     load_vision_from_mmproj, ModelWeights as QuantizedTextModel, Qwen25VLQuantized,
@@ -111,19 +111,6 @@ enum Model {
 impl Model {
     fn is_quantized(&self) -> bool {
         matches!(self, Model::Quantized(_))
-    }
-
-    /// Forward pass for image understanding.
-    fn forward(
-        &mut self,
-        input_ids: &Tensor,
-        pixel_values: &Tensor,
-        image_grid_thw: &Tensor,
-    ) -> candle::Result<Tensor> {
-        match self {
-            Model::Fp16(m) => m.forward(input_ids, pixel_values, image_grid_thw),
-            Model::Quantized(m) => m.forward(input_ids, pixel_values, image_grid_thw),
-        }
     }
 
     /// Generate tokens for images with streaming output (FP16 only).
@@ -974,8 +961,8 @@ fn main() -> Result<()> {
         };
 
         // Get special token IDs from config
-        let image_token_id = config.image_token_id.unwrap_or(151655);
-        let video_token_id = config.video_token_id.unwrap_or(151656);
+        let image_token_id = config.image_token_id;
+        let video_token_id = config.video_token_id;
 
         let quantized = Qwen25VLQuantized::new(
             text_model,

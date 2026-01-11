@@ -9,7 +9,7 @@ use std::io::Write;
 use tokenizers::Tokenizer;
 
 use candle::quantized::gguf_file;
-use candle::Tensor;
+use candle::{DType, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -226,7 +226,7 @@ fn main() -> anyhow::Result<()> {
                 &mut file,
                 &device,
             )?),
-            Which::Phi3b => Model::Phi3b(Phi3b::from_gguf(model, &mut file, &device)?),
+            Which::Phi3b => Model::Phi3b(Phi3b::from_gguf(model, &mut file, &device, DType::F32)?),
         }
     };
     println!("model built");

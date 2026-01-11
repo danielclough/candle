@@ -6,13 +6,12 @@
 
 use anyhow::{anyhow, Result};
 use candle::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
 
 use crate::mt_box_muller_rng::MtBoxMullerRng;
 use candle_transformers::models::{
     qwen2_5_vl::{
-        get_image_grid_thw, normalize_image, patchify_image, smart_resize,
-        Qwen25VLVisionModel, VisionConfig, DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS,
+        get_image_grid_thw, normalize_image, patchify_image, smart_resize, DEFAULT_MAX_PIXELS,
+        DEFAULT_MIN_PIXELS,
     },
     qwen_image::{
         apply_true_cfg, pack_latents, unpack_latents, Config, TiledDecodeConfig,
@@ -132,22 +131,14 @@ pub fn run(
 
     let tokenizer = common::load_tokenizer(paths.tokenizer_path.as_deref(), &api)?;
 
-    // Load vision encoder
-    let vision_config = VisionConfig::default();
-    let vision_model_files = match &paths.vision_encoder_path {
-        Some(path) => {
-            candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
-        }
-        None => {
-            let repo = api.repo(hf_hub::Repo::model(common::DEFAULT_TEXT_ENCODER_ID.to_string()));
-            candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
-        }
-    };
-
-    // Load vision encoder in F32 for numerical precision
-    let vb_vision =
-        unsafe { VarBuilder::from_mmaped_safetensors(&vision_model_files, DType::F32, device)? };
-    let vision_model = Qwen25VLVisionModel::new(&vision_config, vb_vision.pp("visual"))?;
+    // Load vision encoder (F32 for numerical precision, supports GGUF mmproj or safetensors)
+    let vision_model = common::load_vision_encoder_variant(
+        paths.vision_encoder_path.as_deref(),
+        paths.gguf_vision_encoder_path.as_deref(),
+        &api,
+        device,
+        DType::F32,
+    )?;
     println!("  Vision encoder loaded (F32)");
 
     // Preprocess input image for vision encoder (F32)

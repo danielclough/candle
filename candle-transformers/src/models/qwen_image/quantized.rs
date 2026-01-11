@@ -231,9 +231,11 @@ impl QwenDoubleStreamAttentionQuantized {
         let v = Tensor::cat(&[&txt_v, &img_v], 1)?;
 
         // Now transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
+        // Note: transpose creates non-contiguous tensors, so we must call contiguous()
+        // before matmul operations which require contiguous memory layouts.
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
 
         // Scaled dot-product attention (in F32 for numerical stability)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
@@ -404,6 +406,7 @@ impl QwenImageTransformer2DModelQuantized {
     /// * `ct` - GGUF file content
     /// * `reader` - Reader for tensor data
     /// * `device` - Device to load model on
+    /// * `dtype` - Working dtype for biases and normalization layers
     ///
     /// # Note
     /// The GGUF tensor names must follow the llama.cpp convention for Qwen-Image.
@@ -412,6 +415,7 @@ impl QwenImageTransformer2DModelQuantized {
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+        dtype: DType,
     ) -> Result<Self> {
         // Extract config from metadata
         let get_u32 = |keys: &[&str]| -> Result<u32> {
@@ -494,8 +498,8 @@ impl QwenImageTransformer2DModelQuantized {
             }};
         }
 
-        // Helper to get dtype for biases (match input dtype)
-        let bias_dtype = DType::BF16;
+        // Use the passed dtype for biases to match the working precision
+        let bias_dtype = dtype;
 
         // Load timestep embeddings
         let time_text_embed = QwenTimestepProjEmbeddingsQuantized {
