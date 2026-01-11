@@ -100,7 +100,12 @@ impl LayerWeights {
     ///
     /// M-RoPE uses 3D position IDs [temporal, height, width] and applies
     /// different position embeddings to different sections of the head dimension.
-    fn apply_mrope(&self, q: &Tensor, k: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn apply_mrope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         let _enter = self.span_rot.enter();
         let (three, _batch, _seq_len) = position_ids.dims3()?;
         assert_eq!(three, 3, "position_ids must have 3 dimensions [t, h, w]");
@@ -328,7 +333,10 @@ impl ModelWeights {
                     return Ok(v);
                 }
             }
-            candle::bail!("cannot find {key} in metadata (tried prefixes: {:?})", prefixes)
+            candle::bail!(
+                "cannot find {key} in metadata (tried prefixes: {:?})",
+                prefixes
+            )
         };
 
         let head_count = get_with_fallback("attention.head_count")?.to_u32()? as usize;
@@ -373,7 +381,8 @@ impl ModelWeights {
             let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
             let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
             let attention_wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
-            let attention_wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
+            let attention_wo =
+                ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
             // Attention biases (dequantized) - Qwen2.5-VL has biases on Q, K, V
             let attention_bq = ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?;
@@ -554,7 +563,11 @@ impl ModelWeights {
                 let attn_mask = attn_mask.broadcast_as((b_sz, 1, seq_len, seq_len))?;
                 let base_f32 = base_mask.to_dtype(DType::F32)?;
                 // Combined mask: 1 where either mask blocks
-                Some((base_f32.broadcast_as((b_sz, 1, seq_len, seq_len))? + attn_mask)?.clamp(0.0, 1.0)?.to_dtype(DType::U8)?)
+                Some(
+                    (base_f32.broadcast_as((b_sz, 1, seq_len, seq_len))? + attn_mask)?
+                        .clamp(0.0, 1.0)?
+                        .to_dtype(DType::U8)?,
+                )
             } else {
                 Some(base_mask)
             }
@@ -674,7 +687,11 @@ impl ModelWeights {
                 let attn_mask = (1.0 - attn_mask)?;
                 let attn_mask = attn_mask.broadcast_as((batch_size, 1, seq_len, seq_len))?;
                 let base_f32 = base_mask.to_dtype(DType::F32)?;
-                Some((base_f32.broadcast_as((batch_size, 1, seq_len, seq_len))? + attn_mask)?.clamp(0.0, 1.0)?.to_dtype(DType::U8)?)
+                Some(
+                    (base_f32.broadcast_as((batch_size, 1, seq_len, seq_len))? + attn_mask)?
+                        .clamp(0.0, 1.0)?
+                        .to_dtype(DType::U8)?,
+                )
             } else {
                 Some(base_mask)
             }
@@ -925,8 +942,8 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     ])
     .unwrap_or((hidden_size * 27 / 10) as u32) as usize; // Default ~2.7x hidden
 
-    let patch_size = get_u32(&["clip.vision.patch_size", "vision.patch_size"])
-        .unwrap_or(14) as usize;
+    let patch_size =
+        get_u32(&["clip.vision.patch_size", "vision.patch_size"]).unwrap_or(14) as usize;
 
     let spatial_merge_size = get_u32(&[
         "qwen2vl.vision.spatial_merge_size",
@@ -948,8 +965,8 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     ])
     .unwrap_or(3584) as usize; // Default for 7B
 
-    let window_size = get_u32(&["qwen2vl.vision.window_size", "vision.window_size"])
-        .unwrap_or(112) as usize;
+    let window_size =
+        get_u32(&["qwen2vl.vision.window_size", "vision.window_size"]).unwrap_or(112) as usize;
 
     // Full attention block indexes (default for Qwen2.5-VL: [7, 15, 23, 31])
     let fullatt_block_indexes = vec![7, 15, 23, 31];
@@ -996,7 +1013,13 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     }
 
     // Patch embedding
-    if let Some(t) = try_load_tensor(ct, reader, device, dtype, &["v.patch_embd.weight", "vision.patch_embed.proj.weight"]) {
+    if let Some(t) = try_load_tensor(
+        ct,
+        reader,
+        device,
+        dtype,
+        &["v.patch_embd.weight", "vision.patch_embed.proj.weight"],
+    ) {
         tensors.insert("patch_embed.proj.weight".to_string(), t);
     }
 
@@ -1122,44 +1145,76 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
 
     // Patch merger
     if let Some(t) = try_load_tensor(
-        ct, reader, device, dtype,
-        &["v.post_ln.weight", "v.mm.ln_q.weight", "vision.merger.ln_q.weight"],
+        ct,
+        reader,
+        device,
+        dtype,
+        &[
+            "v.post_ln.weight",
+            "v.mm.ln_q.weight",
+            "vision.merger.ln_q.weight",
+        ],
     ) {
         tensors.insert("merger.ln_q.weight".to_string(), t);
     }
 
     // Merger MLP (2-layer with GELU)
     if let Some(t) = try_load_tensor(
-        ct, reader, device, dtype,
-        &["v.mm.0.weight", "v.mm_proj.0.weight", "vision.merger.mlp.0.weight"],
+        ct,
+        reader,
+        device,
+        dtype,
+        &[
+            "v.mm.0.weight",
+            "v.mm_proj.0.weight",
+            "vision.merger.mlp.0.weight",
+        ],
     ) {
         tensors.insert("merger.mlp.0.weight".to_string(), t);
     }
     if let Some(t) = try_load_tensor(
-        ct, reader, device, dtype,
-        &["v.mm.0.bias", "v.mm_proj.0.bias", "vision.merger.mlp.0.bias"],
+        ct,
+        reader,
+        device,
+        dtype,
+        &[
+            "v.mm.0.bias",
+            "v.mm_proj.0.bias",
+            "vision.merger.mlp.0.bias",
+        ],
     ) {
         tensors.insert("merger.mlp.0.bias".to_string(), t);
     }
 
     if let Some(t) = try_load_tensor(
-        ct, reader, device, dtype,
-        &["v.mm.2.weight", "v.mm_proj.2.weight", "vision.merger.mlp.2.weight"],
+        ct,
+        reader,
+        device,
+        dtype,
+        &[
+            "v.mm.2.weight",
+            "v.mm_proj.2.weight",
+            "vision.merger.mlp.2.weight",
+        ],
     ) {
         tensors.insert("merger.mlp.2.weight".to_string(), t);
     }
     if let Some(t) = try_load_tensor(
-        ct, reader, device, dtype,
-        &["v.mm.2.bias", "v.mm_proj.2.bias", "vision.merger.mlp.2.bias"],
+        ct,
+        reader,
+        device,
+        dtype,
+        &[
+            "v.mm.2.bias",
+            "v.mm_proj.2.bias",
+            "vision.merger.mlp.2.bias",
+        ],
     ) {
         tensors.insert("merger.mlp.2.bias".to_string(), t);
     }
 
     // Debug: list loaded tensors
-    tracing::debug!(
-        "Loaded {} vision tensors from mmproj GGUF",
-        tensors.len()
-    );
+    tracing::debug!("Loaded {} vision tensors from mmproj GGUF", tensors.len());
 
     // Create VarBuilder from the tensor map
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
@@ -1272,12 +1327,8 @@ impl Qwen25VLQuantized {
             })
             .collect();
 
-        let position_ids = compute_mrope_position_ids_multi(
-            input_ids,
-            self.image_token_id,
-            &image_grids,
-            device,
-        )?;
+        let position_ids =
+            compute_mrope_position_ids_multi(input_ids, self.image_token_id, &image_grids, device)?;
 
         // 4. Find image placeholder positions and replace with vision embeddings
         let input_ids_flat: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
@@ -1431,7 +1482,9 @@ impl Qwen25VLQuantized {
         let mrope_delta = current_pos - seq_len as i64;
 
         // Prefill
-        let logits = self.forward(input_ids, pixel_values, image_grid_thw)?.squeeze(0)?;
+        let logits = self
+            .forward(input_ids, pixel_values, image_grid_thw)?
+            .squeeze(0)?;
         let mut generated: Vec<u32> = Vec::new();
         let mut next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
         generated.push(next_token);
@@ -1448,7 +1501,9 @@ impl Qwen25VLQuantized {
             let position_ids = Tensor::new(&[[[pos]], [[pos]], [[pos]]], device)?;
 
             let next_embeds = self.text.tok_embeddings.forward(&next_input)?;
-            let logits = self.forward_with_embeds(next_embeds, &position_ids)?.squeeze(0)?;
+            let logits = self
+                .forward_with_embeds(next_embeds, &position_ids)?
+                .squeeze(0)?;
 
             next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
             generated.push(next_token);

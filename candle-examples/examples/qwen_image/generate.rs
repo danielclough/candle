@@ -37,12 +37,7 @@ pub struct ModelPaths {
 }
 
 /// Run the generate pipeline.
-pub fn run(
-    args: GenerateArgs,
-    paths: ModelPaths,
-    device: &Device,
-    dtype: DType,
-) -> Result<()> {
+pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType) -> Result<()> {
     common::validate_dimensions(args.height, args.width)?;
 
     println!("Qwen-Image Text-to-Image");
@@ -68,7 +63,11 @@ pub fn run(
         &api,
         device,
     )?;
-    let encoder_type = if text_model.is_quantized() { "quantized GGUF" } else { "FP16" };
+    let encoder_type = if text_model.is_quantized() {
+        "quantized GGUF"
+    } else {
+        "FP16"
+    };
     println!("  Text encoder loaded ({})", encoder_type);
 
     // =========================================================================
@@ -101,7 +100,10 @@ pub fn run(
         Some((neg_embeds, neg_mask))
     } else {
         if args.true_cfg_scale > 1.0 {
-            println!("  Note: true_cfg_scale={} but no negative prompt provided, CFG disabled", args.true_cfg_scale);
+            println!(
+                "  Note: true_cfg_scale={} but no negative prompt provided, CFG disabled",
+                args.true_cfg_scale
+            );
         }
         None
     };
@@ -152,7 +154,10 @@ pub fn run(
         // Use [B, T, C, H, W] format to match PyTorch diffusers
         let seed = args.seed.unwrap_or_else(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
         });
         println!("  Using seed: {}", seed);
         let mut rng = MtBoxMullerRng::new(seed);
@@ -179,8 +184,15 @@ pub fn run(
         device,
         dtype,
     )?;
-    let model_type = if transformer.is_quantized() { "quantized GGUF" } else { "FP16" };
-    println!("  Transformer loaded ({} layers, {})", config.num_layers, model_type);
+    let model_type = if transformer.is_quantized() {
+        "quantized GGUF"
+    } else {
+        "FP16"
+    };
+    println!(
+        "  Transformer loaded ({} layers, {})",
+        config.num_layers, model_type
+    );
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
     let txt_seq_lens = vec![pos_embeds.dim(1)?];
@@ -212,13 +224,27 @@ pub fn run(
         // Convert F32 latents to BF16 for transformer (weights are BF16)
         let latents_bf16 = latents.to_dtype(dtype)?;
 
-        let noise_pred =
-            transformer.forward(&latents_bf16, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens, dtype)?;
+        let noise_pred = transformer.forward(
+            &latents_bf16,
+            &pos_embeds,
+            &pos_mask,
+            &t,
+            &img_shapes,
+            &txt_seq_lens,
+            dtype,
+        )?;
 
         // Apply True CFG only if negative prompt was provided
         let noise_pred = if let Some((ref neg_embeds, ref neg_mask)) = neg_data {
-            let neg_pred =
-                transformer.forward(&latents_bf16, neg_embeds, neg_mask, &t, &img_shapes, &txt_seq_lens, dtype)?;
+            let neg_pred = transformer.forward(
+                &latents_bf16,
+                neg_embeds,
+                neg_mask,
+                &t,
+                &img_shapes,
+                &txt_seq_lens,
+                dtype,
+            )?;
             apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred
@@ -280,7 +306,10 @@ fn create_img2img_latents(
     // Use [B, T, C, H, W] format to match transposed VAE output
     // Use PyTorch-compatible RNG for consistent noise distribution
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let mut rng = MtBoxMullerRng::new(seed);
     let noise = rng.randn(
         &[1, 1, 16, dims.latent_height, dims.latent_width],

@@ -63,10 +63,7 @@ impl QwenEmbedRope {
 
         // Precompute negative indices: -MAX_SEQ_LEN, -MAX_SEQ_LEN+1, ..., -1
         // This is equivalent to: flip(0..MAX_SEQ_LEN) * -1 - 1
-        let neg_index: Vec<f32> = (0..MAX_SEQ_LEN)
-            .rev()
-            .map(|i| -((i + 1) as f32))
-            .collect();
+        let neg_index: Vec<f32> = (0..MAX_SEQ_LEN).rev().map(|i| -((i + 1) as f32)).collect();
         let neg_index = Tensor::from_vec(neg_index, MAX_SEQ_LEN, device)?;
 
         // Compute frequencies for all axes concatenated
@@ -141,7 +138,13 @@ impl QwenEmbedRope {
     ///
     /// # Returns
     /// Tensor of shape [frame * height * width, total_dim/2, 2]
-    fn compute_video_freqs(&self, frame: usize, height: usize, width: usize, idx: usize) -> Result<Tensor> {
+    fn compute_video_freqs(
+        &self,
+        frame: usize,
+        height: usize,
+        width: usize,
+        idx: usize,
+    ) -> Result<Tensor> {
         let seq_len = frame * height * width;
 
         // Compute split offsets for axis: [frame_dim/2, height_dim/2, width_dim/2]
@@ -203,9 +206,7 @@ impl QwenEmbedRope {
         // Concatenate along frequency dimension and reshape to [seq_len, total_dim/2, 2]
         let freqs = Tensor::cat(&[freqs_frame, freqs_height, freqs_width], 3)?;
         let total_half_dim: usize = half_dims.iter().sum();
-        freqs
-            .reshape((seq_len, total_half_dim, 2))?
-            .contiguous()
+        freqs.reshape((seq_len, total_half_dim, 2))?.contiguous()
     }
 
     /// Forward pass: compute frequencies for video and text sequences.
@@ -290,8 +291,16 @@ pub fn apply_rotary_emb_qwen(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
     // Extract cos and sin from freqs_cis: [seq, head_dim/2, 2]
     // Reshape for broadcasting: [1, seq, 1, head_dim/2]
     // Convert to input dtype if needed (freqs are F32, input may be BF16)
-    let freqs_cos = freqs_cis.i((.., .., 0))?.unsqueeze(0)?.unsqueeze(2)?.to_dtype(x.dtype())?;
-    let freqs_sin = freqs_cis.i((.., .., 1))?.unsqueeze(0)?.unsqueeze(2)?.to_dtype(x.dtype())?;
+    let freqs_cos = freqs_cis
+        .i((.., .., 0))?
+        .unsqueeze(0)?
+        .unsqueeze(2)?
+        .to_dtype(x.dtype())?;
+    let freqs_sin = freqs_cis
+        .i((.., .., 1))?
+        .unsqueeze(0)?
+        .unsqueeze(2)?
+        .to_dtype(x.dtype())?;
 
     // Complex multiplication: (a + bi) × (c + di) = (ac - bd) + (ad + bc)i
     // where x = a + bi, freqs = c + di (c=cos, d=sin)
@@ -315,7 +324,11 @@ pub fn apply_rotary_emb_qwen(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
 ///
 /// # Returns
 /// Tensor of shape [batch, embedding_dim]
-pub fn timestep_embedding(timesteps: &Tensor, embedding_dim: usize, dtype: DType) -> Result<Tensor> {
+pub fn timestep_embedding(
+    timesteps: &Tensor,
+    embedding_dim: usize,
+    dtype: DType,
+) -> Result<Tensor> {
     const SCALE: f64 = 1000.0;
     const MAX_PERIOD: f64 = 10000.0;
 

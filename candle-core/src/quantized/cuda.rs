@@ -1027,7 +1027,14 @@ impl QCudaStorage {
             }
             let rhs_f32 = rhs.as_cuda_slice::<f32>()?;
             let rhs_f32 = rhs_f32.slice(storage_offset..(storage_offset + storage_len));
-            dequantize_mul_mat_vec(&self.data, &rhs_f32, self.dtype, ncols, nrows, self.device())?
+            dequantize_mul_mat_vec(
+                &self.data,
+                &rhs_f32,
+                self.dtype,
+                ncols,
+                nrows,
+                self.device(),
+            )?
         } else {
             mul_mat_vec_via_q8_1(
                 &self.data,

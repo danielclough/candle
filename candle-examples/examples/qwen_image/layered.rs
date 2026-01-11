@@ -146,25 +146,42 @@ pub fn run(
     // Keep in F32 to avoid BF16 quantization error accumulating across steps
     // Use PyTorch-compatible RNG for consistent noise distribution
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let noise_latents = rng.randn(
-        &[1, args.layers + 1, 16, dims.latent_height, dims.latent_width],
+        &[
+            1,
+            args.layers + 1,
+            16,
+            dims.latent_height,
+            dims.latent_width,
+        ],
         device,
         DType::F32,
     )?;
 
     // Pack layered latents
-    let packed_noise =
-        pack_layered_latents(&noise_latents, dims.latent_height, dims.latent_width, args.layers)?;
+    let packed_noise = pack_layered_latents(
+        &noise_latents,
+        dims.latent_height,
+        dims.latent_width,
+        args.layers,
+    )?;
     println!("  Packed noise shape: {:?}", packed_noise.dims());
 
     // Pack image latents (single frame) for conditioning, convert to BF16 for transformer
     let image_latents_frame = image_latents.squeeze(2)?; // [1, 16, h, w]
     let image_latents_frame = image_latents_frame.unsqueeze(1)?; // [1, 1, 16, h, w]
-    let packed_image =
-        pack_layered_latents(&image_latents_frame, dims.latent_height, dims.latent_width, 0)?
-            .to_dtype(dtype)?;
+    let packed_image = pack_layered_latents(
+        &image_latents_frame,
+        dims.latent_height,
+        dims.latent_width,
+        0,
+    )?
+    .to_dtype(dtype)?;
 
     // Load transformer with layered config
     let config = Config::qwen_image_layered();
@@ -194,11 +211,7 @@ pub fn run(
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
-    for (step, &timestep) in timesteps
-        .iter()
-        .take(args.num_inference_steps)
-        .enumerate()
-    {
+    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
         if step % 10 == 0 || step == args.num_inference_steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",

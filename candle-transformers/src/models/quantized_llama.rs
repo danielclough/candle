@@ -465,7 +465,11 @@ impl ModelWeights {
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
                 // Use dtype-converted RmsNorm weights to avoid runtime conversion overhead
-                attention_norm: RmsNorm::from_qtensor_with_dtype(attention_norm, rms_norm_eps, dtype)?,
+                attention_norm: RmsNorm::from_qtensor_with_dtype(
+                    attention_norm,
+                    rms_norm_eps,
+                    dtype,
+                )?,
                 mlp_or_moe,
                 ffn_norm: RmsNorm::from_qtensor_with_dtype(ffn_norm, rms_norm_eps, dtype)?,
                 n_head: head_count,

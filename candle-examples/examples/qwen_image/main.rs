@@ -341,7 +341,8 @@ fn main() -> Result<()> {
     let _guard = common::setup_tracing(cli.tracing);
 
     // Setup device and dtype
-    let (device, dtype) = common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.use_f16, cli.seed)?;
+    let (device, dtype) =
+        common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.use_f16, cli.seed)?;
 
     // Dispatch to the appropriate pipeline
     match cli.command {

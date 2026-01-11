@@ -17,7 +17,12 @@ use super::config::Config;
 use super::rope::{timestep_embedding, QwenEmbedRope};
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
-fn layer_norm_no_affine(size: usize, eps: f64, device: &candle::Device, dtype: DType) -> Result<LayerNorm> {
+fn layer_norm_no_affine(
+    size: usize,
+    eps: f64,
+    device: &candle::Device,
+    dtype: DType,
+) -> Result<LayerNorm> {
     let weight = Tensor::ones(size, dtype, device)?;
     Ok(LayerNorm::new_no_bias(weight, eps))
 }
@@ -36,8 +41,11 @@ impl QwenTimestepProjEmbeddings {
     pub fn new(embedding_dim: usize, vb: VarBuilder) -> Result<Self> {
         let timestep_embedder_linear1 =
             candle_nn::linear(256, embedding_dim, vb.pp("timestep_embedder.linear_1"))?;
-        let timestep_embedder_linear2 =
-            candle_nn::linear(embedding_dim, embedding_dim, vb.pp("timestep_embedder.linear_2"))?;
+        let timestep_embedder_linear2 = candle_nn::linear(
+            embedding_dim,
+            embedding_dim,
+            vb.pp("timestep_embedder.linear_2"),
+        )?;
         Ok(Self {
             timestep_embedder_linear1,
             timestep_embedder_linear2,
@@ -474,7 +482,10 @@ mod tests {
 
         // Pack: [B, T, C, H, W] -> [B, num_patches, C*4]
         let packed = pack_latents(&latents, height, width)?;
-        assert_eq!(packed.dims(), &[batch, (height / 2) * (width / 2), channels * 4]);
+        assert_eq!(
+            packed.dims(),
+            &[batch, (height / 2) * (width / 2), channels * 4]
+        );
 
         // Unpack: [B, num_patches, C*4] -> [B, C, T, H, W]
         let unpacked = unpack_latents(&packed, height, width, channels)?;
@@ -483,8 +494,15 @@ mod tests {
         // PyTorch: pack takes [B, T, C, H, W], unpack gives [B, C, T, H, W]
         // Verify data is preserved by comparing with permuted input
         let latents_bcthw = latents.permute([0, 2, 1, 3, 4])?;
-        let diff = (&latents_bcthw - &unpacked)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(diff < 1e-5, "Pack/unpack should preserve data, diff: {}", diff);
+        let diff = (&latents_bcthw - &unpacked)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "Pack/unpack should preserve data, diff: {}",
+            diff
+        );
 
         Ok(())
     }

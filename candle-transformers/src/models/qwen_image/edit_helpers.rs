@@ -277,7 +277,10 @@ pub fn calculate_dimensions(target_area: usize, aspect_ratio: f64) -> (usize, us
 ///
 /// # Returns
 /// (width, height) tuple
-pub fn calculate_dimensions_with_resolution(resolution: usize, aspect_ratio: f64) -> (usize, usize) {
+pub fn calculate_dimensions_with_resolution(
+    resolution: usize,
+    aspect_ratio: f64,
+) -> (usize, usize) {
     calculate_dimensions(resolution * resolution, aspect_ratio)
 }
 
@@ -396,7 +399,10 @@ mod tests {
         // Unpack
         let unpacked = unpack_layered_latents(&packed, height, width, layers, channels)?;
         // Note: unpacked is [batch, channels, layers+1, height, width]
-        assert_eq!(unpacked.dims(), &[batch, channels, layers + 1, height, width]);
+        assert_eq!(
+            unpacked.dims(),
+            &[batch, channels, layers + 1, height, width]
+        );
 
         Ok(())
     }

@@ -44,8 +44,8 @@ use candle_nn::{Linear, Module, RmsNorm, VarBuilder};
 
 use super::blocks::QwenImageTransformerBlock;
 use super::config::Config;
-use super::rope::QwenEmbedRope;
 use super::model::QwenTimestepProjEmbeddings;
+use super::rope::QwenEmbedRope;
 
 /// Configuration for ControlNet.
 #[derive(Debug, Clone)]
@@ -109,7 +109,12 @@ impl ZeroLinear {
     ///
     /// This initializes weights to zero, useful when creating a ControlNet from
     /// a pretrained base transformer.
-    pub fn new_zeroed(in_dim: usize, out_dim: usize, device: &candle::Device, dtype: DType) -> Result<Self> {
+    pub fn new_zeroed(
+        in_dim: usize,
+        out_dim: usize,
+        device: &candle::Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let weight = Tensor::zeros((out_dim, in_dim), dtype, device)?;
         let bias = Tensor::zeros(out_dim, dtype, device)?;
         let linear = Linear::new(weight, Some(bias));
@@ -187,11 +192,19 @@ impl QwenImageControlNetModel {
 
         // Input projections
         let img_in = candle_nn::linear(config.base_config.in_channels, inner_dim, vb.pp("img_in"))?;
-        let txt_in = candle_nn::linear(config.base_config.joint_attention_dim, inner_dim, vb.pp("txt_in"))?;
+        let txt_in = candle_nn::linear(
+            config.base_config.joint_attention_dim,
+            inner_dim,
+            vb.pp("txt_in"),
+        )?;
 
         // ControlNet-specific: zero-initialized control embedder
         let control_in_channels = config.base_config.in_channels + config.extra_condition_channels;
-        let controlnet_x_embedder = ZeroLinear::new(control_in_channels, inner_dim, vb.pp("controlnet_x_embedder"))?;
+        let controlnet_x_embedder = ZeroLinear::new(
+            control_in_channels,
+            inner_dim,
+            vb.pp("controlnet_x_embedder"),
+        )?;
 
         // Transformer blocks (subset)
         let mut transformer_blocks = Vec::with_capacity(config.num_layers);
@@ -329,7 +342,11 @@ mod tests {
         let output = zero_linear.forward(&input)?;
         let max_val = output.abs()?.max_all()?.to_scalar::<f32>()?;
 
-        assert!(max_val < 1e-6, "Zero-initialized output should be zero, got max: {}", max_val);
+        assert!(
+            max_val < 1e-6,
+            "Zero-initialized output should be zero, got max: {}",
+            max_val
+        );
 
         Ok(())
     }

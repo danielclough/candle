@@ -138,7 +138,8 @@ impl FlowMatchEulerDiscreteScheduler {
             (0..num_inference_steps)
                 .map(|i| {
                     sigma_max
-                        - (sigma_max - sigma_min) * i as f64 / (num_inference_steps - 1).max(1) as f64
+                        - (sigma_max - sigma_min) * i as f64
+                            / (num_inference_steps - 1).max(1) as f64
                 })
                 .collect()
         };

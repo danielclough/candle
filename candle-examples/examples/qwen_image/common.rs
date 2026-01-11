@@ -8,9 +8,9 @@
 //! - Scheduler setup
 
 use anyhow::{anyhow, Result};
+use candle::quantized::gguf_file;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle::quantized::gguf_file;
 use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
     qwen_image::{
@@ -36,11 +36,15 @@ pub const DEFAULT_TRANSFORMER_ID: &str = "Qwen/Qwen-Image";
 
 /// Default GGUF model paths (HuggingFace format: owner/repo/filename).
 /// Text encoder and vision encoder use Qwen2.5-VL GGUF files from unsloth.
-pub const DEFAULT_GGUF_TEXT_ENCODER: &str = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf";
+pub const DEFAULT_GGUF_TEXT_ENCODER: &str =
+    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf";
 /// Vision encoder (mmproj) files at different precision levels - matched to working dtype.
-pub const DEFAULT_GGUF_VISION_ENCODER_F32: &str = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F32.gguf";
-pub const DEFAULT_GGUF_VISION_ENCODER_F16: &str = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F16.gguf";
-pub const DEFAULT_GGUF_VISION_ENCODER_BF16: &str = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-BF16.gguf";
+pub const DEFAULT_GGUF_VISION_ENCODER_F32: &str =
+    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F32.gguf";
+pub const DEFAULT_GGUF_VISION_ENCODER_F16: &str =
+    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F16.gguf";
+pub const DEFAULT_GGUF_VISION_ENCODER_BF16: &str =
+    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-BF16.gguf";
 /// Default GGUF transformer from city96/Qwen-Image-gguf.
 /// Available quants: Q2_K (7GB), Q3_K_M (9.7GB), Q4_K_M (13GB), Q5_K_M (15GB), Q8_0 (22GB), BF16 (41GB)
 pub const DEFAULT_GGUF_TRANSFORMER: &str = "city96/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf";
@@ -182,7 +186,11 @@ pub fn load_image_for_vae(
     }
 
     // Shape: [1, 3, 1, height, width] for 3D VAE - (B, C, T, H, W) convention
-    Ok(Tensor::from_vec(data, (1, 3, 1, target_height, target_width), device)?)
+    Ok(Tensor::from_vec(
+        data,
+        (1, 3, 1, target_height, target_width),
+        device,
+    )?)
 }
 
 /// Load a grayscale mask image and resize to latent dimensions.
@@ -334,12 +342,10 @@ pub fn load_transformer(
     dtype: DType,
 ) -> Result<QwenImageTransformer2DModel> {
     let model_files = match transformer_path {
-        Some(path) => {
-            candle_examples::hub_load_local_safetensors(
-                path,
-                "diffusion_pytorch_model.safetensors.index.json",
-            )?
-        }
+        Some(path) => candle_examples::hub_load_local_safetensors(
+            path,
+            "diffusion_pytorch_model.safetensors.index.json",
+        )?,
         None => {
             let repo = api.repo(hf_hub::Repo::model(model_id.to_string()));
             candle_examples::hub_load_safetensors(
@@ -370,7 +376,9 @@ pub fn load_transformer_quantized(
     println!("Loading quantized transformer from {}...", gguf_path);
     let mut file = std::fs::File::open(gguf_path)?;
     let content = gguf_file::Content::read(&mut file)?;
-    Ok(QwenImageTransformer2DModelQuantized::from_gguf(content, &mut file, device, dtype)?)
+    Ok(QwenImageTransformer2DModelQuantized::from_gguf(
+        content, &mut file, device, dtype,
+    )?)
 }
 
 // ============================================================================
@@ -402,7 +410,9 @@ impl TransformerVariant {
     ) -> candle::Result<Tensor> {
         match self {
             Self::FP16(model) => model.forward(img, txt, txt_mask, timestep, img_shapes, txt_lens),
-            Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes, txt_lens, dtype),
+            Self::Quantized(model) => {
+                model.forward(img, txt, timestep, img_shapes, txt_lens, dtype)
+            }
         }
     }
 
@@ -478,10 +488,20 @@ impl TextEncoderVariant {
     ) -> candle::Result<Tensor> {
         match self {
             Self::FP16(model) => model.forward_with_vision(
-                input_ids, vision_embeds, image_grid_thw, attention_mask, spatial_merge_size, image_token_id
+                input_ids,
+                vision_embeds,
+                image_grid_thw,
+                attention_mask,
+                spatial_merge_size,
+                image_token_id,
             ),
             Self::Quantized(model) => model.forward_with_vision(
-                input_ids, vision_embeds, image_grid_thw, attention_mask, spatial_merge_size, image_token_id
+                input_ids,
+                vision_embeds,
+                image_grid_thw,
+                attention_mask,
+                spatial_merge_size,
+                image_token_id,
             ),
         }
     }
@@ -548,7 +568,10 @@ pub fn load_vision_encoder_variant(
         let default_mmproj = default_mmproj_for_dtype(dtype);
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
         let resolved_path = resolve_gguf_path(gguf_value, default_mmproj, api)?;
-        println!("Loading vision encoder from mmproj GGUF: {:?}...", resolved_path);
+        println!(
+            "Loading vision encoder from mmproj GGUF: {:?}...",
+            resolved_path
+        );
 
         let mut file = std::fs::File::open(&resolved_path)?;
         let content = gguf_file::Content::read(&mut file)?;

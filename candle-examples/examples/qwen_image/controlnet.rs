@@ -116,7 +116,10 @@ pub fn run(
     // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
     // Use PyTorch-compatible RNG for consistent noise distribution
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let latents = rng.randn(
         &[1, 16, 1, dims.latent_height, dims.latent_width],
@@ -124,7 +127,10 @@ pub fn run(
         DType::F32,
     )?;
 
-    println!("  Latent size: {}x{}", dims.latent_height, dims.latent_width);
+    println!(
+        "  Latent size: {}x{}",
+        dims.latent_height, dims.latent_width
+    );
 
     // =========================================================================
     // Stage 4: Load ControlNet
@@ -178,11 +184,7 @@ pub fn run(
         "  Running {} denoising steps with ControlNet...",
         args.num_inference_steps
     );
-    for (step, &timestep) in timesteps
-        .iter()
-        .take(args.num_inference_steps)
-        .enumerate()
-    {
+    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
         if step % 10 == 0 || step == args.num_inference_steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
@@ -220,8 +222,14 @@ pub fn run(
         )?;
 
         // Negative prediction (without ControlNet for True CFG)
-        let neg_pred =
-            transformer.forward(&packed, &neg_embeds, &neg_mask, &t, &img_shapes, &txt_seq_lens)?;
+        let neg_pred = transformer.forward(
+            &packed,
+            &neg_embeds,
+            &neg_mask,
+            &t,
+            &img_shapes,
+            &txt_seq_lens,
+        )?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;

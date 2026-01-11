@@ -109,7 +109,8 @@ pub fn get_number_of_image_patches(
     let merge_size = merge_size.unwrap_or(DEFAULT_MERGE_SIZE);
 
     let factor = patch_size * merge_size;
-    let (resized_height, resized_width) = smart_resize(height, width, factor, min_pixels, max_pixels);
+    let (resized_height, resized_width) =
+        smart_resize(height, width, factor, min_pixels, max_pixels);
 
     let grid_h = resized_height / patch_size;
     let grid_w = resized_width / patch_size;
@@ -139,7 +140,12 @@ pub fn get_number_of_image_tokens(
 ) -> usize {
     let merge_size = merge_size.unwrap_or(DEFAULT_MERGE_SIZE);
     let num_patches = get_number_of_image_patches(
-        height, width, min_pixels, max_pixels, patch_size, Some(merge_size),
+        height,
+        width,
+        min_pixels,
+        max_pixels,
+        patch_size,
+        Some(merge_size),
     );
     num_patches / (merge_size * merge_size)
 }
@@ -176,7 +182,8 @@ pub fn get_number_of_video_patches(
     let temporal_patch_size = temporal_patch_size.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE);
 
     let factor = patch_size * merge_size;
-    let (resized_height, resized_width) = smart_resize(height, width, factor, min_pixels, max_pixels);
+    let (resized_height, resized_width) =
+        smart_resize(height, width, factor, min_pixels, max_pixels);
 
     let grid_h = resized_height / patch_size;
     let grid_w = resized_width / patch_size;
@@ -250,7 +257,8 @@ pub fn get_image_grid_thw(
     let merge_size = merge_size.unwrap_or(DEFAULT_MERGE_SIZE);
 
     let factor = patch_size * merge_size;
-    let (resized_height, resized_width) = smart_resize(height, width, factor, min_pixels, max_pixels);
+    let (resized_height, resized_width) =
+        smart_resize(height, width, factor, min_pixels, max_pixels);
 
     let grid_h = resized_height / patch_size;
     let grid_w = resized_width / patch_size;
@@ -290,7 +298,8 @@ pub fn get_video_grid_thw(
     let temporal_patch_size = temporal_patch_size.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE);
 
     let factor = patch_size * merge_size;
-    let (resized_height, resized_width) = smart_resize(height, width, factor, min_pixels, max_pixels);
+    let (resized_height, resized_width) =
+        smart_resize(height, width, factor, min_pixels, max_pixels);
 
     let grid_t = num_frames / temporal_patch_size;
     let grid_h = resized_height / patch_size;
@@ -470,7 +479,8 @@ pub fn patchify_video(
                         for c in 0..channels {
                             for t_sub in 0..temporal_patch_size {
                                 // Get frame index, repeat last frame if padded
-                                let frame_idx = (t * temporal_patch_size + t_sub).min(num_frames - 1);
+                                let frame_idx =
+                                    (t * temporal_patch_size + t_sub).min(num_frames - 1);
                                 let frame_data = &frames_data[frame_idx];
 
                                 for ph in 0..patch_size {
@@ -549,7 +559,13 @@ impl ProcessorConfig {
 
     /// Compute target dimensions for an image.
     pub fn compute_size(&self, height: usize, width: usize) -> (usize, usize) {
-        smart_resize(height, width, self.factor(), self.min_pixels, self.max_pixels)
+        smart_resize(
+            height,
+            width,
+            self.factor(),
+            self.min_pixels,
+            self.max_pixels,
+        )
     }
 
     /// Compute the grid dimensions (T, H, W) for an image.

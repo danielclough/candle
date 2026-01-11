@@ -14,8 +14,8 @@ use candle_transformers::models::{
         DEFAULT_MIN_PIXELS,
     },
     qwen_image::{
-        apply_true_cfg, pack_latents, unpack_latents, Config, TiledDecodeConfig,
-        EDIT_DROP_TOKENS, EDIT_PROMPT_TEMPLATE,
+        apply_true_cfg, pack_latents, unpack_latents, Config, TiledDecodeConfig, EDIT_DROP_TOKENS,
+        EDIT_PROMPT_TEMPLATE,
     },
 };
 use tokenizers::Tokenizer;
@@ -58,18 +58,20 @@ pub struct EditModelPaths {
     pub tokenizer_path: Option<String>,
 }
 
-pub fn run(
-    args: EditArgs,
-    paths: EditModelPaths,
-    device: &Device,
-    dtype: DType,
-) -> Result<()> {
+pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType) -> Result<()> {
     println!("Qwen-Image Edit");
     println!("Device: {:?}, DType: {:?}", device, dtype);
     println!("Model: {}", args.model_id);
     println!("Input image: {}", args.input_image);
     println!("Prompt: {}", args.prompt);
-    println!("Negative prompt: {}", if args.negative_prompt.is_empty() { "(none)" } else { &args.negative_prompt });
+    println!(
+        "Negative prompt: {}",
+        if args.negative_prompt.is_empty() {
+            "(none)"
+        } else {
+            &args.negative_prompt
+        }
+    );
     println!("CFG scale: {}", args.true_cfg_scale);
     println!("Steps: {}", args.num_inference_steps);
 
@@ -152,7 +154,8 @@ pub fn run(
     );
 
     // Compute vision embeddings (convert to F32 for text encoder which uses F32)
-    let vision_embeds = vision_model.forward(&pixel_values, &image_grid_thw)?
+    let vision_embeds = vision_model
+        .forward(&pixel_values, &image_grid_thw)?
         .to_dtype(DType::F32)?;
     let num_image_tokens = vision_embeds.dim(0)?;
     println!("  Vision embeddings: {} tokens", num_image_tokens);
@@ -167,7 +170,11 @@ pub fn run(
         &api,
         device,
     )?;
-    let encoder_type = if text_model.is_quantized() { "quantized GGUF" } else { "FP16" };
+    let encoder_type = if text_model.is_quantized() {
+        "quantized GGUF"
+    } else {
+        "FP16"
+    };
     println!("  Text encoder loaded ({})", encoder_type);
 
     // Encode prompts with vision (text encoder outputs F32, convert to transformer dtype)
@@ -218,15 +225,20 @@ pub fn run(
     // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
     let seed = args.seed.unwrap_or_else(|| {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     });
     println!("  Using seed: {}", seed);
     let mut rng = MtBoxMullerRng::new(seed);
-    let noise_latents = rng.randn(
-        &[1, 1, 16, dims.latent_height, dims.latent_width],
-        &Device::Cpu,
-        DType::F32,
-    )?.to_device(device)?;
+    let noise_latents = rng
+        .randn(
+            &[1, 1, 16, dims.latent_height, dims.latent_width],
+            &Device::Cpu,
+            DType::F32,
+        )?
+        .to_device(device)?;
 
     let packed_noise = pack_latents(&noise_latents, dims.latent_height, dims.latent_width)?;
 
@@ -245,8 +257,15 @@ pub fn run(
         device,
         dtype,
     )?;
-    let model_type = if transformer.is_quantized() { "quantized GGUF" } else { "FP16" };
-    println!("  Transformer loaded ({} layers, {})", config.num_layers, model_type);
+    let model_type = if transformer.is_quantized() {
+        "quantized GGUF"
+    } else {
+        "FP16"
+    };
+    println!(
+        "  Transformer loaded ({} layers, {})",
+        config.num_layers, model_type
+    );
 
     // =========================================================================
     // Stage 5: Denoising loop
@@ -255,8 +274,8 @@ pub fn run(
 
     // Image shapes for RoPE: noise + image regions (both same size)
     let img_shapes = vec![
-        (1, dims.packed_height, dims.packed_width),  // Noise latents
-        (1, dims.packed_height, dims.packed_width),  // Image latents
+        (1, dims.packed_height, dims.packed_width), // Noise latents
+        (1, dims.packed_height, dims.packed_width), // Image latents
     ];
     // Text sequence lengths for RoPE - must match actual embedding lengths!
     // Positive and negative prompts may have different token counts.
@@ -266,11 +285,7 @@ pub fn run(
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
-    for (step, &timestep) in timesteps
-        .iter()
-        .take(args.num_inference_steps)
-        .enumerate()
-    {
+    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
         if step % 10 == 0 || step == args.num_inference_steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
@@ -302,7 +317,9 @@ pub fn run(
         let pos_pred = pos_pred.narrow(1, 0, noise_seq_len)?;
 
         // Only apply CFG if we have a negative prompt (matching Python behavior)
-        let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) = (&neg_embeds, &neg_mask, &neg_txt_seq_lens) {
+        let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) =
+            (&neg_embeds, &neg_mask, &neg_txt_seq_lens)
+        {
             let neg_pred = transformer.forward(
                 &latent_model_input,
                 neg_embeds,
@@ -386,13 +403,8 @@ fn preprocess_image_for_vision(
 
     let factor = VISION_PATCH_SIZE * VISION_MERGE_SIZE;
     let max_px = max_pixels.unwrap_or(DEFAULT_MAX_PIXELS);
-    let (resized_height, resized_width) = smart_resize(
-        orig_height,
-        orig_width,
-        factor,
-        DEFAULT_MIN_PIXELS,
-        max_px,
-    );
+    let (resized_height, resized_width) =
+        smart_resize(orig_height, orig_width, factor, DEFAULT_MIN_PIXELS, max_px);
 
     // Use CatmullRom (bicubic) to match PyTorch's default resample method
     let resized = img.resize_exact(

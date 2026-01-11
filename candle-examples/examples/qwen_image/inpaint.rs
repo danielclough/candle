@@ -67,7 +67,10 @@ pub fn run(
     );
 
     let dims = common::calculate_latent_dims(target_height, target_width);
-    println!("  Latent size: {}x{}", dims.latent_height, dims.latent_width);
+    println!(
+        "  Latent size: {}x{}",
+        dims.latent_height, dims.latent_width
+    );
 
     // Encode input image
     let input_image =
@@ -134,7 +137,10 @@ pub fn run(
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use PyTorch-compatible RNG for consistent noise distribution
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let noise = rng.randn(
         &[1, 16, 1, dims.latent_height, dims.latent_width],
@@ -167,15 +173,8 @@ pub fn run(
     let timesteps = scheduler.timesteps().to_vec();
     let sigmas = scheduler.sigmas().to_vec();
 
-    println!(
-        "  Running {} denoising steps...",
-        args.num_inference_steps
-    );
-    for (step, &timestep) in timesteps
-        .iter()
-        .take(args.num_inference_steps)
-        .enumerate()
-    {
+    println!("  Running {} denoising steps...", args.num_inference_steps);
+    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
         if step % 10 == 0 || step == args.num_inference_steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
@@ -197,10 +196,22 @@ pub fn run(
         let packed = packed.to_dtype(dtype)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
-        let pos_pred =
-            transformer.forward(&packed, &pos_embeds, &pos_mask, &t, &img_shapes, &txt_seq_lens)?;
-        let neg_pred =
-            transformer.forward(&packed, &neg_embeds, &neg_mask, &t, &img_shapes, &txt_seq_lens)?;
+        let pos_pred = transformer.forward(
+            &packed,
+            &pos_embeds,
+            &pos_mask,
+            &t,
+            &img_shapes,
+            &txt_seq_lens,
+        )?;
+        let neg_pred = transformer.forward(
+            &packed,
+            &neg_embeds,
+            &neg_mask,
+            &t,
+            &img_shapes,
+            &txt_seq_lens,
+        )?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;

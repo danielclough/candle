@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::models::with_tracing::QMatMul;
 
-use super::rope::{timestep_embedding, apply_rotary_emb_qwen, QwenEmbedRope};
+use super::rope::{apply_rotary_emb_qwen, timestep_embedding, QwenEmbedRope};
 
 // ============================================================================
 // QLinear: Quantized Linear with Bias Support
@@ -336,16 +336,19 @@ impl QwenImageTransformerBlockQuantized {
 
         // Joint attention
         let (img_attn, txt_attn) =
-            self.attn.forward(&img_modulated, &txt_modulated, img_freqs, txt_freqs)?;
+            self.attn
+                .forward(&img_modulated, &txt_modulated, img_freqs, txt_freqs)?;
 
         // Gated residual (in F32 for numerical stability due to large values)
         let img_gated = img_mod1.gate(&img_attn)?;
-        let img = img.to_dtype(DType::F32)?
+        let img = img
+            .to_dtype(DType::F32)?
             .add(&img_gated.to_dtype(DType::F32)?)?
             .to_dtype(img.dtype())?;
 
         let txt_gated = txt_mod1.gate(&txt_attn)?;
-        let txt = txt.to_dtype(DType::F32)?
+        let txt = txt
+            .to_dtype(DType::F32)?
             .add(&txt_gated.to_dtype(DType::F32)?)?
             .to_dtype(txt.dtype())?;
 
@@ -361,11 +364,13 @@ impl QwenImageTransformerBlockQuantized {
         let txt_mlp_gated = txt_mod2.gate(&txt_mlp_out)?;
 
         // Final residual (in F32)
-        let img = img.to_dtype(DType::F32)?
+        let img = img
+            .to_dtype(DType::F32)?
             .add(&img_mlp_gated.to_dtype(DType::F32)?)?
             .to_dtype(img.dtype())?;
 
-        let txt = txt.to_dtype(DType::F32)?
+        let txt = txt
+            .to_dtype(DType::F32)?
             .add(&txt_mlp_gated.to_dtype(DType::F32)?)?
             .to_dtype(txt.dtype())?;
 
@@ -428,11 +433,8 @@ impl QwenImageTransformer2DModelQuantized {
         };
 
         // Model dimensions
-        let inner_dim = get_u32(&[
-            "qwen_image.inner_dim",
-            "transformer.inner_dim",
-        ])
-        .unwrap_or(3072) as usize;
+        let inner_dim =
+            get_u32(&["qwen_image.inner_dim", "transformer.inner_dim"]).unwrap_or(3072) as usize;
 
         let num_heads = get_u32(&[
             "qwen_image.num_attention_heads",
@@ -442,23 +444,17 @@ impl QwenImageTransformer2DModelQuantized {
 
         let head_dim = inner_dim / num_heads;
 
-        let num_layers = get_u32(&[
-            "qwen_image.num_layers",
-            "transformer.num_layers",
-        ])
-        .unwrap_or(60) as usize;
+        let num_layers =
+            get_u32(&["qwen_image.num_layers", "transformer.num_layers"]).unwrap_or(60) as usize;
 
-        let patch_size = get_u32(&["qwen_image.patch_size"])
-            .unwrap_or(2) as usize;
+        let patch_size = get_u32(&["qwen_image.patch_size"]).unwrap_or(2) as usize;
 
-        let out_channels = get_u32(&["qwen_image.out_channels"])
-            .unwrap_or(16) as usize;
+        let out_channels = get_u32(&["qwen_image.out_channels"]).unwrap_or(16) as usize;
 
-        let _joint_attention_dim = get_u32(&["qwen_image.joint_attention_dim"])
-            .unwrap_or(3584) as usize;
+        let _joint_attention_dim =
+            get_u32(&["qwen_image.joint_attention_dim"]).unwrap_or(3584) as usize;
 
-        let _in_channels = get_u32(&["qwen_image.in_channels"])
-            .unwrap_or(64) as usize;
+        let _in_channels = get_u32(&["qwen_image.in_channels"]).unwrap_or(64) as usize;
 
         let theta = 10000usize;
         let axes_dims = (16usize, 56usize, 56usize);

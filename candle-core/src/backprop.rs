@@ -366,20 +366,20 @@ impl Tensor {
                         // Compute output padding needed to reconstruct input shape
                         let grad_d = grad.dim(2)?;
                         let k_d = kernel.dim(2)?;
-                        let out_size_d = (grad_d - 1) * stride_d + dilation_d * (k_d - 1) + 1
-                            - 2 * padding_d;
+                        let out_size_d =
+                            (grad_d - 1) * stride_d + dilation_d * (k_d - 1) + 1 - 2 * padding_d;
                         let out_padding_d = arg.dim(2)? - out_size_d;
 
                         let grad_h = grad.dim(3)?;
                         let k_h = kernel.dim(3)?;
-                        let out_size_h = (grad_h - 1) * stride_h + dilation_h * (k_h - 1) + 1
-                            - 2 * padding_h;
+                        let out_size_h =
+                            (grad_h - 1) * stride_h + dilation_h * (k_h - 1) + 1 - 2 * padding_h;
                         let out_padding_h = arg.dim(3)? - out_size_h;
 
                         let grad_w = grad.dim(4)?;
                         let k_w = kernel.dim(4)?;
-                        let out_size_w = (grad_w - 1) * stride_w + dilation_w * (k_w - 1) + 1
-                            - 2 * padding_w;
+                        let out_size_w =
+                            (grad_w - 1) * stride_w + dilation_w * (k_w - 1) + 1 - 2 * padding_w;
                         let out_padding_w = arg.dim(4)? - out_size_w;
 
                         // Gradient w.r.t. input: conv_transpose3d(grad, kernel)
@@ -411,15 +411,14 @@ impl Tensor {
                         let sum_grad = grads.or_insert(kernel)?;
                         let (_, _, k0, k1, k2) = kernel.dims5()?;
                         let (_, _, g_k0, g_k1, g_k2) = grad_kernel.dims5()?;
-                        let grad_kernel =
-                            if g_k0 != k0 || g_k1 != k1 || g_k2 != k2 {
-                                grad_kernel
-                                    .narrow(2, 0, k0)?
-                                    .narrow(3, 0, k1)?
-                                    .narrow(4, 0, k2)?
-                            } else {
-                                grad_kernel
-                            };
+                        let grad_kernel = if g_k0 != k0 || g_k1 != k1 || g_k2 != k2 {
+                            grad_kernel
+                                .narrow(2, 0, k0)?
+                                .narrow(3, 0, k1)?
+                                .narrow(4, 0, k2)?
+                        } else {
+                            grad_kernel
+                        };
                         *sum_grad = sum_grad.add(&grad_kernel)?;
                     }
                     Op::ConvTranspose3D {

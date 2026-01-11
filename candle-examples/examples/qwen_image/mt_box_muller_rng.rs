@@ -250,7 +250,10 @@ mod tests {
         for (i, (rust, pytorch)) in values.iter().zip(pytorch_first_8.iter()).enumerate() {
             let diff = (rust - pytorch).abs();
             println!("  [{i}] rust={rust:.6}, pytorch={pytorch:.6}, diff={diff:.2e}");
-            assert!(diff < 1e-5, "Mismatch at index {i}: rust={rust}, pytorch={pytorch}");
+            assert!(
+                diff < 1e-5,
+                "Mismatch at index {i}: rust={rust}, pytorch={pytorch}"
+            );
         }
     }
 

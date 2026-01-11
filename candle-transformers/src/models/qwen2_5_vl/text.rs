@@ -48,13 +48,7 @@ fn flash_attn_windowed(
 }
 
 #[cfg(not(feature = "flash-attn"))]
-fn flash_attn_windowed(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Tensor,
-    _: f32,
-    _: usize,
-) -> Result<Tensor> {
+fn flash_attn_windowed(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: usize) -> Result<Tensor> {
     unimplemented!("compile with '--features flash-attn'")
 }
 
@@ -603,9 +597,9 @@ pub fn compute_mrope_position_ids_video(
 
                         // Qwen2.5-VL temporal scaling: frame_index * second_per_grid_t * tokens_per_second
                         let frame_index = vision_idx / (grid_h * grid_w);
-                        let t_pos =
-                            (frame_index as f32 * second_per_grid_t * tokens_per_second as f32)
-                                as i64;
+                        let t_pos = (frame_index as f32
+                            * second_per_grid_t
+                            * tokens_per_second as f32) as i64;
                         let spatial_idx = vision_idx % (grid_h * grid_w);
                         let h_pos = (spatial_idx / grid_w) as i64;
                         let w_pos = (spatial_idx % grid_w) as i64;
@@ -615,8 +609,8 @@ pub fn compute_mrope_position_ids_video(
                         pos_w[token_idx] = w_pos + offset;
                     }
 
-                    let max_t = ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32)
-                        as i64;
+                    let max_t =
+                        ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32) as i64;
                     let max_h = (grid_h - 1) as i64;
                     let max_w = (grid_w - 1) as i64;
                     current_pos = offset + max_t.max(max_h).max(max_w) + 1;
@@ -711,9 +705,9 @@ pub fn compute_mrope_position_ids_video_with_delta(
                     for vision_idx in 0..num_vision_tokens {
                         let token_idx = batch_start + v_start + vision_idx;
                         let frame_index = vision_idx / (grid_h * grid_w);
-                        let t_pos =
-                            (frame_index as f32 * second_per_grid_t * tokens_per_second as f32)
-                                as i64;
+                        let t_pos = (frame_index as f32
+                            * second_per_grid_t
+                            * tokens_per_second as f32) as i64;
                         let spatial_idx = vision_idx % (grid_h * grid_w);
                         let h_pos = (spatial_idx / grid_w) as i64;
                         let w_pos = (spatial_idx % grid_w) as i64;
@@ -723,8 +717,8 @@ pub fn compute_mrope_position_ids_video_with_delta(
                         pos_w[token_idx] = w_pos + offset;
                     }
 
-                    let max_t = ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32)
-                        as i64;
+                    let max_t =
+                        ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32) as i64;
                     let max_h = (grid_h - 1) as i64;
                     let max_w = (grid_w - 1) as i64;
                     current_pos = offset + max_t.max(max_h).max(max_w) + 1;
@@ -909,9 +903,11 @@ impl Attention {
             .transpose(1, 2)?;
 
         // Apply M-RoPE (no QK-norm in Qwen2.5-VL, unlike Qwen3-VL)
-        let (query_states, key_states) = self
-            .rotary_emb
-            .apply_multimodal_rotary_emb(&query_states, &key_states, position_ids)?;
+        let (query_states, key_states) = self.rotary_emb.apply_multimodal_rotary_emb(
+            &query_states,
+            &key_states,
+            position_ids,
+        )?;
 
         // KV cache
         let (key_states, value_states) = match &self.kv_cache {
@@ -1219,7 +1215,8 @@ impl Qwen25VLTextModel {
             // On the final chunk, apply norm and compute logits
             if chunk_idx == num_chunks - 1 {
                 hidden = hidden.apply(&self.norm)?;
-                return self.lm_head
+                return self
+                    .lm_head
                     .forward(&hidden)?
                     .i((.., chunk_len - 1, ..))?
                     .contiguous();
@@ -1256,8 +1253,7 @@ impl Qwen25VLTextModel {
         }
 
         let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-        let variance =
-            vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
+        let variance = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
         let std = variance.sqrt();
         let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
         let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -1355,8 +1351,12 @@ impl Qwen25VLTextModel {
             })
             .collect();
 
-        let position_ids =
-            compute_mrope_position_ids_multi(input_ids, image_token_id, &image_grids, &self.device)?;
+        let position_ids = compute_mrope_position_ids_multi(
+            input_ids,
+            image_token_id,
+            &image_grids,
+            &self.device,
+        )?;
 
         // 4. Create causal attention mask if sequence length > 1
         let causal_mask = if seq_len <= 1 {
@@ -1390,7 +1390,8 @@ impl Qwen25VLTextModel {
         // 5. Forward through all transformer layers
         let mut hidden_states = input_embeds;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+            hidden_states =
+                layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
         }
 
         // 6. Apply final layer norm (but NOT lm_head - we want hidden states)
@@ -1443,7 +1444,6 @@ impl Qwen25VLTextModel {
         // Combine with provided attention mask if any
         let attention_mask = match (causal_mask, attention_mask) {
             (Some(causal), Some(mask)) => {
-
                 // Expand mask to match causal mask shape: [batch, 1, 1, seq_len]
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
                 // Convert 0/1 mask to large_negative/0 additive mask
@@ -1458,9 +1458,7 @@ impl Qwen25VLTextModel {
 
                 Some(combined)
             }
-            (Some(causal), None) => {
-                Some(causal)
-            }
+            (Some(causal), None) => Some(causal),
             (None, Some(mask)) => {
                 let mask = mask.unsqueeze(1)?.unsqueeze(1)?;
                 // IMPORTANT: Cannot use (1-mask)*-inf because 0*-inf = NaN in IEEE 754!
@@ -1474,7 +1472,8 @@ impl Qwen25VLTextModel {
 
         // Forward through all transformer layers
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
+            hidden_states =
+                layer.forward(&hidden_states, attention_mask.as_ref(), &position_ids)?;
         }
 
         // Apply final layer norm - HuggingFace applies norm BEFORE adding to all_hidden_states,

@@ -190,8 +190,12 @@ impl QwenImageRMSNorm {
         // - [dim] - flat 1D (ideal case)
         // - [dim, 1, 1, 1] - for 5D tensors in residual blocks
         // - [dim, 1, 1] - for 4D tensors in attention blocks
-        let gamma = vb.get(dim, "gamma")
-            .or_else(|_| vb.get((dim, 1, 1, 1), "gamma").and_then(|g| g.flatten_all()))
+        let gamma = vb
+            .get(dim, "gamma")
+            .or_else(|_| {
+                vb.get((dim, 1, 1, 1), "gamma")
+                    .and_then(|g| g.flatten_all())
+            })
             .or_else(|_| vb.get((dim, 1, 1), "gamma").and_then(|g| g.flatten_all()))?;
         let scale = (dim as f64).sqrt();
         Ok(Self {
@@ -204,7 +208,11 @@ impl QwenImageRMSNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // L2 normalize along channel dimension
         // Matches PyTorch's F.normalize: v / max(||v||, eps)
-        let dim = if self.channel_first { 1 } else { x.dims().len() - 1 };
+        let dim = if self.channel_first {
+            1
+        } else {
+            x.dims().len() - 1
+        };
         let eps = 1e-12; // Match PyTorch's F.normalize default
 
         // Compute L2 norm: sqrt(sum(x^2, dim=dim, keepdim=True))
@@ -241,9 +249,23 @@ pub struct QwenImageResidualBlock {
 impl QwenImageResidualBlock {
     pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
         let norm1 = QwenImageRMSNorm::new(in_dim, true, vb.pp("norm1"))?;
-        let conv1 = QwenImageCausalConv3d::new(in_dim, out_dim, (3, 3, 3), (1, 1, 1), (1, 1, 1), vb.pp("conv1"))?;
+        let conv1 = QwenImageCausalConv3d::new(
+            in_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            vb.pp("conv1"),
+        )?;
         let norm2 = QwenImageRMSNorm::new(out_dim, true, vb.pp("norm2"))?;
-        let conv2 = QwenImageCausalConv3d::new(out_dim, out_dim, (3, 3, 3), (1, 1, 1), (1, 1, 1), vb.pp("conv2"))?;
+        let conv2 = QwenImageCausalConv3d::new(
+            out_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            vb.pp("conv2"),
+        )?;
 
         let conv_shortcut = if in_dim != out_dim {
             Some(QwenImageCausalConv3d::new(
@@ -267,7 +289,12 @@ impl QwenImageResidualBlock {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, cache: Option<&mut Vec<Option<Tensor>>>, cache_idx: &mut usize) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut Vec<Option<Tensor>>>,
+        cache_idx: &mut usize,
+    ) -> Result<Tensor> {
         // Shortcut
         let h = if let Some(conv) = &self.conv_shortcut {
             conv.forward(x, None)?
@@ -328,7 +355,12 @@ impl QwenImageAttentionBlock {
         let proj_bias = vb.get(dim, "proj.bias").ok();
         let proj = Conv2d::new(proj_weight, proj_bias, Default::default());
 
-        Ok(Self { norm, to_qkv, proj, dim })
+        Ok(Self {
+            norm,
+            to_qkv,
+            proj,
+            dim,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -390,14 +422,29 @@ impl QwenImageMidBlock {
 
         // Interleaved attention + resnet
         for i in 0..num_layers {
-            attentions.push(QwenImageAttentionBlock::new(dim, vb.pp(format!("attentions.{}", i)))?);
-            resnets.push(QwenImageResidualBlock::new(dim, dim, vb.pp(format!("resnets.{}", i + 1)))?);
+            attentions.push(QwenImageAttentionBlock::new(
+                dim,
+                vb.pp(format!("attentions.{}", i)),
+            )?);
+            resnets.push(QwenImageResidualBlock::new(
+                dim,
+                dim,
+                vb.pp(format!("resnets.{}", i + 1)),
+            )?);
         }
 
-        Ok(Self { resnets, attentions })
+        Ok(Self {
+            resnets,
+            attentions,
+        })
     }
 
-    pub fn forward(&self, x: &Tensor, mut cache: Option<&mut Vec<Option<Tensor>>>, cache_idx: &mut usize) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        mut cache: Option<&mut Vec<Option<Tensor>>>,
+        cache_idx: &mut usize,
+    ) -> Result<Tensor> {
         let mut x = self.resnets[0].forward(x, cache.as_deref_mut(), cache_idx)?;
 
         for (attn, resnet) in self.attentions.iter().zip(self.resnets[1..].iter()) {
@@ -463,7 +510,8 @@ impl Downsample2D {
 
         // Reshape back
         let (_, c_out, h_out, w_out) = x.dims4()?;
-        x.reshape((b, t, c_out, h_out, w_out))?.permute([0, 2, 1, 3, 4])
+        x.reshape((b, t, c_out, h_out, w_out))?
+            .permute([0, 2, 1, 3, 4])
     }
 }
 
@@ -480,7 +528,12 @@ impl Downsample3D {
         // This is required for single-frame images where T=1, allowing the kernel (3,1,1)
         // to have enough padded input to produce valid output.
         let time_conv = QwenImageCausalConv3d::new(
-            dim, dim, (3, 1, 1), (2, 1, 1), (1, 0, 0), vb.pp("time_conv")
+            dim,
+            dim,
+            (3, 1, 1),
+            (2, 1, 1),
+            (1, 0, 0),
+            vb.pp("time_conv"),
         )?;
         Ok(Self { conv_2d, time_conv })
     }
@@ -659,7 +712,8 @@ impl Upsample2D {
 
         // Reshape back
         let (_, c_out, h_out, w_out) = x.dims4()?;
-        x.reshape((b, t, c_out, h_out, w_out))?.permute([0, 2, 1, 3, 4])
+        x.reshape((b, t, c_out, h_out, w_out))?
+            .permute([0, 2, 1, 3, 4])
     }
 }
 
@@ -673,9 +727,17 @@ impl Upsample3D {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         let upsample_2d = Upsample2D::new(dim, vb.clone())?;
         let time_conv = QwenImageCausalConv3d::new(
-            dim, dim * 2, (3, 1, 1), (1, 1, 1), (1, 0, 0), vb.pp("time_conv")
+            dim,
+            dim * 2,
+            (3, 1, 1),
+            (1, 1, 1),
+            (1, 0, 0),
+            vb.pp("time_conv"),
         )?;
-        Ok(Self { upsample_2d, time_conv })
+        Ok(Self {
+            upsample_2d,
+            time_conv,
+        })
     }
 
     fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<Tensor> {
@@ -832,7 +894,11 @@ impl DiagonalGaussianDistribution {
         let mean = chunks[0].clone();
         let logvar = chunks[1].clamp(-30.0, 20.0)?;
         let std = (&logvar * 0.5)?.exp()?;
-        Ok(Self { mean, _logvar: logvar, std })
+        Ok(Self {
+            mean,
+            _logvar: logvar,
+            std,
+        })
     }
 
     /// Sample from the distribution (reparameterization trick).
@@ -1133,7 +1199,8 @@ impl AutoencoderKLQwenImage {
 
         // Blended overlap = a * (1 - weight) + b * weight
         let one_minus_w = (1.0 - &weights)?;
-        let blended = (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
+        let blended =
+            (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
 
         // Construct result: b with the overlap region replaced by blended values
         // For simplicity, we'll just return b with modified overlap region
@@ -1172,7 +1239,8 @@ impl AutoencoderKLQwenImage {
 
         // Blended overlap = a * (1 - weight) + b * weight
         let one_minus_w = (1.0 - &weights)?;
-        let blended = (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
+        let blended =
+            (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
 
         // Construct result: blended | b_rest
         if blend < w_b {

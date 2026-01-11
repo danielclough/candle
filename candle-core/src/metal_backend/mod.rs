@@ -1172,14 +1172,8 @@ impl BackendStorage for MetalStorage {
         let d_out = params.out_d();
         let h_out = params.out_h();
         let w_out = params.out_w();
-        let dst_el = dims[0]
-            * d_out
-            * h_out
-            * w_out
-            * dims[1]
-            * params.k_d
-            * params.k_h
-            * params.k_w;
+        let dst_el =
+            dims[0] * d_out * h_out * w_out * dims[1] * params.k_d * params.k_h * params.k_w;
 
         let dst = self
             .device

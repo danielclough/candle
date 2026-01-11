@@ -526,9 +526,17 @@ impl Conv3d {
 
 impl crate::Module for Conv3d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let padding = (self.config.padding, self.config.padding, self.config.padding);
+        let padding = (
+            self.config.padding,
+            self.config.padding,
+            self.config.padding,
+        );
         let stride = (self.config.stride, self.config.stride, self.config.stride);
-        let dilation = (self.config.dilation, self.config.dilation, self.config.dilation);
+        let dilation = (
+            self.config.dilation,
+            self.config.dilation,
+            self.config.dilation,
+        );
         let x = x.conv3d(&self.weight, padding, stride, dilation, self.config.groups)?;
         match &self.bias {
             None => Ok(x),
@@ -598,14 +606,22 @@ impl ConvTranspose3d {
 
 impl crate::Module for ConvTranspose3d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let padding = (self.config.padding, self.config.padding, self.config.padding);
+        let padding = (
+            self.config.padding,
+            self.config.padding,
+            self.config.padding,
+        );
         let output_padding = (
             self.config.output_padding,
             self.config.output_padding,
             self.config.output_padding,
         );
         let stride = (self.config.stride, self.config.stride, self.config.stride);
-        let dilation = (self.config.dilation, self.config.dilation, self.config.dilation);
+        let dilation = (
+            self.config.dilation,
+            self.config.dilation,
+            self.config.dilation,
+        );
         let x = x.conv_transpose3d(
             &self.weight,
             padding,

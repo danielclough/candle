@@ -34,15 +34,15 @@ pub mod vision;
 pub use config::{Config, RopeScaling, VisionConfig};
 pub use processing::{
     get_image_grid_thw, get_number_of_image_patches, get_number_of_image_tokens,
-    get_number_of_video_patches, get_number_of_video_tokens, get_video_grid_thw,
-    normalize_image, normalize_pixel, patchify_image, patchify_video, smart_resize,
-    ProcessorConfig, DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE, DEFAULT_MIN_PIXELS,
-    DEFAULT_PATCH_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
+    get_number_of_video_patches, get_number_of_video_tokens, get_video_grid_thw, normalize_image,
+    normalize_pixel, patchify_image, patchify_video, smart_resize, ProcessorConfig,
+    DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE, DEFAULT_MIN_PIXELS, DEFAULT_PATCH_SIZE,
+    DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
 };
 pub use text::{
     compute_mrope_position_ids, compute_mrope_position_ids_multi, compute_mrope_position_ids_video,
-    compute_mrope_position_ids_video_with_delta, compute_mrope_position_ids_with_delta,
-    ImageGrid, MRopePositionIds, Qwen25VLTextModel, VideoGrid,
+    compute_mrope_position_ids_video_with_delta, compute_mrope_position_ids_with_delta, ImageGrid,
+    MRopePositionIds, Qwen25VLTextModel, VideoGrid,
 };
 pub use vision::Qwen25VLVisionModel;
 
@@ -118,12 +118,8 @@ impl Qwen25VLModel {
             })
             .collect();
 
-        let position_ids = compute_mrope_position_ids_multi(
-            input_ids,
-            self.image_token_id,
-            &image_grids,
-            device,
-        )?;
+        let position_ids =
+            compute_mrope_position_ids_multi(input_ids, self.image_token_id, &image_grids, device)?;
 
         // 4. Find image placeholder positions and replace with vision embeddings
         let input_ids_flat: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
@@ -159,9 +155,10 @@ impl Qwen25VLModel {
 
         // 5. Forward through text model (use chunked prefill if configured)
         match self.prefill_chunk_size {
-            Some(chunk_size) => self
-                .text
-                .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size),
+            Some(chunk_size) => {
+                self.text
+                    .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size)
+            }
             None => self.text.forward_with_mrope(input_embeds, &position_ids),
         }
     }
@@ -240,9 +237,10 @@ impl Qwen25VLModel {
 
         // 5. Forward through text model (use chunked prefill if configured)
         match self.prefill_chunk_size {
-            Some(chunk_size) => self
-                .text
-                .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size),
+            Some(chunk_size) => {
+                self.text
+                    .forward_with_mrope_chunked(input_embeds, &position_ids, chunk_size)
+            }
             None => self.text.forward_with_mrope(input_embeds, &position_ids),
         }
     }
@@ -310,13 +308,19 @@ impl Qwen25VLModel {
             })
             .collect();
 
-        let mrope_result =
-            compute_mrope_position_ids_with_delta(input_ids, self.image_token_id, &image_grids, device)?;
+        let mrope_result = compute_mrope_position_ids_with_delta(
+            input_ids,
+            self.image_token_id,
+            &image_grids,
+            device,
+        )?;
         let mrope_delta = mrope_result.mrope_position_delta;
 
         // Prefill: process the full input with image
         // Squeeze batch dimension: [batch, vocab] -> [vocab] for sampler
-        let logits = self.forward(input_ids, pixel_values, image_grid_thw)?.squeeze(0)?;
+        let logits = self
+            .forward(input_ids, pixel_values, image_grid_thw)?
+            .squeeze(0)?;
         let mut generated: Vec<u32> = Vec::new();
         let mut next_token = sampler(&logits, &generated)?;
         generated.push(next_token);
@@ -337,7 +341,10 @@ impl Qwen25VLModel {
             let position_ids = Tensor::new(&[[[pos]], [[pos]], [[pos]]], device)?;
 
             let next_embeds = self.text.embed_tokens(&next_input)?;
-            let logits = self.text.forward_with_mrope(next_embeds, &position_ids)?.squeeze(0)?;
+            let logits = self
+                .text
+                .forward_with_mrope(next_embeds, &position_ids)?
+                .squeeze(0)?;
 
             next_token = sampler(&logits, &generated)?;
             generated.push(next_token);
@@ -409,13 +416,19 @@ impl Qwen25VLModel {
             })
             .collect();
 
-        let mrope_result =
-            compute_mrope_position_ids_with_delta(input_ids, self.image_token_id, &image_grids, device)?;
+        let mrope_result = compute_mrope_position_ids_with_delta(
+            input_ids,
+            self.image_token_id,
+            &image_grids,
+            device,
+        )?;
         let mrope_delta = mrope_result.mrope_position_delta;
 
         // Prefill: process the full input with image
         // Squeeze batch dimension: [batch, vocab] -> [vocab] for sampler
-        let logits = self.forward(input_ids, pixel_values, image_grid_thw)?.squeeze(0)?;
+        let logits = self
+            .forward(input_ids, pixel_values, image_grid_thw)?
+            .squeeze(0)?;
         let mut generated: Vec<u32> = Vec::new();
         let mut next_token = sampler(&logits, &generated)?;
         generated.push(next_token);
@@ -437,7 +450,10 @@ impl Qwen25VLModel {
             let position_ids = Tensor::new(&[[[pos]], [[pos]], [[pos]]], device)?;
 
             let next_embeds = self.text.embed_tokens(&next_input)?;
-            let logits = self.text.forward_with_mrope(next_embeds, &position_ids)?.squeeze(0)?;
+            let logits = self
+                .text
+                .forward_with_mrope(next_embeds, &position_ids)?
+                .squeeze(0)?;
 
             next_token = sampler(&logits, &generated)?;
             generated.push(next_token);
@@ -539,8 +555,14 @@ impl Qwen25VLModel {
 
         // Prefill: process the full input with video
         // Squeeze batch dimension: [batch, vocab] -> [vocab] for sampler
-        let logits =
-            self.forward_video(input_ids, pixel_values_video, video_grid_thw, second_per_grid_t)?.squeeze(0)?;
+        let logits = self
+            .forward_video(
+                input_ids,
+                pixel_values_video,
+                video_grid_thw,
+                second_per_grid_t,
+            )?
+            .squeeze(0)?;
         let mut generated: Vec<u32> = Vec::new();
         let mut next_token = sampler(&logits, &generated)?;
         generated.push(next_token);
@@ -561,7 +583,10 @@ impl Qwen25VLModel {
             let position_ids = Tensor::new(&[[[pos]], [[pos]], [[pos]]], device)?;
 
             let next_embeds = self.text.embed_tokens(&next_input)?;
-            let logits = self.text.forward_with_mrope(next_embeds, &position_ids)?.squeeze(0)?;
+            let logits = self
+                .text
+                .forward_with_mrope(next_embeds, &position_ids)?
+                .squeeze(0)?;
 
             next_token = sampler(&logits, &generated)?;
             generated.push(next_token);
@@ -627,8 +652,14 @@ impl Qwen25VLModel {
 
         // Prefill: process the full input with video
         // Squeeze batch dimension: [batch, vocab] -> [vocab] for sampler
-        let logits =
-            self.forward_video(input_ids, pixel_values_video, video_grid_thw, second_per_grid_t)?.squeeze(0)?;
+        let logits = self
+            .forward_video(
+                input_ids,
+                pixel_values_video,
+                video_grid_thw,
+                second_per_grid_t,
+            )?
+            .squeeze(0)?;
         let mut generated: Vec<u32> = Vec::new();
         let mut next_token = sampler(&logits, &generated)?;
         generated.push(next_token);
@@ -650,7 +681,10 @@ impl Qwen25VLModel {
             let position_ids = Tensor::new(&[[[pos]], [[pos]], [[pos]]], device)?;
 
             let next_embeds = self.text.embed_tokens(&next_input)?;
-            let logits = self.text.forward_with_mrope(next_embeds, &position_ids)?.squeeze(0)?;
+            let logits = self
+                .text
+                .forward_with_mrope(next_embeds, &position_ids)?
+                .squeeze(0)?;
 
             next_token = sampler(&logits, &generated)?;
             generated.push(next_token);

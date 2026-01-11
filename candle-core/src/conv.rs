@@ -204,19 +204,25 @@ pub struct ParamsConvTranspose3D {
 
 impl ParamsConvTranspose3D {
     pub(crate) fn out_d(&self) -> usize {
-        (self.i_d - 1) * self.stride_d + self.dilation_d * (self.k_d - 1) + self.output_padding_d
+        (self.i_d - 1) * self.stride_d
+            + self.dilation_d * (self.k_d - 1)
+            + self.output_padding_d
             + 1
             - 2 * self.padding_d
     }
 
     pub(crate) fn out_h(&self) -> usize {
-        (self.i_h - 1) * self.stride_h + self.dilation_h * (self.k_h - 1) + self.output_padding_h
+        (self.i_h - 1) * self.stride_h
+            + self.dilation_h * (self.k_h - 1)
+            + self.output_padding_h
             + 1
             - 2 * self.padding_h
     }
 
     pub(crate) fn out_w(&self) -> usize {
-        (self.i_w - 1) * self.stride_w + self.dilation_w * (self.k_w - 1) + self.output_padding_w
+        (self.i_w - 1) * self.stride_w
+            + self.dilation_w * (self.k_w - 1)
+            + self.output_padding_w
             + 1
             - 2 * self.padding_w
     }

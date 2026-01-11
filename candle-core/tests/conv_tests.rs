@@ -1026,13 +1026,11 @@ fn conv_transpose3d_with_params(dev: &Device) -> Result<()> {
 
 fn conv_transpose3d_grad(dev: &Device) -> Result<()> {
     // Test that gradients can be computed for ConvTranspose3D
-    let input = candle_core::Var::from_tensor(
-        &Tensor::arange(0f32, 16., dev)?.reshape((1, 2, 2, 2, 2))?,
-    )?;
+    let input =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 16., dev)?.reshape((1, 2, 2, 2, 2))?)?;
     // Kernel: [in_channels=2, out_channels=3, k_d=2, k_h=2, k_w=2]
-    let kernel = candle_core::Var::from_tensor(
-        &Tensor::arange(0f32, 48., dev)?.reshape((2, 3, 2, 2, 2))?,
-    )?;
+    let kernel =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 48., dev)?.reshape((2, 3, 2, 2, 2))?)?;
 
     let output = input.conv_transpose3d(&kernel, (0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
     assert_eq!(output.dims(), [1, 3, 3, 3, 3]);
@@ -1077,12 +1075,10 @@ fn conv_transpose3d_groups(dev: &Device) -> Result<()> {
 
 fn conv3d_grad(dev: &Device) -> Result<()> {
     // Test that gradients can be computed for Conv3D
-    let input = candle_core::Var::from_tensor(
-        &Tensor::arange(0f32, 32., dev)?.reshape((1, 2, 2, 2, 4))?,
-    )?;
-    let kernel = candle_core::Var::from_tensor(
-        &Tensor::arange(0f32, 16., dev)?.reshape((2, 2, 2, 2, 1))?,
-    )?;
+    let input =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 32., dev)?.reshape((1, 2, 2, 2, 4))?)?;
+    let kernel =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 16., dev)?.reshape((2, 2, 2, 2, 1))?)?;
 
     let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
     assert_eq!(output.dims(), [1, 2, 1, 1, 4]);
@@ -1127,11 +1123,36 @@ fn conv3d_batch(dev: &Device) -> Result<()> {
     Ok(())
 }
 
-test_device!(conv3d_basic, conv3d_basic_cpu, conv3d_basic_gpu, conv3d_basic_metal);
-test_device!(conv3d_padding, conv3d_padding_cpu, conv3d_padding_gpu, conv3d_padding_metal);
-test_device!(conv3d_stride, conv3d_stride_cpu, conv3d_stride_gpu, conv3d_stride_metal);
-test_device!(conv3d_dilation, conv3d_dilation_cpu, conv3d_dilation_gpu, conv3d_dilation_metal);
-test_device!(conv3d_groups, conv3d_groups_cpu, conv3d_groups_gpu, conv3d_groups_metal);
+test_device!(
+    conv3d_basic,
+    conv3d_basic_cpu,
+    conv3d_basic_gpu,
+    conv3d_basic_metal
+);
+test_device!(
+    conv3d_padding,
+    conv3d_padding_cpu,
+    conv3d_padding_gpu,
+    conv3d_padding_metal
+);
+test_device!(
+    conv3d_stride,
+    conv3d_stride_cpu,
+    conv3d_stride_gpu,
+    conv3d_stride_metal
+);
+test_device!(
+    conv3d_dilation,
+    conv3d_dilation_cpu,
+    conv3d_dilation_gpu,
+    conv3d_dilation_metal
+);
+test_device!(
+    conv3d_groups,
+    conv3d_groups_cpu,
+    conv3d_groups_gpu,
+    conv3d_groups_metal
+);
 test_device!(
     conv_transpose3d_basic,
     conv_transpose3d_basic_cpu,
@@ -1156,6 +1177,21 @@ test_device!(
     conv_transpose3d_groups_gpu,
     conv_transpose3d_groups_metal
 );
-test_device!(conv3d_grad, conv3d_grad_cpu, conv3d_grad_gpu, conv3d_grad_metal);
-test_device!(conv3d_1x1x1, conv3d_1x1x1_cpu, conv3d_1x1x1_gpu, conv3d_1x1x1_metal);
-test_device!(conv3d_batch, conv3d_batch_cpu, conv3d_batch_gpu, conv3d_batch_metal);
+test_device!(
+    conv3d_grad,
+    conv3d_grad_cpu,
+    conv3d_grad_gpu,
+    conv3d_grad_metal
+);
+test_device!(
+    conv3d_1x1x1,
+    conv3d_1x1x1_cpu,
+    conv3d_1x1x1_gpu,
+    conv3d_1x1x1_metal
+);
+test_device!(
+    conv3d_batch,
+    conv3d_batch_cpu,
+    conv3d_batch_gpu,
+    conv3d_batch_metal
+);

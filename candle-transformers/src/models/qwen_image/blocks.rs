@@ -18,7 +18,12 @@ use super::rope::apply_rotary_emb_qwen;
 ///
 /// This is used in Qwen-Image transformer blocks where the modulation provides
 /// the scale and shift instead of learned LayerNorm parameters.
-fn layer_norm_no_affine(size: usize, eps: f64, device: &candle::Device, dtype: DType) -> Result<LayerNorm> {
+fn layer_norm_no_affine(
+    size: usize,
+    eps: f64,
+    device: &candle::Device,
+    dtype: DType,
+) -> Result<LayerNorm> {
     let weight = Tensor::ones(size, dtype, device)?;
     Ok(LayerNorm::new_no_bias(weight, eps))
 }
@@ -102,19 +107,20 @@ pub fn apply_modulation_with_index(
     let one_minus_index = (1.0 - &index_expanded)?;
 
     // Select shift per token
-    let shift_result = (&shift_0.broadcast_mul(&one_minus_index)?
-        + &shift_1.broadcast_mul(&index_expanded)?)?;
+    let shift_result =
+        (&shift_0.broadcast_mul(&one_minus_index)? + &shift_1.broadcast_mul(&index_expanded)?)?;
 
     // Select scale per token
-    let scale_result = (&scale_0.broadcast_mul(&one_minus_index)?
-        + &scale_1.broadcast_mul(&index_expanded)?)?;
+    let scale_result =
+        (&scale_0.broadcast_mul(&one_minus_index)? + &scale_1.broadcast_mul(&index_expanded)?)?;
 
     // Select gate per token
-    let gate_result = (&gate_0.broadcast_mul(&one_minus_index)?
-        + &gate_1.broadcast_mul(&index_expanded)?)?;
+    let gate_result =
+        (&gate_0.broadcast_mul(&one_minus_index)? + &gate_1.broadcast_mul(&index_expanded)?)?;
 
     // Apply modulation: x * (1 + scale) + shift
-    let modulated = xs.broadcast_mul(&(&scale_result + 1.0)?)?
+    let modulated = xs
+        .broadcast_mul(&(&scale_result + 1.0)?)?
         .broadcast_add(&shift_result)?;
 
     Ok((modulated, gate_result))
@@ -252,11 +258,7 @@ impl AddedQkNorm {
 /// Scaled dot-product attention.
 ///
 /// Input shapes: Q, K, V are [batch, heads, seq, head_dim]
-fn scaled_dot_product_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-) -> Result<Tensor> {
+fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let head_dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (head_dim as f64).sqrt();
 
@@ -524,7 +526,13 @@ impl QwenImageTransformerBlock {
         temb: &Tensor,
         image_rotary_emb: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, None)
+        self.forward_impl(
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            image_rotary_emb,
+            None,
+        )
     }
 
     /// Forward pass with modulate_index for edit mode (zero_cond_t).
@@ -541,7 +549,13 @@ impl QwenImageTransformerBlock {
         image_rotary_emb: Option<&(Tensor, Tensor)>,
         modulate_index: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_impl(hidden_states, encoder_hidden_states, temb, image_rotary_emb, modulate_index)
+        self.forward_impl(
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            image_rotary_emb,
+            modulate_index,
+        )
     }
 
     /// Internal forward implementation handling both standard and edit modes.
@@ -590,7 +604,9 @@ impl QwenImageTransformerBlock {
         let txt_gate1 = txt_mod1.gate.clone();
 
         // Joint attention
-        let (img_attn_out, txt_attn_out) = self.attn.forward(&img_modulated, &txt_modulated, image_rotary_emb)?;
+        let (img_attn_out, txt_attn_out) =
+            self.attn
+                .forward(&img_modulated, &txt_modulated, image_rotary_emb)?;
 
         // === F32 ACCUMULATION FOR RESIDUAL ADDITIONS ===
         // The MLP outputs have std > 2000, and accumulated values reach ±2.3M
@@ -604,10 +620,10 @@ impl QwenImageTransformerBlock {
         // Residual add in F32 to avoid overflow, then cast back
         let hidden_states = (hidden_states.to_dtype(DType::F32)?
             + gated_img_attn.to_dtype(DType::F32)?)?
-            .to_dtype(orig_dtype)?;
+        .to_dtype(orig_dtype)?;
         let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
             + gated_txt_attn.to_dtype(DType::F32)?)?
-            .to_dtype(orig_dtype)?;
+        .to_dtype(orig_dtype)?;
 
         // === MLP phase ===
 
@@ -628,7 +644,7 @@ impl QwenImageTransformerBlock {
         // Residual add in F32
         let hidden_states = (hidden_states.to_dtype(DType::F32)?
             + gated_img_mlp.to_dtype(DType::F32)?)?
-            .to_dtype(orig_dtype)?;
+        .to_dtype(orig_dtype)?;
 
         // Text: norm2 + modulate + MLP + gated residual (always standard)
         let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
@@ -639,7 +655,7 @@ impl QwenImageTransformerBlock {
         // Residual add in F32
         let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
             + gated_txt_mlp.to_dtype(DType::F32)?)?
-            .to_dtype(orig_dtype)?;
+        .to_dtype(orig_dtype)?;
 
         Ok((encoder_hidden_states, hidden_states))
     }

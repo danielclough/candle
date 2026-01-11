@@ -89,13 +89,13 @@ use candle::quantized::gguf_file;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::models::quantized_qwen2_5_vl::{
+    load_vision_from_mmproj, ModelWeights as QuantizedTextModel, Qwen25VLQuantized,
+};
 use candle_transformers::models::qwen2_5_vl::{
     patchify_image, patchify_video, smart_resize, Config, ImageGrid, Qwen25VLModel,
     Qwen25VLVisionModel, DEFAULT_MAX_PIXELS, DEFAULT_MERGE_SIZE, DEFAULT_MIN_PIXELS,
     DEFAULT_PATCH_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE, IMAGE_MEAN, IMAGE_STD,
-};
-use candle_transformers::models::quantized_qwen2_5_vl::{
-    load_vision_from_mmproj, ModelWeights as QuantizedTextModel, Qwen25VLQuantized,
 };
 use candle_transformers::utils::apply_repeat_penalty;
 use clap::Parser;
@@ -373,8 +373,10 @@ struct Args {
 }
 
 // Default GGUF models (HuggingFace format: owner/repo/filename)
-const DEFAULT_GGUF_TEXT: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf";
-const DEFAULT_GGUF_VISION: &str = "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf";
+const DEFAULT_GGUF_TEXT: &str =
+    "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf";
+const DEFAULT_GGUF_VISION: &str =
+    "Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf";
 
 /// Resolve a GGUF path to a local file, downloading from HuggingFace if needed.
 ///
@@ -425,8 +427,13 @@ fn load_image(path: &str, device: &Device, dtype: DType) -> Result<(Tensor, Tens
     let (width, height) = (img.width() as usize, img.height() as usize);
 
     let factor = DEFAULT_PATCH_SIZE * DEFAULT_MERGE_SIZE; // 28
-    let (new_height, new_width) =
-        smart_resize(height, width, factor, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS);
+    let (new_height, new_width) = smart_resize(
+        height,
+        width,
+        factor,
+        DEFAULT_MIN_PIXELS,
+        DEFAULT_MAX_PIXELS,
+    );
 
     let resized = image::imageops::resize(
         &img,
@@ -554,8 +561,13 @@ fn load_video(
         .map_err(|e| E::msg(format!("Failed to decode frame: {}", e)))?
         .to_rgb8();
     let (width, height) = (first_img.width() as usize, first_img.height() as usize);
-    let (new_height, new_width) =
-        smart_resize(height, width, factor, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS);
+    let (new_height, new_width) = smart_resize(
+        height,
+        width,
+        factor,
+        DEFAULT_MIN_PIXELS,
+        DEFAULT_MAX_PIXELS,
+    );
 
     // Load and normalize all frames
     let mut frames_data: Vec<Vec<f32>> = Vec::with_capacity(num_frames);
@@ -606,13 +618,15 @@ fn load_video(
     let grid_t = num_frames.div_ceil(DEFAULT_TEMPORAL_PATCH_SIZE);
 
     let num_patches = grid_t * h_patches * w_patches;
-    let patch_elements =
-        3 * DEFAULT_TEMPORAL_PATCH_SIZE * DEFAULT_PATCH_SIZE * DEFAULT_PATCH_SIZE;
+    let patch_elements = 3 * DEFAULT_TEMPORAL_PATCH_SIZE * DEFAULT_PATCH_SIZE * DEFAULT_PATCH_SIZE;
 
     let pixel_values =
         Tensor::from_vec(patches, (num_patches, patch_elements), device)?.to_dtype(dtype)?;
 
-    let grid_thw = Tensor::new(&[[grid_t as u32, h_patches as u32, w_patches as u32]], device)?;
+    let grid_thw = Tensor::new(
+        &[[grid_t as u32, h_patches as u32, w_patches as u32]],
+        device,
+    )?;
 
     // second_per_grid_t = temporal_patch_size / fps
     let second_per_grid_t = DEFAULT_TEMPORAL_PATCH_SIZE as f32 / fps;
@@ -885,7 +899,9 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "flash-attn"))]
         {
-            eprintln!("Warning: flash-attn feature not enabled, compile with --features flash-attn");
+            eprintln!(
+                "Warning: flash-attn feature not enabled, compile with --features flash-attn"
+            );
             config.use_flash_attn = false;
         }
     }
@@ -1046,20 +1062,38 @@ fn main() -> Result<()> {
         (None, None, None) => Sampling::ArgMax,
         (Some(t), _, _) if t < 1e-7 => Sampling::ArgMax,
         // All three specified: top-k then top-p
-        (Some(temp), Some(k), Some(p)) => {
-            Sampling::TopKThenTopP { k, p, temperature: temp }
-        }
+        (Some(temp), Some(k), Some(p)) => Sampling::TopKThenTopP {
+            k,
+            p,
+            temperature: temp,
+        },
         // Temperature + top-k
-        (Some(temp), Some(k), None) => Sampling::TopK { k, temperature: temp },
+        (Some(temp), Some(k), None) => Sampling::TopK {
+            k,
+            temperature: temp,
+        },
         // Temperature + top-p (nucleus)
-        (Some(temp), None, Some(p)) => Sampling::TopP { p, temperature: temp },
+        (Some(temp), None, Some(p)) => Sampling::TopP {
+            p,
+            temperature: temp,
+        },
         // Temperature only (sample from full distribution)
         (Some(temp), None, None) => Sampling::All { temperature: temp },
         // Top-k without explicit temperature (use default 1.0)
-        (None, Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature: 1.0 },
-        (None, Some(k), None) => Sampling::TopK { k, temperature: 1.0 },
+        (None, Some(k), Some(p)) => Sampling::TopKThenTopP {
+            k,
+            p,
+            temperature: 1.0,
+        },
+        (None, Some(k), None) => Sampling::TopK {
+            k,
+            temperature: 1.0,
+        },
         // Top-p without explicit temperature (use default 1.0)
-        (None, None, Some(p)) => Sampling::TopP { p, temperature: 1.0 },
+        (None, None, Some(p)) => Sampling::TopP {
+            p,
+            temperature: 1.0,
+        },
     };
 
     let mut logits_processor = LogitsProcessor::from_sampling(args.seed, sampling.clone());
@@ -1134,7 +1168,10 @@ fn main() -> Result<()> {
 
         // Generate using video forward with sampling
         if args.stream {
-            println!("\nGenerating (streaming, max {} tokens)...\n", args.max_length);
+            println!(
+                "\nGenerating (streaming, max {} tokens)...\n",
+                args.max_length
+            );
             model.generate_video_streaming(
                 &input_ids,
                 &pixel_values,
@@ -1233,12 +1270,19 @@ fn main() -> Result<()> {
         if model.is_quantized() {
             // Quantized models use simpler greedy generation
             if args.stream {
-                eprintln!("Note: Streaming not supported for quantized models, using batch generation");
+                eprintln!(
+                    "Note: Streaming not supported for quantized models, using batch generation"
+                );
             }
             if args.temperature.is_some() || args.top_k.is_some() || args.top_p.is_some() {
-                eprintln!("Note: Sampling parameters ignored for quantized models (greedy decoding)");
+                eprintln!(
+                    "Note: Sampling parameters ignored for quantized models (greedy decoding)"
+                );
             }
-            println!("\nGenerating (quantized, greedy, max {} tokens)...", args.max_length);
+            println!(
+                "\nGenerating (quantized, greedy, max {} tokens)...",
+                args.max_length
+            );
             model.generate_greedy(
                 &input_ids,
                 &pixel_values,
@@ -1247,7 +1291,10 @@ fn main() -> Result<()> {
                 eos_token_id,
             )?
         } else if args.stream {
-            println!("\nGenerating (streaming, max {} tokens)...\n", args.max_length);
+            println!(
+                "\nGenerating (streaming, max {} tokens)...\n",
+                args.max_length
+            );
             model.generate_streaming(
                 &input_ids,
                 &pixel_values,

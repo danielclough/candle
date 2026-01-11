@@ -203,11 +203,8 @@ fn conv3d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
             for kh in 0..p.k_h {
                 for kw in 0..p.k_w {
                     for c_in_idx in 0..p.c_in {
-                        let k_idx = dst_c_idx * k_s0
-                            + c_in_idx * k_s1
-                            + kd * k_s2
-                            + kh * k_s3
-                            + kw * k_s4;
+                        let k_idx =
+                            dst_c_idx * k_s0 + c_in_idx * k_s1 + kd * k_s2 + kh * k_s3 + kw * k_s4;
                         k_flat.push(k[k_idx]);
                     }
                 }
@@ -376,11 +373,7 @@ fn conv3d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
                     let kh = rem / p.k_w;
                     let kw = rem % p.k_w;
                     (0..p.c_in).map(move |c_in_idx| {
-                        k[dst_c_idx * k_s0
-                            + c_in_idx * k_s1
-                            + kd * k_s2
-                            + kh * k_s3
-                            + kw * k_s4]
+                        k[dst_c_idx * k_s0 + c_in_idx * k_s1 + kd * k_s2 + kh * k_s3 + kw * k_s4]
                     })
                 })
                 .collect()
@@ -397,8 +390,7 @@ fn conv3d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
                         let k_cont =
                             &k_cache[dst_c_idx][k_offset * p.c_in..(k_offset + 1) * p.c_in];
                         let base_dst_idx = dst_c_idx * out_d * out_h * out_w;
-                        let batch_dst_idx =
-                            base_dst_idx + b_idx * p.c_out * out_d * out_h * out_w;
+                        let batch_dst_idx = base_dst_idx + b_idx * p.c_out * out_d * out_h * out_w;
                         let batch_src_idx = b_idx * cont_s0;
 
                         for dst_d in 0..out_d {
@@ -531,8 +523,8 @@ fn im2col_3d<T: WithDType + num_traits::Num + Copy + 'static>(
                     let mut k_idx = 0;
                     for c in 0..p.c_in {
                         for kd in 0..p.k_d {
-                            let id =
-                                (od * p.stride_d + kd * p.dilation_d) as isize - p.padding_d as isize;
+                            let id = (od * p.stride_d + kd * p.dilation_d) as isize
+                                - p.padding_d as isize;
                             for kh in 0..p.k_h {
                                 let ih = (oh * p.stride_h + kh * p.dilation_h) as isize
                                     - p.padding_h as isize;
@@ -540,23 +532,22 @@ fn im2col_3d<T: WithDType + num_traits::Num + Copy + 'static>(
                                     let iw = (ow * p.stride_w + kw * p.dilation_w) as isize
                                         - p.padding_w as isize;
 
-                                    col[col_offset + k_idx] =
-                                        if id >= 0
-                                            && id < p.i_d as isize
-                                            && ih >= 0
-                                            && ih < p.i_h as isize
-                                            && iw >= 0
-                                            && iw < p.i_w as isize
-                                        {
-                                            let inp_idx = b_idx * inp_s0
-                                                + c * inp_s1
-                                                + (id as usize) * inp_s2
-                                                + (ih as usize) * inp_s3
-                                                + (iw as usize) * inp_s4;
-                                            inp[inp_idx]
-                                        } else {
-                                            T::zero()
-                                        };
+                                    col[col_offset + k_idx] = if id >= 0
+                                        && id < p.i_d as isize
+                                        && ih >= 0
+                                        && ih < p.i_h as isize
+                                        && iw >= 0
+                                        && iw < p.i_w as isize
+                                    {
+                                        let inp_idx = b_idx * inp_s0
+                                            + c * inp_s1
+                                            + (id as usize) * inp_s2
+                                            + (ih as usize) * inp_s3
+                                            + (iw as usize) * inp_s4;
+                                        inp[inp_idx]
+                                    } else {
+                                        T::zero()
+                                    };
                                     k_idx += 1;
                                 }
                             }
@@ -643,12 +634,9 @@ impl Map2 for ConvTranspose3D<'_> {
                             for inp_d in 0..p.i_d {
                                 for inp_h in 0..p.i_h {
                                     for inp_w in 0..p.i_w {
-                                        let out_d_pos =
-                                            inp_d * p.stride_d + k_d * p.dilation_d;
-                                        let out_h_pos =
-                                            inp_h * p.stride_h + k_h * p.dilation_h;
-                                        let out_w_pos =
-                                            inp_w * p.stride_w + k_w * p.dilation_w;
+                                        let out_d_pos = inp_d * p.stride_d + k_d * p.dilation_d;
+                                        let out_h_pos = inp_h * p.stride_h + k_h * p.dilation_h;
+                                        let out_w_pos = inp_w * p.stride_w + k_w * p.dilation_w;
 
                                         if out_d_pos < p.padding_d
                                             || out_h_pos < p.padding_h

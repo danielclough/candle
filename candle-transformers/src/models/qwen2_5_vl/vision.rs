@@ -555,8 +555,7 @@ impl Qwen25VLVisionModel {
             // For each temporal frame
             for _t in 0..grid_t {
                 // Create index grid with padding (-1 indicates padding)
-                let mut index_padded =
-                    vec![vec![-1i64; llm_grid_w + pad_w]; llm_grid_h + pad_h];
+                let mut index_padded = vec![vec![-1i64; llm_grid_w + pad_w]; llm_grid_h + pad_h];
 
                 // Fill in actual indices
                 for (h, row) in index_padded.iter_mut().enumerate().take(llm_grid_h) {
@@ -583,8 +582,7 @@ impl Qwen25VLVisionModel {
                         if !window_indices.is_empty() {
                             let seqlen = window_indices.len() * self.spatial_merge_unit;
                             window_index.extend(window_indices);
-                            cu_window_seqlens
-                                .push(cu_window_seqlens.last().unwrap() + seqlen);
+                            cu_window_seqlens.push(cu_window_seqlens.last().unwrap() + seqlen);
                         }
                     }
                 }
@@ -620,14 +618,17 @@ impl Qwen25VLVisionModel {
         let grouped = seq_len / self.spatial_merge_unit;
 
         // Reshape to (grouped, spatial_merge_unit, hidden_dim)
-        let hidden_states = hidden_states.reshape((grouped, self.spatial_merge_unit, hidden_dim))?;
+        let hidden_states =
+            hidden_states.reshape((grouped, self.spatial_merge_unit, hidden_dim))?;
 
         // Reorder using window_index
         let window_index_u32: Vec<u32> = window_index.iter().map(|&x| x as u32).collect();
         let window_index_tensor =
             Tensor::from_vec(window_index_u32, (window_index.len(),), device)?;
         // NOTE: index_select may produce non-contiguous tensor, force contiguity for downstream ops
-        let mut hidden_states = hidden_states.index_select(&window_index_tensor, 0)?.contiguous()?;
+        let mut hidden_states = hidden_states
+            .index_select(&window_index_tensor, 0)?
+            .contiguous()?;
 
         // Reshape back to (seq_len, hidden_dim)
         hidden_states = hidden_states.reshape((seq_len, hidden_dim))?;
@@ -635,7 +636,9 @@ impl Qwen25VLVisionModel {
         // Reorder rotary position embeddings similarly
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
         let rotary_pos_emb = rotary_pos_emb.reshape((grouped, self.spatial_merge_unit, ()))?;
-        let rotary_pos_emb = rotary_pos_emb.index_select(&window_index_tensor, 0)?.contiguous()?;
+        let rotary_pos_emb = rotary_pos_emb
+            .index_select(&window_index_tensor, 0)?
+            .contiguous()?;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
 
         // Compute cos/sin for RoPE
@@ -668,7 +671,9 @@ impl Qwen25VLVisionModel {
         let reverse_index_tensor =
             Tensor::from_vec(reverse_indices, (window_index.len(),), device)?;
 
-        let output = hidden_states.index_select(&reverse_index_tensor, 0)?.contiguous()?;
+        let output = hidden_states
+            .index_select(&reverse_index_tensor, 0)?
+            .contiguous()?;
         Ok(output)
     }
 }
