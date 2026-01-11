@@ -337,61 +337,7 @@ pub fn encode_text_prompt(
         .to_dtype(DType::F32)?
         .unsqueeze(0)?;
 
-    // Debug: Check input tensors before forward pass
-    if std::env::var("QWEN_DEBUG").is_ok() {
-        // Check attention mask values
-        let mask_f32 = attention_mask_tensor.to_dtype(DType::F32)?;
-        let mask_vec: Vec<f32> = mask_f32.flatten_all()?.to_vec1()?;
-        let mask_min = mask_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mask_max = mask_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mask_sum: f32 = mask_vec.iter().sum();
-        let mask_len = attention_mask_tensor.dim(1)?;
-        println!("[DEBUG] attention_mask: shape={:?}, min={}, max={}, sum={} (expect sum={})",
-            attention_mask_tensor.dims(), mask_min, mask_max, mask_sum, mask_len);
-
-        // Warn if mask values are outside expected range [0, 1]
-        if mask_min < 0.0 || mask_max > 1.0 {
-            println!("[DEBUG] ⚠️  WARNING: attention_mask values outside [0, 1] range!");
-        }
-
-        // Check input_ids range
-        let ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-        let ids_min = *ids_vec.iter().min().unwrap_or(&0);
-        let ids_max = *ids_vec.iter().max().unwrap_or(&0);
-        println!("[DEBUG] input_ids: shape={:?}, min={}, max={}, num_tokens={}",
-            input_ids.dims(), ids_min, ids_max, ids_vec.len());
-
-        // Print first and last few tokens for context
-        if ids_vec.len() > 10 {
-            println!("[DEBUG] input_ids first 5: {:?}", &ids_vec[..5]);
-            println!("[DEBUG] input_ids last 5: {:?}", &ids_vec[ids_vec.len()-5..]);
-        } else {
-            println!("[DEBUG] input_ids all: {:?}", ids_vec);
-        }
-    }
-
     let hidden_states = text_model.forward_text_only(&input_ids, Some(&attention_mask_tensor))?;
-
-    // Debug: Check output hidden states for NaN
-    if std::env::var("QWEN_DEBUG").is_ok() {
-        let hs_f32 = hidden_states.to_dtype(DType::F32)?;
-        let hs_vec: Vec<f32> = hs_f32.flatten_all()?.to_vec1()?;
-        let nan_count = hs_vec.iter().filter(|x| x.is_nan()).count();
-        let inf_count = hs_vec.iter().filter(|x| x.is_infinite()).count();
-
-        if nan_count > 0 || inf_count > 0 {
-            println!("[DEBUG] ❌ hidden_states contains {} NaN, {} Inf values out of {}",
-                nan_count, inf_count, hs_vec.len());
-        } else {
-            let mean = hs_vec.iter().sum::<f32>() / hs_vec.len() as f32;
-            let variance = hs_vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / hs_vec.len() as f32;
-            let std = variance.sqrt();
-            let min = hs_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = hs_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!("[DEBUG] ✓ hidden_states: shape={:?}, mean={:.4}, std={:.4}, min={:.4}, max={:.4}",
-                hidden_states.dims(), mean, std, min, max);
-        }
-    }
 
     let seq_len = hidden_states.dim(1)?;
     if seq_len <= drop_tokens {

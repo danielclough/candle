@@ -448,15 +448,8 @@ fn encode_prompt_with_vision(
 
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-    // DEBUG: Print original tokens
-    eprintln!("[ENCODE_PROMPT] original tokens len: {}", tokens.len());
-    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID we're looking for: {}", IMAGE_TOKEN_ID);
-    let original_image_pos = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID);
-    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID found at position: {:?}", original_image_pos);
-
     // Expand image_pad token to the correct number
     if let Some(pos) = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID) {
-        eprintln!("[ENCODE_PROMPT] Expanding single IMAGE_TOKEN_ID at pos {} to {} copies", pos, num_image_tokens);
         let expanded: Vec<u32> = tokens[..pos]
             .iter()
             .chain(std::iter::repeat_n(&IMAGE_TOKEN_ID, num_image_tokens))
@@ -464,23 +457,9 @@ fn encode_prompt_with_vision(
             .copied()
             .collect();
         tokens = expanded;
-    } else {
-        eprintln!("[ENCODE_PROMPT] WARNING: No IMAGE_TOKEN_ID found in tokens!");
     }
 
     let seq_len = tokens.len();
-    eprintln!("[ENCODE_PROMPT] final tokens len: {}", seq_len);
-
-    // Verify expansion
-    let image_count = tokens.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
-    eprintln!("[ENCODE_PROMPT] IMAGE_TOKEN_ID count in final tokens: {}", image_count);
-
-    // Print tokens around the image region
-    if let Some(first_img_pos) = tokens.iter().position(|&t| t == IMAGE_TOKEN_ID) {
-        let start = first_img_pos.saturating_sub(3);
-        let end = (first_img_pos + 10).min(tokens.len());
-        eprintln!("[ENCODE_PROMPT] tokens[{}..{}] around image start: {:?}", start, end, &tokens[start..end]);
-    }
     let input_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
     let attention_mask = Tensor::ones((1, seq_len), DType::F32, device)?;
 

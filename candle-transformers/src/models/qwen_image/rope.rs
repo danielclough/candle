@@ -143,10 +143,6 @@ impl QwenEmbedRope {
     /// Tensor of shape [frame * height * width, total_dim/2, 2]
     fn compute_video_freqs(&self, frame: usize, height: usize, width: usize, idx: usize) -> Result<Tensor> {
         let seq_len = frame * height * width;
-        eprintln!("[DIFFUSION_ROPE] compute_video_freqs: frame={}, height={}, width={}, idx={}, scale_rope={}",
-            frame, height, width, idx, self.scale_rope);
-        eprintln!("[DIFFUSION_ROPE] axes_dim: {:?}, seq_len={}", self.axes_dim, seq_len);
-        let _device = self.pos_freqs.device();
 
         // Compute split offsets for axis: [frame_dim/2, height_dim/2, width_dim/2]
         let half_dims: Vec<usize> = self.axes_dim.iter().map(|&d| d / 2).collect();
@@ -207,32 +203,9 @@ impl QwenEmbedRope {
         // Concatenate along frequency dimension and reshape to [seq_len, total_dim/2, 2]
         let freqs = Tensor::cat(&[freqs_frame, freqs_height, freqs_width], 3)?;
         let total_half_dim: usize = half_dims.iter().sum();
-        let result = freqs
+        freqs
             .reshape((seq_len, total_half_dim, 2))?
-            .contiguous()?;
-
-        // DEBUG: Print frequency statistics for comparison with Python
-        // Convert to F32 for debug printing (tensors may be BF16)
-        let result_f32 = result.to_dtype(candle::DType::F32)?;
-        let freqs_flat = result_f32.flatten_all()?;
-        let mean = freqs_flat.mean_all()?.to_scalar::<f32>().unwrap_or(0.0);
-        let min = freqs_flat.min(0)?.to_scalar::<f32>().unwrap_or(0.0);
-        let max = freqs_flat.max(0)?.to_scalar::<f32>().unwrap_or(0.0);
-        eprintln!("[DIFFUSION_ROPE] freqs shape: {:?}, mean={:.6}, min={:.6}, max={:.6}",
-            result.dims(), mean, min, max);
-
-        // Print frequency values for position 0: frame(0-7), height(8-15), width(36-43)
-        let first_pos = result_f32.i(0)?;  // [total_dim/2, 2]
-        let all_cos: Vec<f32> = first_pos.i((.., 0))?.flatten_all()?.to_vec1()?;
-        let all_sin: Vec<f32> = first_pos.i((.., 1))?.flatten_all()?.to_vec1()?;
-        eprintln!("[DIFFUSION_ROPE] pos[0] frame cos[0:8]:  {:?}", &all_cos[..8.min(all_cos.len())]);
-        eprintln!("[DIFFUSION_ROPE] pos[0] frame sin[0:8]:  {:?}", &all_sin[..8.min(all_sin.len())]);
-        eprintln!("[DIFFUSION_ROPE] pos[0] height cos[8:16]: {:?}", &all_cos[8..16.min(all_cos.len())]);
-        eprintln!("[DIFFUSION_ROPE] pos[0] height sin[8:16]: {:?}", &all_sin[8..16.min(all_sin.len())]);
-        eprintln!("[DIFFUSION_ROPE] pos[0] width cos[36:44]: {:?}", &all_cos[36..44.min(all_cos.len())]);
-        eprintln!("[DIFFUSION_ROPE] pos[0] width sin[36:44]: {:?}", &all_sin[36..44.min(all_sin.len())]);
-
-        Ok(result)
+            .contiguous()
     }
 
     /// Forward pass: compute frequencies for video and text sequences.
