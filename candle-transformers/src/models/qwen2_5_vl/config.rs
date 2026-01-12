@@ -12,122 +12,70 @@ use serde::Deserialize;
 // Vision Configuration
 // ============================================================================
 
-fn default_depth() -> usize {
-    32
-}
-fn default_vision_hidden_size() -> usize {
-    1280
-}
-fn default_vision_intermediate_size() -> usize {
-    3420
-}
-fn default_num_heads() -> usize {
-    16
-}
-fn default_in_channels() -> usize {
-    3
-}
-fn default_out_hidden_size() -> usize {
-    3584 // 7B default, overridden by config
-}
-fn default_patch_size() -> usize {
-    14
-}
-fn default_spatial_merge_size() -> usize {
-    2
-}
-fn default_temporal_patch_size() -> usize {
-    2
-}
-fn default_fullatt_block_indexes() -> Vec<usize> {
-    vec![7, 15, 23, 31]
-}
-fn default_window_size() -> usize {
-    112
-}
-fn default_tokens_per_second() -> usize {
-    4
-}
-fn default_vision_hidden_act() -> Activation {
-    Activation::Silu
-}
-
 /// Vision encoder configuration for Qwen2.5-VL.
 ///
 /// These values are mostly consistent across all model sizes (3B, 7B, 72B),
 /// except for `out_hidden_size` which must match the text model's hidden_size.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct VisionConfig {
     /// Number of transformer blocks in the vision encoder.
-    #[serde(default = "default_depth")]
     pub depth: usize,
 
     /// Hidden dimension of the vision encoder.
-    #[serde(default = "default_vision_hidden_size")]
     pub hidden_size: usize,
 
     /// Intermediate dimension in the MLP.
-    #[serde(default = "default_vision_intermediate_size")]
     pub intermediate_size: usize,
 
     /// Number of attention heads.
-    #[serde(default = "default_num_heads")]
     pub num_heads: usize,
 
     /// Number of input image channels.
-    #[serde(default = "default_in_channels")]
     pub in_chans: usize,
 
     /// Output hidden size - must match text model's hidden_size.
     /// 2048 (3B) / 3584 (7B) / 8192 (72B)
-    #[serde(default = "default_out_hidden_size")]
     pub out_hidden_size: usize,
 
     /// Patch size for the vision encoder.
-    #[serde(default = "default_patch_size")]
     pub patch_size: usize,
 
     /// Spatial merge size (2x2 pooling in the merger).
-    #[serde(default = "default_spatial_merge_size")]
     pub spatial_merge_size: usize,
 
     /// Temporal patch size for video frames.
-    #[serde(default = "default_temporal_patch_size")]
     pub temporal_patch_size: usize,
 
     /// Block indices that use full attention (others use window attention).
-    #[serde(default = "default_fullatt_block_indexes")]
     pub fullatt_block_indexes: Vec<usize>,
 
     /// Window size for windowed attention layers.
-    #[serde(default = "default_window_size")]
     pub window_size: usize,
 
     /// Tokens per second for video temporal position encoding.
-    #[serde(default = "default_tokens_per_second")]
     pub tokens_per_second: usize,
 
     /// Activation function (SiLU for Qwen2.5-VL).
-    #[serde(default = "default_vision_hidden_act")]
     pub hidden_act: Activation,
 }
 
 impl Default for VisionConfig {
     fn default() -> Self {
         Self {
-            depth: default_depth(),
-            hidden_size: default_vision_hidden_size(),
-            intermediate_size: default_vision_intermediate_size(),
-            num_heads: default_num_heads(),
-            in_chans: default_in_channels(),
-            out_hidden_size: default_out_hidden_size(),
-            patch_size: default_patch_size(),
-            spatial_merge_size: default_spatial_merge_size(),
-            temporal_patch_size: default_temporal_patch_size(),
-            fullatt_block_indexes: default_fullatt_block_indexes(),
-            window_size: default_window_size(),
-            tokens_per_second: default_tokens_per_second(),
-            hidden_act: default_vision_hidden_act(),
+            depth: 32,
+            hidden_size: 1280,
+            intermediate_size: 3420,
+            num_heads: 16,
+            in_chans: 3,
+            out_hidden_size: 3584,
+            patch_size: 14,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            fullatt_block_indexes: vec![7, 15, 23, 31],
+            window_size: 112,
+            tokens_per_second: 4,
+            hidden_act: Activation::Silu,
         }
     }
 }
@@ -143,31 +91,26 @@ impl VisionConfig {
 // RoPE Scaling Configuration
 // ============================================================================
 
-fn default_mrope_section() -> Vec<usize> {
-    vec![16, 24, 24]
-}
-
 /// RoPE scaling configuration for multimodal position embeddings.
 ///
 /// M-RoPE (Multimodal RoPE) splits the head_dim into sections for
 /// temporal, height, and width position encoding.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct RopeScaling {
     /// Sections for multimodal RoPE: [temporal, height, width].
     /// Total must equal head_dim/2 = 64 for head_dim=128.
     /// Default: [16, 24, 24]
-    #[serde(default = "default_mrope_section")]
     pub mrope_section: Vec<usize>,
 
     /// RoPE type identifier.
-    #[serde(default)]
     pub rope_type: Option<String>,
 }
 
 impl Default for RopeScaling {
     fn default() -> Self {
         Self {
-            mrope_section: default_mrope_section(),
+            mrope_section: vec![16, 24, 24],
             rope_type: Some("mrope".to_string()),
         }
     }
@@ -177,160 +120,86 @@ impl Default for RopeScaling {
 // Main Configuration
 // ============================================================================
 
-fn default_vocab_size() -> usize {
-    152064
-}
-fn default_hidden_size() -> usize {
-    3584 // 7B default
-}
-fn default_intermediate_size() -> usize {
-    18944 // 7B default
-}
-fn default_num_hidden_layers() -> usize {
-    28 // 7B default
-}
-fn default_num_attention_heads() -> usize {
-    28 // 7B default
-}
-fn default_num_key_value_heads() -> usize {
-    4 // 7B default
-}
-fn default_head_dim() -> usize {
-    128
-}
-fn default_rms_norm_eps() -> f64 {
-    1e-6
-}
-fn default_rope_theta() -> f64 {
-    1_000_000.0
-}
-fn default_max_position_embeddings() -> usize {
-    128000 // 128K context
-}
-fn default_hidden_act() -> Activation {
-    Activation::Silu
-}
-fn default_image_token_id() -> u32 {
-    151655
-}
-fn default_video_token_id() -> u32 {
-    151656
-}
-fn default_vision_start_token_id() -> u32 {
-    151652
-}
-fn default_vision_end_token_id() -> u32 {
-    151653
-}
-fn default_sliding_window() -> usize {
-    4096
-}
-fn default_max_window_layers() -> usize {
-    80
-}
-
 /// Combined configuration for Qwen2.5-VL model.
 ///
 /// The text model parameters are at the top level (not nested in `text_config`),
 /// following the HuggingFace format.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Vision encoder configuration.
-    #[serde(default)]
     pub vision_config: VisionConfig,
 
     /// Vocabulary size for the text model.
-    #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
 
     /// Hidden size of the text model.
     /// 2048 (3B) / 3584 (7B) / 8192 (72B)
-    #[serde(default = "default_hidden_size")]
     pub hidden_size: usize,
 
     /// Intermediate size in the MLP.
-    #[serde(default = "default_intermediate_size")]
     pub intermediate_size: usize,
 
     /// Number of transformer layers.
-    #[serde(default = "default_num_hidden_layers")]
     pub num_hidden_layers: usize,
 
     /// Number of attention heads.
-    #[serde(default = "default_num_attention_heads")]
     pub num_attention_heads: usize,
 
     /// Number of key-value heads for GQA.
-    #[serde(default = "default_num_key_value_heads")]
     pub num_key_value_heads: usize,
 
     /// Head dimension for attention.
-    #[serde(default = "default_head_dim")]
     pub head_dim: usize,
 
     /// RMS normalization epsilon.
-    #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
 
     /// RoPE base frequency.
-    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
 
     /// Maximum position embeddings (128K context).
-    #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
 
     /// Activation function.
-    #[serde(default = "default_hidden_act")]
     pub hidden_act: Activation,
 
     /// Whether to tie word embeddings with lm_head.
-    #[serde(default)]
     pub tie_word_embeddings: bool,
 
     /// Image placeholder token ID.
-    #[serde(default = "default_image_token_id")]
     pub image_token_id: u32,
 
     /// Video placeholder token ID.
-    #[serde(default = "default_video_token_id")]
     pub video_token_id: u32,
 
     /// Vision start token ID.
-    #[serde(default = "default_vision_start_token_id")]
     pub vision_start_token_id: u32,
 
     /// Vision end token ID.
-    #[serde(default = "default_vision_end_token_id")]
     pub vision_end_token_id: u32,
 
     /// RoPE scaling configuration with mrope_section.
-    #[serde(default)]
     pub rope_scaling: Option<RopeScaling>,
 
     /// Whether to use sliding window attention.
-    #[serde(default)]
     pub use_sliding_window: bool,
 
     /// Sliding window size (default: 4096).
     /// Only used when use_sliding_window is true.
-    #[serde(default = "default_sliding_window")]
     pub sliding_window: usize,
 
     /// Layers >= this index use sliding window attention (default: 80).
     /// For 7B model with 28 layers, this means no layers use sliding window by default.
-    #[serde(default = "default_max_window_layers")]
     pub max_window_layers: usize,
 
     /// Whether to use flash attention (requires flash-attn feature and CUDA).
-    #[serde(default)]
     pub use_flash_attn: bool,
 
     /// Chunk size for prefill to reduce peak memory usage.
     /// When set, processes the input in chunks during prefill phase.
     /// Recommended: 2048 for Metal, 4096 for CUDA.
     /// None means disabled (process full sequence at once).
-    #[serde(default)]
     pub prefill_chunk_size: Option<usize>,
 }
 
@@ -338,26 +207,26 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             vision_config: VisionConfig::default(),
-            vocab_size: default_vocab_size(),
-            hidden_size: default_hidden_size(),
-            intermediate_size: default_intermediate_size(),
-            num_hidden_layers: default_num_hidden_layers(),
-            num_attention_heads: default_num_attention_heads(),
-            num_key_value_heads: default_num_key_value_heads(),
-            head_dim: default_head_dim(),
-            rms_norm_eps: default_rms_norm_eps(),
-            rope_theta: default_rope_theta(),
-            max_position_embeddings: default_max_position_embeddings(),
-            hidden_act: default_hidden_act(),
+            vocab_size: 152064,
+            hidden_size: 3584,
+            intermediate_size: 18944,
+            num_hidden_layers: 28,
+            num_attention_heads: 28,
+            num_key_value_heads: 4,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 128000,
+            hidden_act: Activation::Silu,
             tie_word_embeddings: false,
-            image_token_id: default_image_token_id(),
-            video_token_id: default_video_token_id(),
-            vision_start_token_id: default_vision_start_token_id(),
-            vision_end_token_id: default_vision_end_token_id(),
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+            vision_end_token_id: 151653,
             rope_scaling: Some(RopeScaling::default()),
             use_sliding_window: false,
-            sliding_window: default_sliding_window(),
-            max_window_layers: default_max_window_layers(),
+            sliding_window: 4096,
+            max_window_layers: 80,
             use_flash_attn: false,
             prefill_chunk_size: None,
         }
@@ -370,7 +239,7 @@ impl Config {
         self.rope_scaling
             .as_ref()
             .map(|rs| rs.mrope_section.clone())
-            .unwrap_or_else(default_mrope_section)
+            .unwrap_or_else(|| vec![16, 24, 24])
     }
 
     /// Number of KV groups for grouped-query attention.
