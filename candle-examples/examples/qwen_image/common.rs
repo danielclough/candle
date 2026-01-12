@@ -17,7 +17,7 @@ use candle_transformers::models::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
         FlowMatchEulerDiscreteScheduler, InferenceConfig, PromptMode,
         QwenImageTransformer2DModel, QwenImageTransformer2DModelQuantized, SchedulerConfig,
-        VaeConfig,
+        TransformerTextCache, VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -441,9 +441,43 @@ impl TransformerVariant {
         }
     }
 
+    /// Forward pass with text Q/K/V caching for CFG optimization.
+    ///
+    /// Only supported for FP16 models. Quantized models fall back to regular forward.
+    /// Cache stores text projections after QK norm and RoPE, skipping ~33% of compute.
+    pub fn forward_with_cache(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        cache: &mut TransformerTextCache,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::FP16(model) => model.forward_with_cache(img, txt, timestep, img_shapes, cache),
+            // Quantized models don't support caching, fall back to regular forward
+            Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes),
+        }
+    }
+
+    /// Create a new text cache for this transformer.
+    ///
+    /// Returns None for quantized models (which don't support caching).
+    pub fn create_text_cache(&self) -> Option<TransformerTextCache> {
+        match self {
+            Self::FP16(model) => Some(model.create_text_cache()),
+            Self::Quantized(_) => None,
+        }
+    }
+
     /// Returns true if this is a quantized model.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized(_))
+    }
+
+    /// Returns true if text caching is supported.
+    pub fn supports_text_cache(&self) -> bool {
+        matches!(self, Self::FP16(_))
     }
 }
 

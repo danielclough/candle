@@ -12,9 +12,39 @@
 use candle::{DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
-use super::blocks::QwenImageTransformerBlock;
+use super::blocks::{QwenImageTransformerBlock, TextQKVCache};
 use super::config::{Config, InferenceConfig};
 use super::rope::{timestep_embedding, QwenEmbedRope};
+
+/// Cache for text Q, K, V tensors across all transformer blocks.
+///
+/// Used for CFG optimization where text embeddings don't change during denoising.
+/// Each block has its own cache to store text projections after QK norm and RoPE.
+#[derive(Debug, Clone)]
+pub struct TransformerTextCache {
+    /// Per-block text caches (one for each of 60 transformer blocks)
+    pub block_caches: Vec<TextQKVCache>,
+}
+
+impl TransformerTextCache {
+    /// Create a new cache for the given number of blocks.
+    pub fn new(num_blocks: usize) -> Self {
+        let block_caches = (0..num_blocks).map(|_| TextQKVCache::new()).collect();
+        Self { block_caches }
+    }
+
+    /// Clear all block caches.
+    pub fn clear(&mut self) {
+        for cache in &mut self.block_caches {
+            cache.clear();
+        }
+    }
+
+    /// Check if all caches are populated.
+    pub fn is_populated(&self) -> bool {
+        !self.block_caches.is_empty() && self.block_caches.iter().all(|c| c.is_populated())
+    }
+}
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
 fn layer_norm_no_affine(
@@ -357,6 +387,114 @@ impl QwenImageTransformer2DModel {
 
         // Final normalization with AdaLN
         let hidden_states = self.norm_out.forward(&hidden_states, &temb_for_norm)?;
+
+        // Project to output: [batch, seq, patch_size² × out_channels]
+        let output = hidden_states.apply(&self.proj_out)?;
+
+        Ok(output)
+    }
+
+    /// Create a new text cache for CFG optimization.
+    ///
+    /// The cache stores text Q, K, V tensors for all transformer blocks,
+    /// allowing them to be reused across denoising steps.
+    pub fn create_text_cache(&self) -> TransformerTextCache {
+        TransformerTextCache::new(self.transformer_blocks.len())
+    }
+
+    /// Forward pass with text Q, K, V caching for CFG optimization.
+    ///
+    /// This is optimized for the CFG pattern where text embeddings don't change
+    /// during denoising. On first call, text projections are computed and cached.
+    /// On subsequent calls, cached text tensors are reused (skipping ~33% of compute).
+    ///
+    /// **Important**: Only use this in non-edit mode (zero_cond_t=false).
+    /// Edit mode requires per-token modulation which is incompatible with caching.
+    ///
+    /// # Usage Pattern for CFG
+    /// ```ignore
+    /// // Create caches for positive and negative prompts
+    /// let mut pos_cache = model.create_text_cache();
+    /// let mut neg_cache = model.create_text_cache();
+    ///
+    /// // Denoising loop
+    /// for step in 0..num_steps {
+    ///     // Conditioned pass (first call populates cache)
+    ///     let cond_output = model.forward_with_cache(
+    ///         &latents, &pos_text_embeds, &timestep, &img_shapes, &mut pos_cache
+    ///     )?;
+    ///
+    ///     // Unconditioned pass (first call populates cache)
+    ///     let uncond_output = model.forward_with_cache(
+    ///         &latents, &neg_text_embeds, &timestep, &img_shapes, &mut neg_cache
+    ///     )?;
+    ///
+    ///     // CFG: output = uncond + guidance_scale * (cond - uncond)
+    ///     let output = (&uncond_output + guidance_scale * (&cond_output - &uncond_output)?)?;
+    /// }
+    /// ```
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
+    /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
+    /// * `timestep` - Diffusion timestep [batch]
+    /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
+    /// * `cache` - Mutable reference to text cache
+    ///
+    /// # Returns
+    /// Output predictions [batch, img_seq, patch_size² × out_channels]
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        cache: &mut TransformerTextCache,
+    ) -> Result<Tensor> {
+        // Note: Caching is only supported in non-edit mode
+        if self.zero_cond_t {
+            candle::bail!(
+                "forward_with_cache is not supported in edit mode (zero_cond_t=true). \
+                 Use forward() instead."
+            );
+        }
+
+        let dtype = hidden_states.dtype();
+
+        // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
+        let mut hidden_states = hidden_states.apply(&self.img_in)?;
+
+        // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
+        let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
+        encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
+
+        // Compute timestep embedding
+        let timestep = timestep.to_dtype(dtype)?;
+        let temb = self.time_text_embed.forward(&timestep, dtype)?;
+
+        // Derive text sequence length from actual encoder_hidden_states shape
+        let txt_seq_len = encoder_hidden_states.dim(1)?;
+        let txt_seq_lens = &[txt_seq_len];
+
+        // Compute RoPE frequencies
+        let image_rotary_emb = self.pos_embed.forward(img_shapes, txt_seq_lens)?;
+
+        // Process through transformer blocks WITH CACHING
+        for (idx, block) in self.transformer_blocks.iter().enumerate() {
+            let block_cache = cache.block_caches.get_mut(idx);
+            let (enc_out, hid_out) = block.forward_with_cache(
+                &hidden_states,
+                &encoder_hidden_states,
+                &temb,
+                Some(&image_rotary_emb),
+                block_cache,
+            )?;
+            encoder_hidden_states = enc_out;
+            hidden_states = hid_out;
+        }
+
+        // Final normalization with AdaLN
+        let hidden_states = self.norm_out.forward(&hidden_states, &temb)?;
 
         // Project to output: [batch, seq, patch_size² × out_channels]
         let output = hidden_states.apply(&self.proj_out)?;

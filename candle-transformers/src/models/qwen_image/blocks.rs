@@ -305,6 +305,46 @@ fn scaled_dot_product_attention(
     }
 }
 
+/// Cache for text Q, K, V tensors to avoid recomputation during denoising.
+///
+/// Since text embeddings don't change during denoising, we can cache the
+/// text projections and reuse them across all denoising steps.
+#[derive(Debug, Clone, Default)]
+pub struct TextQKVCache {
+    /// Cached text query tensor [batch, txt_seq, num_heads, head_dim]
+    pub txt_q: Option<Tensor>,
+    /// Cached text key tensor [batch, txt_seq, num_heads, head_dim]
+    pub txt_k: Option<Tensor>,
+    /// Cached text value tensor [batch, txt_seq, num_heads, head_dim]
+    pub txt_v: Option<Tensor>,
+}
+
+impl TextQKVCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if the cache is populated.
+    pub fn is_populated(&self) -> bool {
+        self.txt_q.is_some() && self.txt_k.is_some() && self.txt_v.is_some()
+    }
+
+    /// Clear the cache.
+    pub fn clear(&mut self) {
+        self.txt_q = None;
+        self.txt_k = None;
+        self.txt_v = None;
+    }
+
+    /// Store text Q, K, V tensors in the cache.
+    pub fn store(&mut self, txt_q: Tensor, txt_k: Tensor, txt_v: Tensor) {
+        self.txt_q = Some(txt_q);
+        self.txt_k = Some(txt_k);
+        self.txt_v = Some(txt_v);
+    }
+}
+
 /// Dual-stream attention for Qwen-Image.
 ///
 /// This implements joint attention where:
@@ -436,6 +476,149 @@ impl QwenDoubleStreamAttention {
 
         // Concatenate for joint attention in [B, S, H, D] format: order is [text, image]
         // This matches Python which concatenates before permuting
+        let joint_q = Tensor::cat(&[&txt_q, &img_q], 1)?;
+        let joint_k = Tensor::cat(&[&txt_k, &img_k], 1)?;
+        let joint_v = Tensor::cat(&[&txt_v, &img_v], 1)?;
+
+        // Transpose for attention: [B, S, H, D] -> [B, H, S, D]
+        let joint_q = joint_q.transpose(1, 2)?;
+        let joint_k = joint_k.transpose(1, 2)?;
+        let joint_v = joint_v.transpose(1, 2)?;
+
+        // Compute attention
+        let joint_attn =
+            scaled_dot_product_attention(&joint_q, &joint_k, &joint_v, self.upcast_attention)?;
+
+        // Transpose back: [B, H, S, D] -> [B, S, H, D]
+        let joint_attn = joint_attn.transpose(1, 2)?;
+
+        // Flatten: [B, S, H, D] -> [B, S, H*D]
+        let joint_attn = joint_attn.flatten_from(2)?;
+
+        // Split back to text and image
+        let txt_attn = joint_attn.narrow(1, 0, txt_seq)?;
+        let img_attn = joint_attn.narrow(1, txt_seq, img_seq)?;
+
+        // Output projections
+        let img_out = img_attn.apply(&self.to_out)?;
+        let txt_out = txt_attn.apply(&self.to_add_out)?;
+
+        Ok((img_out, txt_out))
+    }
+
+    /// Forward pass with optional text Q, K, V caching for CFG optimization.
+    ///
+    /// When `cache` is provided:
+    /// - If cache is empty: compute text Q, K, V and store in cache
+    /// - If cache is populated: reuse cached text Q, K, V (skips text projections)
+    ///
+    /// This is useful for CFG where text embeddings don't change during denoising.
+    /// Cache stores text tensors AFTER QK norm and RoPE application.
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Image stream [batch, img_seq, dim]
+    /// * `encoder_hidden_states` - Text stream [batch, txt_seq, dim]
+    /// * `image_rotary_emb` - RoPE frequencies (img_freqs, txt_freqs)
+    /// * `cache` - Optional mutable reference to text cache
+    ///
+    /// # Returns
+    /// Tuple of (img_attn_output, txt_attn_output)
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        cache: Option<&mut TextQKVCache>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b_sz, img_seq, _) = hidden_states.dims3()?;
+        let txt_seq = encoder_hidden_states.dim(1)?;
+
+        // Compute QKV for image stream (always computed fresh)
+        let img_q = hidden_states.apply(&self.to_q)?;
+        let img_k = hidden_states.apply(&self.to_k)?;
+        let img_v = hidden_states.apply(&self.to_v)?;
+
+        // Reshape image for multi-head attention
+        let img_q = img_q.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
+        let img_k = img_k.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
+        let img_v = img_v.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
+
+        // Apply QK normalization for image
+        let img_q = self.img_norm.forward_q(&img_q)?;
+        let img_k = self.img_norm.forward_k(&img_k)?;
+
+        // Apply RoPE for image
+        let (img_q, img_k) = if let Some((img_freqs, _)) = image_rotary_emb {
+            let img_q = apply_rotary_emb_qwen(&img_q, img_freqs)?;
+            let img_k = apply_rotary_emb_qwen(&img_k, img_freqs)?;
+            (img_q, img_k)
+        } else {
+            (img_q, img_k)
+        };
+
+        // Get text Q, K, V - either from cache or compute fresh
+        let (txt_q, txt_k, txt_v) = if let Some(c) = cache {
+            if c.is_populated() {
+                // Use cached text tensors
+                (
+                    c.txt_q.clone().unwrap(),
+                    c.txt_k.clone().unwrap(),
+                    c.txt_v.clone().unwrap(),
+                )
+            } else {
+                // Compute text QKV and cache
+                let txt_q = encoder_hidden_states.apply(&self.add_q_proj)?;
+                let txt_k = encoder_hidden_states.apply(&self.add_k_proj)?;
+                let txt_v = encoder_hidden_states.apply(&self.add_v_proj)?;
+
+                // Reshape
+                let txt_q = txt_q.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+                let txt_k = txt_k.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+                let txt_v = txt_v.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+
+                // Apply QK normalization
+                let txt_q = self.txt_norm.forward_q(&txt_q)?;
+                let txt_k = self.txt_norm.forward_k(&txt_k)?;
+
+                // Apply RoPE
+                let (txt_q, txt_k) = if let Some((_, txt_freqs)) = image_rotary_emb {
+                    let txt_q = apply_rotary_emb_qwen(&txt_q, txt_freqs)?;
+                    let txt_k = apply_rotary_emb_qwen(&txt_k, txt_freqs)?;
+                    (txt_q, txt_k)
+                } else {
+                    (txt_q, txt_k)
+                };
+
+                // Store in cache
+                c.store(txt_q.clone(), txt_k.clone(), txt_v.clone());
+
+                (txt_q, txt_k, txt_v)
+            }
+        } else {
+            // No cache provided - compute normally
+            let txt_q = encoder_hidden_states.apply(&self.add_q_proj)?;
+            let txt_k = encoder_hidden_states.apply(&self.add_k_proj)?;
+            let txt_v = encoder_hidden_states.apply(&self.add_v_proj)?;
+
+            let txt_q = txt_q.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+            let txt_k = txt_k.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+            let txt_v = txt_v.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+
+            let txt_q = self.txt_norm.forward_q(&txt_q)?;
+            let txt_k = self.txt_norm.forward_k(&txt_k)?;
+
+            let (txt_q, txt_k) = if let Some((_, txt_freqs)) = image_rotary_emb {
+                let txt_q = apply_rotary_emb_qwen(&txt_q, txt_freqs)?;
+                let txt_k = apply_rotary_emb_qwen(&txt_k, txt_freqs)?;
+                (txt_q, txt_k)
+            } else {
+                (txt_q, txt_k)
+            };
+
+            (txt_q, txt_k, txt_v)
+        };
+
+        // Concatenate for joint attention in [B, S, H, D] format: order is [text, image]
         let joint_q = Tensor::cat(&[&txt_q, &img_q], 1)?;
         let joint_k = Tensor::cat(&[&txt_k, &img_k], 1)?;
         let joint_v = Tensor::cat(&[&txt_v, &img_v], 1)?;
@@ -684,6 +867,91 @@ impl QwenImageTransformerBlock {
         let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
 
         // Residual add in F32
+        let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
+            + gated_txt_mlp.to_dtype(DType::F32)?)?
+        .to_dtype(orig_dtype)?;
+
+        Ok((encoder_hidden_states, hidden_states))
+    }
+
+    /// Forward pass with text Q, K, V caching for CFG optimization.
+    ///
+    /// Similar to `forward()` but accepts an optional cache for text tensors.
+    /// When cache is populated, text projections are skipped (significant speedup).
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Image stream [batch, img_seq, dim]
+    /// * `encoder_hidden_states` - Text stream [batch, txt_seq, dim]
+    /// * `temb` - Timestep embedding [batch, dim]
+    /// * `image_rotary_emb` - RoPE frequencies
+    /// * `cache` - Optional mutable reference to text cache
+    ///
+    /// # Returns
+    /// Tuple of (updated_encoder_hidden_states, updated_hidden_states)
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        image_rotary_emb: Option<&(Tensor, Tensor)>,
+        cache: Option<&mut TextQKVCache>,
+    ) -> Result<(Tensor, Tensor)> {
+        let orig_dtype = hidden_states.dtype();
+
+        // Get modulation parameters for both streams
+        let (img_mod1, img_mod2) = self.img_mod.forward(temb)?;
+        let (txt_mod1, txt_mod2) = self.txt_mod.forward(temb)?;
+
+        // === Attention phase ===
+
+        // Image: norm1 + modulate
+        let img_normed = hidden_states.apply(&self.img_norm1)?;
+        let img_modulated = img_mod1.scale_shift(&img_normed)?;
+        let img_gate1 = img_mod1.gate.clone();
+
+        // Text: norm1 + modulate
+        let txt_normed = encoder_hidden_states.apply(&self.txt_norm1)?;
+        let txt_modulated = txt_mod1.scale_shift(&txt_normed)?;
+        let txt_gate1 = txt_mod1.gate.clone();
+
+        // Joint attention WITH CACHE
+        let (img_attn_out, txt_attn_out) = self.attn.forward_with_cache(
+            &img_modulated,
+            &txt_modulated,
+            image_rotary_emb,
+            cache,
+        )?;
+
+        // Gated residual for attention
+        let gated_img_attn = img_gate1.broadcast_mul(&img_attn_out)?;
+        let gated_txt_attn = txt_gate1.broadcast_mul(&txt_attn_out)?;
+
+        // Residual add in F32 to avoid overflow
+        let hidden_states = (hidden_states.to_dtype(DType::F32)?
+            + gated_img_attn.to_dtype(DType::F32)?)?
+        .to_dtype(orig_dtype)?;
+        let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
+            + gated_txt_attn.to_dtype(DType::F32)?)?
+        .to_dtype(orig_dtype)?;
+
+        // === MLP phase ===
+
+        // Image: norm2 + modulate + MLP + gated residual
+        let img_normed2 = hidden_states.apply(&self.img_norm2)?;
+        let img_modulated2 = img_mod2.scale_shift(&img_normed2)?;
+        let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
+        let gated_img_mlp = img_mod2.gate(&img_mlp_out)?;
+
+        let hidden_states = (hidden_states.to_dtype(DType::F32)?
+            + gated_img_mlp.to_dtype(DType::F32)?)?
+        .to_dtype(orig_dtype)?;
+
+        // Text: norm2 + modulate + MLP + gated residual
+        let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
+        let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
+        let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;
+        let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
+
         let encoder_hidden_states = (encoder_hidden_states.to_dtype(DType::F32)?
             + gated_txt_mlp.to_dtype(DType::F32)?)?
         .to_dtype(orig_dtype)?;

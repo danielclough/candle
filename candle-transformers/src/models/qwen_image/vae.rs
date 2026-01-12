@@ -884,7 +884,7 @@ impl QwenImageDecoder3d {
 #[derive(Debug, Clone)]
 pub struct DiagonalGaussianDistribution {
     mean: Tensor,
-    _logvar: Tensor,
+    logvar: Tensor,
     std: Tensor,
 }
 
@@ -896,7 +896,7 @@ impl DiagonalGaussianDistribution {
         let std = (&logvar * 0.5)?.exp()?;
         Ok(Self {
             mean,
-            _logvar: logvar,
+            logvar,
             std,
         })
     }
@@ -912,22 +912,81 @@ impl DiagonalGaussianDistribution {
     pub fn mode(&self) -> &Tensor {
         &self.mean
     }
+
+    /// Return the log variance of the distribution.
+    pub fn logvar(&self) -> &Tensor {
+        &self.logvar
+    }
 }
 
 /// Tiled decoding configuration for memory-efficient VAE decode.
 #[derive(Debug, Clone, Copy)]
 pub struct TiledDecodeConfig {
-    /// Minimum tile size in pixel space (default: 256)
-    pub tile_sample_min_size: usize,
-    /// Stride between tiles in pixel space (default: 192, overlap = 64)
-    pub tile_sample_stride: usize,
+    /// Minimum tile height in pixel space (default: 256)
+    pub tile_sample_min_height: usize,
+    /// Minimum tile width in pixel space (default: 256)
+    pub tile_sample_min_width: usize,
+    /// Stride between tiles in height dimension (default: 192, overlap = 64)
+    pub tile_sample_stride_height: usize,
+    /// Stride between tiles in width dimension (default: 192, overlap = 64)
+    pub tile_sample_stride_width: usize,
 }
 
 impl Default for TiledDecodeConfig {
     fn default() -> Self {
         Self {
-            tile_sample_min_size: 256,
-            tile_sample_stride: 192, // overlap = 256 - 192 = 64 pixels
+            tile_sample_min_height: 256,
+            tile_sample_min_width: 256,
+            tile_sample_stride_height: 192, // overlap = 256 - 192 = 64 pixels
+            tile_sample_stride_width: 192,
+        }
+    }
+}
+
+impl TiledDecodeConfig {
+    /// Create a config with uniform tile size and stride.
+    pub fn uniform(tile_size: usize, stride: usize) -> Self {
+        Self {
+            tile_sample_min_height: tile_size,
+            tile_sample_min_width: tile_size,
+            tile_sample_stride_height: stride,
+            tile_sample_stride_width: stride,
+        }
+    }
+}
+
+/// Tiled encoding configuration for memory-efficient VAE encode.
+#[derive(Debug, Clone, Copy)]
+pub struct TiledEncodeConfig {
+    /// Minimum tile height in pixel space (default: 256)
+    pub tile_sample_min_height: usize,
+    /// Minimum tile width in pixel space (default: 256)
+    pub tile_sample_min_width: usize,
+    /// Stride between tiles in height dimension (default: 192, overlap = 64)
+    pub tile_sample_stride_height: usize,
+    /// Stride between tiles in width dimension (default: 192, overlap = 64)
+    pub tile_sample_stride_width: usize,
+}
+
+impl Default for TiledEncodeConfig {
+    fn default() -> Self {
+        Self {
+            tile_sample_min_height: 256,
+            tile_sample_min_width: 256,
+            tile_sample_stride_height: 192, // overlap = 256 - 192 = 64 pixels
+            tile_sample_stride_width: 192,
+        }
+    }
+}
+
+impl TiledEncodeConfig {
+    /// Create a config with uniform tile size and stride.
+    pub fn uniform(tile_size: usize, stride: usize) -> Self {
+        Self {
+            tile_sample_min_height: tile_size,
+            tile_sample_min_width: tile_size,
+            tile_sample_stride_height: stride,
+            tile_sample_stride_width: stride,
         }
     }
 }
@@ -940,6 +999,14 @@ pub struct AutoencoderKLQwenImage {
     quant_conv: QwenImageCausalConv3d,
     post_quant_conv: QwenImageCausalConv3d,
     config: VaeConfig,
+    /// When enabled, processes batch dimension one sample at a time to reduce memory usage.
+    use_slicing: bool,
+    /// When enabled, automatically uses tiled encoding/decoding for large images.
+    use_tiling: bool,
+    /// Configuration for tiled encoding (used when use_tiling is true).
+    tile_encode_config: TiledEncodeConfig,
+    /// Configuration for tiled decoding (used when use_tiling is true).
+    tile_decode_config: TiledDecodeConfig,
 }
 
 impl AutoencoderKLQwenImage {
@@ -971,20 +1038,158 @@ impl AutoencoderKLQwenImage {
             quant_conv,
             post_quant_conv,
             config: config.clone(),
+            use_slicing: false,
+            use_tiling: false,
+            tile_encode_config: TiledEncodeConfig::default(),
+            tile_decode_config: TiledDecodeConfig::default(),
         })
     }
 
-    /// Encode an image to latent distribution.
-    pub fn encode(&self, x: &Tensor) -> Result<DiagonalGaussianDistribution> {
+    /// Enable tiled encoding/decoding for memory efficiency with large images.
+    ///
+    /// When enabled, `encode()` and `decode()` will automatically use tiled
+    /// processing to handle images larger than GPU memory.
+    ///
+    /// # Arguments
+    /// * `tile_height` - Optional minimum tile height in pixels (default: 256)
+    /// * `tile_width` - Optional minimum tile width in pixels (default: 256)
+    /// * `stride_height` - Optional stride height in pixels (default: 192)
+    /// * `stride_width` - Optional stride width in pixels (default: 192)
+    pub fn enable_tiling(
+        &mut self,
+        tile_height: Option<usize>,
+        tile_width: Option<usize>,
+        stride_height: Option<usize>,
+        stride_width: Option<usize>,
+    ) {
+        self.use_tiling = true;
+        if let Some(h) = tile_height {
+            self.tile_encode_config.tile_sample_min_height = h;
+            self.tile_decode_config.tile_sample_min_height = h;
+        }
+        if let Some(w) = tile_width {
+            self.tile_encode_config.tile_sample_min_width = w;
+            self.tile_decode_config.tile_sample_min_width = w;
+        }
+        if let Some(sh) = stride_height {
+            self.tile_encode_config.tile_sample_stride_height = sh;
+            self.tile_decode_config.tile_sample_stride_height = sh;
+        }
+        if let Some(sw) = stride_width {
+            self.tile_encode_config.tile_sample_stride_width = sw;
+            self.tile_decode_config.tile_sample_stride_width = sw;
+        }
+    }
+
+    /// Enable tiling with default parameters (256px tiles, 192px stride).
+    pub fn enable_tiling_default(&mut self) {
+        self.use_tiling = true;
+        self.tile_encode_config = TiledEncodeConfig::default();
+        self.tile_decode_config = TiledDecodeConfig::default();
+    }
+
+    /// Disable tiled encoding/decoding.
+    pub fn disable_tiling(&mut self) {
+        self.use_tiling = false;
+    }
+
+    /// Check if tiling is enabled.
+    pub fn is_tiling_enabled(&self) -> bool {
+        self.use_tiling
+    }
+
+    /// Enable sliced encoding/decoding for memory efficiency.
+    ///
+    /// When enabled, processes batch dimension one sample at a time,
+    /// reducing peak memory usage at the cost of some speed.
+    pub fn enable_slicing(&mut self) {
+        self.use_slicing = true;
+    }
+
+    /// Disable sliced encoding/decoding.
+    pub fn disable_slicing(&mut self) {
+        self.use_slicing = false;
+    }
+
+    /// Check if slicing is enabled.
+    pub fn is_slicing_enabled(&self) -> bool {
+        self.use_slicing
+    }
+
+    /// Internal: Encode a single batch item.
+    fn encode_single(&self, x: &Tensor) -> Result<DiagonalGaussianDistribution> {
         let h = self.encoder.forward(x)?;
         let h = self.quant_conv.forward(&h, None)?;
         DiagonalGaussianDistribution::new(&h)
     }
 
-    /// Decode latents to an image.
-    pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+    /// Internal: Decode a single batch item.
+    fn decode_single(&self, z: &Tensor) -> Result<Tensor> {
         let z = self.post_quant_conv.forward(z, None)?;
         self.decoder.forward(&z)
+    }
+
+    /// Encode an image to latent distribution.
+    ///
+    /// - If tiling is enabled, uses tiled encoding for memory efficiency.
+    /// - If slicing is enabled and batch size > 1, processes each sample independently.
+    pub fn encode(&self, x: &Tensor) -> Result<DiagonalGaussianDistribution> {
+        // Tiling takes precedence if enabled
+        if self.use_tiling {
+            let latent = self.tiled_encode(x, &self.tile_encode_config)?;
+            // Create a distribution from the latent (mode only, zero logvar)
+            let logvar = latent.zeros_like()?;
+            let combined = Tensor::cat(&[&latent, &logvar], 1)?;
+            return DiagonalGaussianDistribution::new(&combined);
+        }
+
+        let batch_size = x.dim(0)?;
+
+        if self.use_slicing && batch_size > 1 {
+            // Process batch one sample at a time
+            let mut means: Vec<Tensor> = Vec::with_capacity(batch_size);
+            let mut logvars: Vec<Tensor> = Vec::with_capacity(batch_size);
+
+            for i in 0..batch_size {
+                let x_slice = x.i(i..i + 1)?;
+                let dist = self.encode_single(&x_slice)?;
+                means.push(dist.mode().clone());
+                logvars.push(dist.logvar().clone());
+            }
+
+            // Concatenate means and logvars to reconstruct combined distribution
+            let mean = Tensor::cat(&means, 0)?;
+            let logvar = Tensor::cat(&logvars, 0)?;
+            let combined = Tensor::cat(&[&mean, &logvar], 1)?;
+            DiagonalGaussianDistribution::new(&combined)
+        } else {
+            self.encode_single(x)
+        }
+    }
+
+    /// Decode latents to an image.
+    ///
+    /// - If tiling is enabled, uses tiled decoding for memory efficiency.
+    /// - If slicing is enabled and batch size > 1, processes each sample independently.
+    pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        // Tiling takes precedence if enabled
+        if self.use_tiling {
+            return self.tiled_decode(z, &self.tile_decode_config);
+        }
+
+        let batch_size = z.dim(0)?;
+
+        if self.use_slicing && batch_size > 1 {
+            // Process batch one sample at a time
+            let mut decoded_slices = Vec::with_capacity(batch_size);
+            for i in 0..batch_size {
+                let z_slice = z.i(i..i + 1)?;
+                decoded_slices.push(self.decode_single(&z_slice)?);
+            }
+            Tensor::cat(&decoded_slices, 0)
+        } else {
+            self.decode_single(z)
+        }
     }
 
     /// Decode latents to a single image frame.
@@ -996,6 +1201,201 @@ impl AutoencoderKLQwenImage {
         // Shape: [B, C, T, H, W] -> [B, C, H, W] by taking first frame
         let (b, c, _t, h, w) = decoded.dims5()?;
         decoded.i((.., .., 0, .., ..))?.reshape((b, c, h, w))
+    }
+
+    /// Encode an image using tiled encoding for memory efficiency.
+    ///
+    /// This method splits large images into overlapping tiles, encodes each tile
+    /// separately, and blends them together in latent space to avoid seams.
+    /// Use this when full encoding fails due to GPU memory constraints.
+    ///
+    /// # Arguments
+    /// * `x` - Input image tensor [B, C, T, H, W] in pixel space
+    /// * `config` - Tiled encode configuration (tile size, stride)
+    ///
+    /// # Returns
+    /// Encoded latent distribution [B, z_dim, T, H/8, W/8]
+    pub fn tiled_encode(&self, x: &Tensor, config: &TiledEncodeConfig) -> Result<Tensor> {
+        let (_, _, _num_frames, height, width) = x.dims5()?;
+        let spatial_ratio = self.config.spatial_compression_ratio();
+
+        // Tile parameters in pixel space (separate H/W)
+        let tile_h_size = config.tile_sample_min_height;
+        let tile_w_size = config.tile_sample_min_width;
+        let tile_h_stride = config.tile_sample_stride_height;
+        let tile_w_stride = config.tile_sample_stride_width;
+
+        // Blend extents in latent space (overlap / spatial_ratio)
+        let blend_extent_h = (tile_h_size - tile_h_stride) / spatial_ratio;
+        let blend_extent_w = (tile_w_size - tile_w_stride) / spatial_ratio;
+
+        // Process tiles and collect latents
+        let mut rows: Vec<Vec<Tensor>> = Vec::new();
+
+        let mut i = 0;
+        while i < height {
+            let mut row: Vec<Tensor> = Vec::new();
+            let mut j = 0;
+
+            while j < width {
+                // Extract tile, handling boundary cases
+                let tile_h = tile_h_size.min(height - i);
+                let tile_w = tile_w_size.min(width - j);
+
+                // Get tile from input image
+                let tile = x.narrow(3, i, tile_h)?.narrow(4, j, tile_w)?;
+
+                // Encode this tile and get the mode (mean) for deterministic blending
+                let dist = self.encode_single(&tile)?;
+                let latent = dist.mode().clone();
+                row.push(latent);
+
+                if j + tile_w_size >= width {
+                    break;
+                }
+                j += tile_w_stride;
+            }
+
+            rows.push(row);
+
+            if i + tile_h_size >= height {
+                break;
+            }
+            i += tile_h_stride;
+        }
+
+        // Calculate output dimensions in latent space
+        let latent_height = height / spatial_ratio;
+        let latent_width = width / spatial_ratio;
+        let latent_h_stride = tile_h_stride / spatial_ratio;
+        let latent_w_stride = tile_w_stride / spatial_ratio;
+
+        // Blend rows together (in latent space)
+        let mut result_rows: Vec<Tensor> = Vec::new();
+
+        for (i, row) in rows.iter().enumerate() {
+            let mut blended_row: Vec<Tensor> = Vec::new();
+
+            for (j, tile) in row.iter().enumerate() {
+                let mut current_tile = tile.clone();
+
+                // Blend with tile above (vertical blending in latent space)
+                if i > 0 && !result_rows.is_empty() {
+                    current_tile =
+                        Self::blend_v_latent(&rows[i - 1][j], &current_tile, blend_extent_h)?;
+                }
+
+                // Blend with tile to the left (horizontal blending in latent space)
+                if j > 0 && !blended_row.is_empty() {
+                    current_tile =
+                        Self::blend_h_latent(&row[j - 1], &current_tile, blend_extent_w)?;
+                }
+
+                // Extract only the stride portion (non-overlapping part)
+                let (_, _, _t, h, w) = current_tile.dims5()?;
+                let extract_h = latent_h_stride.min(h);
+                let extract_w = latent_w_stride.min(w);
+
+                // For the last tiles in each direction, we need the full remaining size
+                let tile_row_idx = i;
+                let tile_col_idx = j;
+                let final_h = if tile_row_idx == rows.len() - 1 {
+                    h.min(latent_height.saturating_sub(tile_row_idx * latent_h_stride))
+                } else {
+                    extract_h
+                };
+                let final_w = if tile_col_idx == row.len() - 1 {
+                    w.min(latent_width.saturating_sub(tile_col_idx * latent_w_stride))
+                } else {
+                    extract_w
+                };
+
+                let extracted = current_tile.narrow(3, 0, final_h)?.narrow(4, 0, final_w)?;
+                blended_row.push(extracted);
+            }
+
+            // Concatenate row horizontally
+            let row_tensor = Tensor::cat(&blended_row, 4)?;
+            result_rows.push(row_tensor);
+        }
+
+        // Concatenate all rows vertically
+        let result = Tensor::cat(&result_rows, 3)?;
+
+        // Trim to exact output size
+        result
+            .narrow(3, 0, latent_height.min(result.dim(3)?))?
+            .narrow(4, 0, latent_width.min(result.dim(4)?))
+    }
+
+    /// Blend two latent tiles vertically (for tiled encoding).
+    fn blend_v_latent(a: &Tensor, b: &Tensor, blend_extent: usize) -> Result<Tensor> {
+        let (_, _, _, h_a, _) = a.dims5()?;
+        let (_, _, _, h_b, _) = b.dims5()?;
+        let blend = blend_extent.min(h_a).min(h_b);
+
+        if blend == 0 {
+            return Ok(b.clone());
+        }
+
+        let device = b.device();
+        let dtype = b.dtype();
+
+        // Get the overlap regions
+        let a_overlap = a.narrow(3, h_a - blend, blend)?;
+        let b_overlap = b.narrow(3, 0, blend)?;
+
+        // Create blend weights [1, 1, 1, blend, 1] for broadcasting
+        let weights: Vec<f32> = (0..blend).map(|y| y as f32 / blend as f32).collect();
+        let weights = Tensor::from_vec(weights, (1, 1, 1, blend, 1), device)?.to_dtype(dtype)?;
+
+        // Blended overlap = a * (1 - weight) + b * weight
+        let one_minus_w = (1.0 - &weights)?;
+        let blended =
+            (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
+
+        // Construct result: blended | b_rest
+        if blend < h_b {
+            let b_rest = b.narrow(3, blend, h_b - blend)?;
+            Tensor::cat(&[blended, b_rest], 3)
+        } else {
+            Ok(blended)
+        }
+    }
+
+    /// Blend two latent tiles horizontally (for tiled encoding).
+    fn blend_h_latent(a: &Tensor, b: &Tensor, blend_extent: usize) -> Result<Tensor> {
+        let (_, _, _, _, w_a) = a.dims5()?;
+        let (_, _, _, _, w_b) = b.dims5()?;
+        let blend = blend_extent.min(w_a).min(w_b);
+
+        if blend == 0 {
+            return Ok(b.clone());
+        }
+
+        let device = b.device();
+        let dtype = b.dtype();
+
+        // Get the overlap regions
+        let a_overlap = a.narrow(4, w_a - blend, blend)?;
+        let b_overlap = b.narrow(4, 0, blend)?;
+
+        // Create blend weights [1, 1, 1, 1, blend] for broadcasting
+        let weights: Vec<f32> = (0..blend).map(|x| x as f32 / blend as f32).collect();
+        let weights = Tensor::from_vec(weights, (1, 1, 1, 1, blend), device)?.to_dtype(dtype)?;
+
+        // Blended overlap = a * (1 - weight) + b * weight
+        let one_minus_w = (1.0 - &weights)?;
+        let blended =
+            (a_overlap.broadcast_mul(&one_minus_w)? + b_overlap.broadcast_mul(&weights)?)?;
+
+        // Construct result: blended | b_rest
+        if blend < w_b {
+            let b_rest = b.narrow(4, blend, w_b - blend)?;
+            Tensor::cat(&[blended, b_rest], 4)
+        } else {
+            Ok(blended)
+        }
     }
 
     /// Normalize latents before transformer (training normalization).
@@ -1054,12 +1454,15 @@ impl AutoencoderKLQwenImage {
         let (_, _, _num_frames, height, width) = z.dims5()?;
         let spatial_ratio = self.config.spatial_compression_ratio();
 
-        // Convert pixel-space config to latent space
-        let tile_latent_min = config.tile_sample_min_size / spatial_ratio;
-        let tile_latent_stride = config.tile_sample_stride / spatial_ratio;
+        // Convert pixel-space config to latent space (separate H/W)
+        let tile_latent_h = config.tile_sample_min_height / spatial_ratio;
+        let tile_latent_w = config.tile_sample_min_width / spatial_ratio;
+        let tile_latent_h_stride = config.tile_sample_stride_height / spatial_ratio;
+        let tile_latent_w_stride = config.tile_sample_stride_width / spatial_ratio;
 
-        // Blend extent in pixel space
-        let blend_extent = config.tile_sample_min_size - config.tile_sample_stride;
+        // Blend extents in pixel space
+        let blend_extent_h = config.tile_sample_min_height - config.tile_sample_stride_height;
+        let blend_extent_w = config.tile_sample_min_width - config.tile_sample_stride_width;
 
         // Process tiles
         let mut rows: Vec<Vec<Tensor>> = Vec::new();
@@ -1071,48 +1474,35 @@ impl AutoencoderKLQwenImage {
 
             while j < width {
                 // Extract tile, handling boundary cases
-                let tile_h = tile_latent_min.min(height - i);
-                let tile_w = tile_latent_min.min(width - j);
+                let tile_h = tile_latent_h.min(height - i);
+                let tile_w = tile_latent_w.min(width - j);
 
-                // Get tile from latent - need to handle case where tile is at boundary
-                let tile = if tile_h == tile_latent_min && tile_w == tile_latent_min {
-                    z.narrow(3, i, tile_h)?.narrow(4, j, tile_w)?
-                } else {
-                    // Pad the tile to minimum size for consistent decoding
-                    let tile_part = z.narrow(3, i, tile_h)?.narrow(4, j, tile_w)?;
-                    let device = z.device();
-                    let dtype = z.dtype();
-                    let b = z.dim(0)?;
-                    let c = z.dim(1)?;
+                // Get tile from latent
+                let tile = z.narrow(3, i, tile_h)?.narrow(4, j, tile_w)?;
 
-                    // Decode the partial tile as-is since padding zeros might cause artifacts
-                    // The VAE can handle variable-sized inputs
-                    let _ = (b, c, device, dtype); // suppress unused warnings
-                    tile_part
-                };
-
-                // Decode this tile
-                let tile_decoded = self.decode(&tile)?;
+                // Decode this tile (use decode_single to avoid infinite recursion)
+                let tile_decoded = self.decode_single(&tile)?;
                 row.push(tile_decoded);
 
-                if j + tile_latent_min >= width {
+                if j + tile_latent_w >= width {
                     break;
                 }
-                j += tile_latent_stride;
+                j += tile_latent_w_stride;
             }
 
             rows.push(row);
 
-            if i + tile_latent_min >= height {
+            if i + tile_latent_h >= height {
                 break;
             }
-            i += tile_latent_stride;
+            i += tile_latent_h_stride;
         }
 
         // Blend rows together
         let sample_height = height * spatial_ratio;
         let sample_width = width * spatial_ratio;
-        let sample_stride = config.tile_sample_stride;
+        let sample_h_stride = config.tile_sample_stride_height;
+        let sample_w_stride = config.tile_sample_stride_width;
 
         let mut result_rows: Vec<Tensor> = Vec::new();
 
@@ -1124,30 +1514,27 @@ impl AutoencoderKLQwenImage {
 
                 // Blend with tile above
                 if i > 0 && !result_rows.is_empty() {
-                    // Get the corresponding tile from the previous row
-                    let _above_row = &result_rows[result_rows.len() - 1];
-                    // Blend vertically at the overlap region
-                    current_tile = Self::blend_v(&rows[i - 1][j], &current_tile, blend_extent)?;
+                    current_tile = Self::blend_v(&rows[i - 1][j], &current_tile, blend_extent_h)?;
                 }
 
                 // Blend with tile to the left
                 if j > 0 && !blended_row.is_empty() {
-                    current_tile = Self::blend_h(&row[j - 1], &current_tile, blend_extent)?;
+                    current_tile = Self::blend_h(&row[j - 1], &current_tile, blend_extent_w)?;
                 }
 
                 // Extract only the stride portion (non-overlapping part)
                 let (_, _, _t, h, w) = current_tile.dims5()?;
-                let extract_h = sample_stride.min(h);
-                let extract_w = sample_stride.min(w);
+                let extract_h = sample_h_stride.min(h);
+                let extract_w = sample_w_stride.min(w);
 
                 // For the last tiles in each direction, we need the full remaining size
-                let final_h = if i + tile_latent_stride >= height {
-                    h.min(sample_height - i * spatial_ratio)
+                let final_h = if i == rows.len() - 1 {
+                    h.min(sample_height.saturating_sub(i * sample_h_stride))
                 } else {
                     extract_h
                 };
-                let final_w = if j + tile_latent_stride >= width {
-                    w.min(sample_width - j * spatial_ratio)
+                let final_w = if j == row.len() - 1 {
+                    w.min(sample_width.saturating_sub(j * sample_w_stride))
                 } else {
                     extract_w
                 };

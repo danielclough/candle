@@ -121,6 +121,34 @@ struct Cli {
     /// Default: Mungert/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
     gguf_vision_encoder: Option<String>,
+
+    // =========================================================================
+    // Memory optimization flags
+    // =========================================================================
+
+    /// Enable VAE slicing to reduce memory usage for batch processing.
+    /// Processes batch dimension one sample at a time.
+    #[arg(long, global = true)]
+    enable_vae_slicing: bool,
+
+    /// Enable VAE tiling to process large images with less memory.
+    /// Splits images into overlapping tiles for encode/decode.
+    #[arg(long, global = true)]
+    enable_vae_tiling: bool,
+
+    /// Tile size for VAE tiling (pixels). Default: 256.
+    #[arg(long, global = true, default_value_t = 256)]
+    vae_tile_size: usize,
+
+    /// Tile stride for VAE tiling (pixels). Default: 192 (64px overlap with 256 tile).
+    #[arg(long, global = true, default_value_t = 192)]
+    vae_tile_stride: usize,
+
+    /// Enable text Q/K/V caching for CFG optimization.
+    /// Caches text projections to skip ~33% of compute on subsequent passes.
+    /// Only effective when using True CFG with negative prompts.
+    #[arg(long, global = true)]
+    enable_text_cache: bool,
 }
 
 #[derive(Subcommand)]
@@ -382,6 +410,11 @@ fn main() -> Result<()> {
                 output,
                 seed: cli.seed,
                 model_id,
+                enable_vae_slicing: cli.enable_vae_slicing,
+                enable_vae_tiling: cli.enable_vae_tiling,
+                vae_tile_size: cli.vae_tile_size,
+                vae_tile_stride: cli.vae_tile_stride,
+                enable_text_cache: cli.enable_text_cache,
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,

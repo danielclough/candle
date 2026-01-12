@@ -7,6 +7,7 @@ use anyhow::Result;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::qwen_image::{
     apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, PromptMode,
+    TransformerTextCache,
 };
 
 use crate::common;
@@ -25,6 +26,12 @@ pub struct GenerateArgs {
     pub output: String,
     pub seed: Option<u64>,
     pub model_id: String,
+    // Memory optimization flags
+    pub enable_vae_slicing: bool,
+    pub enable_vae_tiling: bool,
+    pub vae_tile_size: usize,
+    pub vae_tile_stride: usize,
+    pub enable_text_cache: bool,
 }
 
 /// Shared model path arguments.
@@ -117,13 +124,31 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     // =========================================================================
     println!("\n[3/5] Setting up scheduler and latents...");
 
-    let vae = common::load_vae(
+    let mut vae = common::load_vae(
         paths.vae_path.as_deref(),
         &api,
         device,
         dtype,
         &args.model_id,
     )?;
+
+    // Configure VAE memory optimizations
+    if args.enable_vae_slicing {
+        vae.enable_slicing();
+        println!("  VAE slicing enabled");
+    }
+    if args.enable_vae_tiling {
+        vae.enable_tiling(
+            Some(args.vae_tile_size),
+            Some(args.vae_tile_size),
+            Some(args.vae_tile_stride),
+            Some(args.vae_tile_stride),
+        );
+        println!(
+            "  VAE tiling enabled (tile: {}px, stride: {}px)",
+            args.vae_tile_size, args.vae_tile_stride
+        );
+    }
     println!("  VAE loaded");
 
     let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
@@ -197,6 +222,24 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     // latents is [B, T, C, H, W], pack to [B, seq, C*4]
     let mut latents = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
 
+    // Setup text caching if enabled and supported
+    let use_text_cache = args.enable_text_cache && do_true_cfg && transformer.supports_text_cache();
+    let mut pos_cache = if use_text_cache {
+        transformer.create_text_cache()
+    } else {
+        None
+    };
+    let mut neg_cache = if use_text_cache {
+        transformer.create_text_cache()
+    } else {
+        None
+    };
+    if use_text_cache {
+        println!("  Text Q/K/V caching enabled");
+    } else if args.enable_text_cache && !transformer.supports_text_cache() {
+        println!("  Note: Text caching not supported for quantized models, disabled");
+    }
+
     println!("  Running {} denoising steps...", num_actual_steps);
     for (step_idx, &timestep) in timesteps
         .iter()
@@ -219,21 +262,21 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         // Convert F32 latents to BF16 for transformer (weights are BF16)
         let latents_bf16 = latents.to_dtype(dtype)?;
 
-        let noise_pred = transformer.forward(
-            &latents_bf16,
-            &pos_embeds,
-            &t,
-            &img_shapes,
-        )?;
+        // Positive pass - use cache if enabled
+        let noise_pred = if let Some(ref mut cache) = pos_cache {
+            transformer.forward_with_cache(&latents_bf16, &pos_embeds, &t, &img_shapes, cache)?
+        } else {
+            transformer.forward(&latents_bf16, &pos_embeds, &t, &img_shapes)?
+        };
 
         // Apply True CFG only if negative prompt was provided
         let noise_pred = if let Some(ref neg_emb) = &neg_embeds {
-            let neg_pred = transformer.forward(
-                &latents_bf16,
-                neg_emb,
-                &t,
-                &img_shapes,
-            )?;
+            // Negative pass - use cache if enabled
+            let neg_pred = if let Some(ref mut cache) = neg_cache {
+                transformer.forward_with_cache(&latents_bf16, neg_emb, &t, &img_shapes, cache)?
+            } else {
+                transformer.forward(&latents_bf16, neg_emb, &t, &img_shapes)?
+            };
             apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred

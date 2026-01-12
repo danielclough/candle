@@ -371,13 +371,10 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     // The [:, :, 0] extracts first temporal frame: [B, C, T, H, W] -> [B, C, H, W]
     let image = if use_tiled {
         let tile_stride = (args.tile_size * 3) / 4;
-        let config = TiledDecodeConfig {
-            tile_sample_min_size: args.tile_size,
-            tile_sample_stride: tile_stride,
-        };
+        let config = TiledDecodeConfig::uniform(args.tile_size, tile_stride);
         println!(
             "\nDecoding with tiled VAE (tile: {}px, stride: {}px)...",
-            config.tile_sample_min_size, config.tile_sample_stride
+            args.tile_size, tile_stride
         );
         let decoded = vae.tiled_decode(&latents, &config)?;
         // Extract first frame: [B, C, T, H, W] -> [B, C, H, W]

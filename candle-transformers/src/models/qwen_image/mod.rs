@@ -73,8 +73,10 @@ pub use edit_helpers::{
     EDIT_DROP_TOKENS, EDIT_PROMPT_TEMPLATE, LAYERED_DROP_TOKENS, LAYERED_PROMPT_TEMPLATE,
     TEXT_ONLY_DROP_TOKENS, TEXT_ONLY_PROMPT_TEMPLATE,
 };
+pub use blocks::TextQKVCache;
 pub use model::{
     pack_latents, unpack_latents, QwenImageTransformer2DModel, QwenTimestepProjEmbeddings,
+    TransformerTextCache,
 };
 pub use pipeline::{
     apply_true_cfg, compute_vision_size, expand_image_tokens, prepare_image_for_vae,
@@ -84,4 +86,4 @@ pub use pipeline::{
 pub use quantized::QwenImageTransformer2DModelQuantized;
 pub use rope::{apply_rotary_emb_qwen, QwenEmbedRope};
 pub use scheduler::{calculate_shift, FlowMatchEulerDiscreteScheduler};
-pub use vae::{AutoencoderKLQwenImage, TiledDecodeConfig};
+pub use vae::{AutoencoderKLQwenImage, DiagonalGaussianDistribution, TiledDecodeConfig, TiledEncodeConfig};
