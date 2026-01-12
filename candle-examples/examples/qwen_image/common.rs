@@ -31,8 +31,6 @@ pub const PATCH_SIZE: usize = 2;
 
 /// Default HuggingFace model IDs (FP16 safetensors).
 pub const DEFAULT_TEXT_ENCODER_ID: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
-pub const DEFAULT_VAE_MODEL_ID: &str = "Qwen/Qwen-Image";
-pub const DEFAULT_TRANSFORMER_ID: &str = "Qwen/Qwen-Image";
 
 /// Default GGUF model paths (HuggingFace format: owner/repo/filename).
 /// Text encoder and vision encoder use Qwen2.5-VL GGUF files from unsloth.
@@ -261,12 +259,13 @@ pub fn load_vae(
     api: &hf_hub::api::sync::Api,
     device: &Device,
     _dtype: DType, // Ignored - VAE always uses F32 for precision
+    model_id: &str,
 ) -> Result<AutoencoderKLQwenImage> {
     let vae_config = VaeConfig::qwen_image();
     let vae_file = match vae_path {
         Some(path) => std::path::PathBuf::from(path).join("diffusion_pytorch_model.safetensors"),
         None => {
-            let repo = api.repo(hf_hub::Repo::model(DEFAULT_VAE_MODEL_ID.to_string()));
+            let repo = api.repo(hf_hub::Repo::model(model_id.to_owned()));
             repo.get("vae/diffusion_pytorch_model.safetensors")?
         }
     };
@@ -400,6 +399,38 @@ impl TransformerVariant {
         match self {
             Self::FP16(model) => model.forward(img, txt, txt_mask, timestep, img_shapes, txt_lens),
             Self::Quantized(model) => {
+                model.forward(img, txt, timestep, img_shapes, txt_lens, dtype)
+            }
+        }
+    }
+
+    /// Unified forward pass with guidance support.
+    ///
+    /// For guidance-distilled models (Edit Plus, 2509/2511+), pass the guidance tensor.
+    /// For legacy models or when guidance is None, this behaves like `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_guidance(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        txt_mask: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        txt_lens: &[usize],
+        guidance: Option<&Tensor>,
+        dtype: DType,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::FP16(model) => model.forward_with_guidance(
+                img, txt, txt_mask, timestep, img_shapes, txt_lens, guidance,
+            ),
+            Self::Quantized(model) => {
+                // Quantized models don't support guidance yet
+                if guidance.is_some() {
+                    println!(
+                        "Warning: guidance_scale is not supported with quantized models, ignoring."
+                    );
+                }
                 model.forward(img, txt, timestep, img_shapes, txt_lens, dtype)
             }
         }
@@ -715,10 +746,7 @@ pub fn encode_text_prompt(
 /// Create and configure the FlowMatch Euler scheduler.
 ///
 /// Automatically calculates the dynamic shift (mu) based on image sequence length.
-pub fn create_scheduler(
-    num_inference_steps: usize,
-    image_seq_len: usize,
-) -> FlowMatchEulerDiscreteScheduler {
+pub fn create_scheduler(steps: usize, image_seq_len: usize) -> FlowMatchEulerDiscreteScheduler {
     let config = SchedulerConfig::default();
     let mu = calculate_shift(
         image_seq_len,
@@ -729,7 +757,7 @@ pub fn create_scheduler(
     );
 
     let mut scheduler = FlowMatchEulerDiscreteScheduler::new(&config);
-    scheduler.set_timesteps(num_inference_steps, None, Some(mu));
+    scheduler.set_timesteps(steps, None, Some(mu));
     scheduler
 }
 

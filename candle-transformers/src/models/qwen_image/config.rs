@@ -118,7 +118,7 @@ impl Config {
         }
     }
 
-    /// Configuration for Qwen-Image Edit model.
+    /// Configuration for Qwen-Image Edit model (legacy).
     ///
     /// The Edit model uses the same architecture as the base model but is
     /// fine-tuned for image editing tasks with vision-language conditioning.
@@ -128,6 +128,21 @@ impl Config {
     pub fn qwen_image_edit() -> Self {
         Self {
             zero_cond_t: true, // Enables per-token modulation for edit mode
+            ..Self::qwen_image()
+        }
+    }
+
+    /// Configuration for Qwen-Image Edit Plus model (2509/2511+).
+    ///
+    /// Enhanced edit model with dual-stream image conditioning:
+    /// - Low-res (384px) condition image for vision encoder understanding
+    /// - High-res (1024px) VAE image for detail preservation
+    ///
+    /// Key difference: `guidance_embeds: true` enables guidance scale as input.
+    pub fn qwen_image_edit_plus() -> Self {
+        Self {
+            zero_cond_t: true,
+            guidance_embeds: true, // Enables guidance_scale input parameter
             ..Self::qwen_image()
         }
     }

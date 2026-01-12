@@ -145,10 +145,10 @@ enum Command {
 
         /// Number of denoising steps.
         #[arg(long, default_value_t = 20)]
-        num_inference_steps: usize,
+        steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 4.0)]
+        #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
 
         /// Input image for img2img mode (optional).
@@ -162,6 +162,10 @@ enum Command {
         /// Output filename.
         #[arg(long, default_value = "qwen_image_output.png")]
         output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-2511")]
+        model_id: String,
     },
 
     /// Image editing with text instructions.
@@ -180,19 +184,19 @@ enum Command {
 
         /// Number of denoising steps.
         #[arg(long, default_value_t = 20)]
-        num_inference_steps: usize,
+        steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 4.0)]
+        #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
+
+        /// Guidance scale for distilled models (edit-plus only, 2509/2511+).
+        #[arg(long)]
+        guidance_scale: Option<f64>,
 
         /// HuggingFace model ID for the transformer.
         #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
         model_id: String,
-
-        /// HuggingFace model ID for the VAE.
-        #[arg(long, default_value = "Qwen/Qwen-Image")]
-        vae_model_id: String,
 
         /// Output height (overrides max_resolution if both height and width specified).
         #[arg(long)]
@@ -244,15 +248,19 @@ enum Command {
 
         /// Number of denoising steps.
         #[arg(long, default_value_t = 20)]
-        num_inference_steps: usize,
+        steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 4.0)]
+        #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
 
         /// Output filename.
         #[arg(long, default_value = "inpainted_output.png")]
         output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
     },
 
     /// Layer decomposition: split image into transparent layers.
@@ -279,15 +287,19 @@ enum Command {
 
         /// Number of denoising steps.
         #[arg(long, default_value_t = 20)]
-        num_inference_steps: usize,
+        steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 4.0)]
+        #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
 
         /// Output directory for layer images.
         #[arg(long, default_value = "./layers")]
         output_dir: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
     },
 
     /// ControlNet-guided generation.
@@ -314,10 +326,10 @@ enum Command {
 
         /// Number of denoising steps.
         #[arg(long, default_value_t = 20)]
-        num_inference_steps: usize,
+        steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 4.0)]
+        #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
 
         /// ControlNet conditioning scale (0.0 = no control, 1.0 = full control).
@@ -331,6 +343,10 @@ enum Command {
         /// Output filename.
         #[arg(long, default_value = "controlnet_output.png")]
         output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
     },
 }
 
@@ -351,23 +367,25 @@ fn main() -> Result<()> {
             negative_prompt,
             height,
             width,
-            num_inference_steps,
+            steps,
             true_cfg_scale,
             init_image,
             strength,
             output,
+            model_id,
         } => {
             let args = generate::GenerateArgs {
                 prompt,
                 negative_prompt,
                 height,
                 width,
-                num_inference_steps,
+                steps,
                 true_cfg_scale,
                 init_image,
                 strength,
                 output,
                 seed: cli.seed,
+                model_id,
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,
@@ -384,10 +402,10 @@ fn main() -> Result<()> {
             input_image,
             prompt,
             negative_prompt,
-            num_inference_steps,
+            steps,
             true_cfg_scale,
+            guidance_scale,
             model_id,
-            vae_model_id,
             height,
             width,
             max_resolution,
@@ -400,10 +418,10 @@ fn main() -> Result<()> {
                 input_image,
                 prompt,
                 negative_prompt,
-                num_inference_steps,
+                steps: steps,
                 true_cfg_scale,
+                guidance_scale,
                 model_id,
-                _vae_model_id: vae_model_id,
                 height,
                 width,
                 max_resolution,
@@ -431,18 +449,20 @@ fn main() -> Result<()> {
             mask,
             prompt,
             negative_prompt,
-            num_inference_steps,
+            steps,
             true_cfg_scale,
             output,
+            model_id,
         } => {
             let args = inpaint::InpaintArgs {
                 input_image,
                 mask,
                 prompt,
                 negative_prompt,
-                num_inference_steps,
+                steps,
                 true_cfg_scale,
                 output,
+                model_id,
             };
             let paths = inpaint::InpaintModelPaths {
                 transformer_path: cli.transformer_path,
@@ -459,9 +479,10 @@ fn main() -> Result<()> {
             negative_prompt,
             layers,
             resolution,
-            num_inference_steps,
+            steps,
             true_cfg_scale,
             output_dir,
+            model_id,
         } => {
             let args = layered::LayeredArgs {
                 input_image,
@@ -469,9 +490,10 @@ fn main() -> Result<()> {
                 negative_prompt,
                 layers,
                 resolution,
-                num_inference_steps,
+                steps,
                 true_cfg_scale,
                 output_dir,
+                model_id,
             };
             let paths = layered::LayeredModelPaths {
                 transformer_path: cli.transformer_path,
@@ -488,11 +510,12 @@ fn main() -> Result<()> {
             control_image,
             height,
             width,
-            num_inference_steps,
+            steps,
             true_cfg_scale,
             controlnet_scale,
             controlnet_path,
             output,
+            model_id,
         } => {
             let args = controlnet::ControlnetArgs {
                 prompt,
@@ -500,10 +523,11 @@ fn main() -> Result<()> {
                 control_image,
                 height,
                 width,
-                num_inference_steps,
+                steps,
                 true_cfg_scale,
                 controlnet_scale,
                 output,
+                model_id,
             };
             let paths = controlnet::ControlnetModelPaths {
                 transformer_path: cli.transformer_path,

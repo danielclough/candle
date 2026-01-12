@@ -18,12 +18,13 @@ pub struct GenerateArgs {
     pub negative_prompt: String,
     pub height: usize,
     pub width: usize,
-    pub num_inference_steps: usize,
+    pub steps: usize,
     pub true_cfg_scale: f64,
     pub init_image: Option<String>,
     pub strength: f64,
     pub output: String,
     pub seed: Option<u64>,
+    pub model_id: String,
 }
 
 /// Shared model path arguments.
@@ -66,7 +67,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     let encoder_type = if text_model.is_quantized() {
         "quantized GGUF"
     } else {
-        &format!("{:?}",dtype)
+        &format!("{:?}", dtype)
     };
     println!("  Text encoder loaded ({})", encoder_type);
 
@@ -116,15 +117,21 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     // =========================================================================
     println!("\n[3/5] Setting up scheduler and latents...");
 
-    let vae = common::load_vae(paths.vae_path.as_deref(), &api, device, dtype)?;
+    let vae = common::load_vae(
+        paths.vae_path.as_deref(),
+        &api,
+        device,
+        dtype,
+        &args.model_id,
+    )?;
     println!("  VAE loaded");
 
-    let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
+    let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
 
     // Calculate start step for img2img
     let (num_actual_steps, start_step) = if args.init_image.is_some() {
-        let t_start = ((1.0 - args.strength) * args.num_inference_steps as f64).round() as usize;
-        let actual_steps = args.num_inference_steps - t_start;
+        let t_start = ((1.0 - args.strength) * args.steps as f64).round() as usize;
+        let actual_steps = args.steps - t_start;
         println!(
             "  img2img mode: strength={:.2}, skipping first {} steps",
             args.strength, t_start
@@ -132,7 +139,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         scheduler.set_begin_index(t_start);
         (actual_steps, t_start)
     } else {
-        (args.num_inference_steps, 0)
+        (args.steps, 0)
     };
 
     // Create initial latents
@@ -178,7 +185,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
-        common::DEFAULT_TRANSFORMER_ID,
+        &args.model_id,
         &config,
         &api,
         device,
@@ -198,9 +205,9 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     // Compute txt_seq_lens from attention mask sum (matching HuggingFace diffusers)
     // This correctly handles any padding in the embeddings.
     let pos_txt_seq_lens = vec![pos_mask.sum_all()?.to_scalar::<f32>()? as usize];
-    let neg_txt_seq_lens = neg_data
-        .as_ref()
-        .map(|(_, neg_mask)| vec![neg_mask.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]);
+    let neg_txt_seq_lens = neg_data.as_ref().map(|(_, neg_mask)| {
+        vec![neg_mask.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]
+    });
     let timesteps = scheduler.timesteps().to_vec();
 
     // Pack latents immediately - PyTorch keeps latents packed throughout the loop
@@ -219,7 +226,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
             println!(
                 "    Step {}/{}, timestep: {:.2}",
                 step + 1,
-                args.num_inference_steps,
+                args.steps,
                 timestep
             );
         }
@@ -241,20 +248,19 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 
         // Apply True CFG only if negative prompt was provided
         // Note: neg_txt_seq_lens is computed separately from neg_mask (matching HuggingFace)
-        let noise_pred =
-            if let (Some((ref neg_embeds, ref neg_mask)), Some(ref neg_seq_lens)) =
-                (&neg_data, &neg_txt_seq_lens)
-            {
-                let neg_pred = transformer.forward(
-                    &latents_bf16,
-                    neg_embeds,
-                    neg_mask,
-                    &t,
-                    &img_shapes,
-                    neg_seq_lens,
-                    dtype,
-                )?;
-                apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
+        let noise_pred = if let (Some((ref neg_embeds, ref neg_mask)), Some(ref neg_seq_lens)) =
+            (&neg_data, &neg_txt_seq_lens)
+        {
+            let neg_pred = transformer.forward(
+                &latents_bf16,
+                neg_embeds,
+                neg_mask,
+                &t,
+                &img_shapes,
+                neg_seq_lens,
+                dtype,
+            )?;
+            apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred
         };

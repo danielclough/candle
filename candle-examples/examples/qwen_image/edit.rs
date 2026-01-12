@@ -33,10 +33,10 @@ pub struct EditArgs {
     pub input_image: String,
     pub prompt: String,
     pub negative_prompt: String,
-    pub num_inference_steps: usize,
+    pub steps: usize,
     pub true_cfg_scale: f64,
+    pub guidance_scale: Option<f64>,
     pub model_id: String,
-    pub _vae_model_id: String,
     pub height: Option<usize>,
     pub width: Option<usize>,
     pub max_resolution: usize,
@@ -59,7 +59,28 @@ pub struct EditModelPaths {
 }
 
 pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType) -> Result<()> {
+    // Auto-detect pipeline type based on model ID
+    let use_plus = args.model_id.contains("2509")
+        || args.model_id.contains("2511")
+        || args.model_id.contains("Plus");
+    let pipeline_name = if use_plus {
+        "QwenImageEditPlusPipeline"
+    } else {
+        "QwenImageEditPipeline"
+    };
+
+    // Warn about guidance_scale with legacy pipeline
+    if !use_plus && args.guidance_scale.is_some() {
+        println!();
+        println!("{}", "!".repeat(60));
+        println!("WARNING: --guidance-scale has no effect with legacy pipeline.");
+        println!("Use a newer model (2509/2511) for guidance_scale support.");
+        println!("{}", "!".repeat(60));
+        println!();
+    }
+
     println!("Qwen-Image Edit");
+    println!("Pipeline: {}", pipeline_name);
     println!("Device: {:?}, DType: {:?}", device, dtype);
     println!("Model: {}", args.model_id);
     println!("Input image: {}", args.input_image);
@@ -72,8 +93,13 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
             &args.negative_prompt
         }
     );
-    println!("CFG scale: {}", args.true_cfg_scale);
-    println!("Steps: {}", args.num_inference_steps);
+    println!("True CFG scale: {}", args.true_cfg_scale);
+    if use_plus {
+        if let Some(gs) = args.guidance_scale {
+            println!("Guidance scale: {}", gs);
+        }
+    }
+    println!("Steps: {}", args.steps);
 
     // Warn if CFG is specified but no negative prompt (matching Python behavior)
     if args.negative_prompt.is_empty() && args.true_cfg_scale != 1.0 {
@@ -112,7 +138,13 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     // =========================================================================
     println!("\n[2/5] Loading VAE and encoding input image...");
 
-    let vae = common::load_vae(paths.vae_path.as_deref(), &api, device, dtype)?;
+    let vae = common::load_vae(
+        paths.vae_path.as_deref(),
+        &api,
+        device,
+        dtype,
+        &args.model_id,
+    )?;
     println!("  VAE loaded");
 
     let vae_input =
@@ -141,7 +173,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         device,
         DType::F32,
     )?;
-    println!("  Vision encoder loaded ({:?})",dtype);
+    println!("  Vision encoder loaded ({:?})", dtype);
 
     // Preprocess input image for vision encoder (F32)
     // Constrain to target dimensions to match Python behavior
@@ -173,7 +205,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let encoder_type = if text_model.is_quantized() {
         "quantized GGUF"
     } else {
-        &format!("{:?}",dtype)
+        &format!("{:?}", dtype)
     };
     println!("  Text encoder loaded ({})", encoder_type);
 
@@ -218,7 +250,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     // =========================================================================
     println!("\n[4/5] Loading transformer and setting up denoising...");
 
-    let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
+    let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
 
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use [B, T, C, H, W] format to match PyTorch diffusers
@@ -246,8 +278,12 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let packed_image = pack_latents(&image_latents, dims.latent_height, dims.latent_width)?;
     let packed_image = packed_image.to_dtype(dtype)?;
 
-    // Load transformer
-    let config = Config::qwen_image_edit();
+    // Load transformer - select config based on pipeline type
+    let config = if use_plus {
+        Config::qwen_image_edit_plus()
+    } else {
+        Config::qwen_image_edit()
+    };
     let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
@@ -260,7 +296,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let model_type = if transformer.is_quantized() {
         "quantized GGUF"
     } else {
-        &format!("{:?}",dtype)
+        &format!("{:?}", dtype)
     };
     println!(
         "  Transformer loaded ({} layers, {})",
@@ -288,12 +324,24 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
-    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
-        if step % 10 == 0 || step == args.num_inference_steps - 1 {
+    // Create guidance tensor for guidance-distilled models (Edit Plus)
+    let guidance = if use_plus {
+        args.guidance_scale.map(|gs| {
+            Tensor::new(&[gs as f32], device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+        })
+    } else {
+        None
+    };
+
+    for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
+        if step % 10 == 0 || step == args.steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
                 step + 1,
-                args.num_inference_steps,
+                args.steps,
                 timestep
             );
         }
@@ -305,13 +353,14 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         // Note: Timestep doubling for zero_cond_t is handled internally by the transformer
-        let pos_pred = transformer.forward(
+        let pos_pred = transformer.forward_with_guidance(
             &latent_model_input,
             &pos_embeds,
             &pos_mask,
             &t,
             &img_shapes,
             &pos_txt_seq_lens,
+            guidance.as_ref(),
             dtype,
         )?;
 
@@ -323,13 +372,14 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) =
             (&neg_embeds, &neg_mask, &neg_txt_seq_lens)
         {
-            let neg_pred = transformer.forward(
+            let neg_pred = transformer.forward_with_guidance(
                 &latent_model_input,
                 neg_embeds,
                 neg_mask,
                 &t,
                 &img_shapes,
                 neg_seq_lens,
+                guidance.as_ref(),
                 dtype,
             )?;
 

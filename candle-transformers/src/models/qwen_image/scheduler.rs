@@ -118,15 +118,10 @@ impl FlowMatchEulerDiscreteScheduler {
     /// Set timesteps for inference.
     ///
     /// # Arguments
-    /// * `num_inference_steps` - Number of denoising steps
+    /// * `steps` - Number of denoising steps
     /// * `sigmas` - Optional custom sigma schedule (overrides default linspace)
     /// * `mu` - Optional shift parameter for dynamic shifting
-    pub fn set_timesteps(
-        &mut self,
-        num_inference_steps: usize,
-        sigmas: Option<&[f64]>,
-        mu: Option<f64>,
-    ) {
+    pub fn set_timesteps(&mut self, steps: usize, sigmas: Option<&[f64]>, mu: Option<f64>) {
         // Generate or use provided sigmas
         let mut sigmas = if let Some(s) = sigmas {
             s.to_vec()
@@ -135,12 +130,8 @@ impl FlowMatchEulerDiscreteScheduler {
             // This ensures the schedule reaches near-zero noise at the final step
             let sigma_max = 1.0;
             let sigma_min = 1.0 / self.num_train_timesteps as f64;
-            (0..num_inference_steps)
-                .map(|i| {
-                    sigma_max
-                        - (sigma_max - sigma_min) * i as f64
-                            / (num_inference_steps - 1).max(1) as f64
-                })
+            (0..steps)
+                .map(|i| sigma_max - (sigma_max - sigma_min) * i as f64 / (steps - 1).max(1) as f64)
                 .collect()
         };
 
@@ -179,7 +170,7 @@ impl FlowMatchEulerDiscreteScheduler {
     }
 
     /// Get the number of inference steps.
-    pub fn num_inference_steps(&self) -> usize {
+    pub fn steps(&self) -> usize {
         self.sigmas.len().saturating_sub(1)
     }
 

@@ -98,6 +98,45 @@ impl AdaLayerNormContinuous {
     }
 }
 
+/// Guidance projection embeddings (for guidance-distilled models).
+///
+/// Converts guidance scale to embeddings using the same structure as timestep embeddings.
+#[derive(Debug, Clone)]
+pub struct QwenGuidanceProjEmbeddings {
+    /// Projects sinusoidal embeddings to hidden dimension
+    guidance_embedder_linear1: Linear,
+    guidance_embedder_linear2: Linear,
+}
+
+impl QwenGuidanceProjEmbeddings {
+    pub fn new(embedding_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let guidance_embedder_linear1 =
+            candle_nn::linear(256, embedding_dim, vb.pp("guidance_embedder.linear_1"))?;
+        let guidance_embedder_linear2 = candle_nn::linear(
+            embedding_dim,
+            embedding_dim,
+            vb.pp("guidance_embedder.linear_2"),
+        )?;
+        Ok(Self {
+            guidance_embedder_linear1,
+            guidance_embedder_linear2,
+        })
+    }
+
+    pub fn forward(&self, guidance: &Tensor, dtype: DType) -> Result<Tensor> {
+        // Create sinusoidal embeddings (256-dim) from guidance scale
+        let guidance_proj = timestep_embedding(guidance, 256, dtype)?;
+
+        // Project through MLP: 256 -> embedding_dim -> embedding_dim
+        let guidance_emb = guidance_proj
+            .apply(&self.guidance_embedder_linear1)?
+            .silu()?
+            .apply(&self.guidance_embedder_linear2)?;
+
+        Ok(guidance_emb)
+    }
+}
+
 /// Qwen-Image Transformer 2D Model.
 ///
 /// A 20B parameter dual-stream MMDiT that processes packed image latents
@@ -116,6 +155,12 @@ impl AdaLayerNormContinuous {
 /// - `modulate_index` tensor marks which modulation to use per token:
 ///   - Index 0 (actual timestep): for noise latents being denoised
 ///   - Index 1 (zero timestep): for reference image latents (conditioning)
+///
+/// # Guidance Embeddings (guidance_embeds)
+///
+/// When `guidance_embeds` is enabled, the model accepts a guidance scale parameter
+/// that is embedded and added to the timestep embedding. This is used by
+/// guidance-distilled models (Edit Plus, 2509/2511+).
 ///
 /// # Example
 ///
@@ -143,6 +188,9 @@ pub struct QwenImageTransformer2DModel {
     /// Timestep embedding projection
     time_text_embed: QwenTimestepProjEmbeddings,
 
+    /// Optional guidance embedding projection (for guidance-distilled models)
+    guidance_embed: Option<QwenGuidanceProjEmbeddings>,
+
     /// Text input normalization
     txt_norm: RmsNorm,
 
@@ -164,6 +212,9 @@ pub struct QwenImageTransformer2DModel {
     /// Whether to use zero conditioning for timestep (edit mode).
     /// When true, doubles timestep and uses per-token modulation.
     zero_cond_t: bool,
+
+    /// Whether to use guidance embeddings (guidance-distilled models).
+    guidance_embeds: bool,
 }
 
 impl QwenImageTransformer2DModel {
@@ -187,6 +238,16 @@ impl QwenImageTransformer2DModel {
 
         // Timestep embeddings
         let time_text_embed = QwenTimestepProjEmbeddings::new(inner_dim, vb.pp("time_text_embed"))?;
+
+        // Guidance embeddings (optional, for guidance-distilled models)
+        let guidance_embed = if config.guidance_embeds {
+            Some(QwenGuidanceProjEmbeddings::new(
+                inner_dim,
+                vb.pp("time_text_embed"),
+            )?)
+        } else {
+            None
+        };
 
         // Text normalization (RMSNorm before projection)
         let txt_norm_weight = vb.get(config.joint_attention_dim, "txt_norm.weight")?;
@@ -223,6 +284,7 @@ impl QwenImageTransformer2DModel {
             _patch_size: config.patch_size,
             pos_embed,
             time_text_embed,
+            guidance_embed,
             txt_norm,
             img_in,
             txt_in,
@@ -230,6 +292,7 @@ impl QwenImageTransformer2DModel {
             norm_out,
             proj_out,
             zero_cond_t: config.zero_cond_t,
+            guidance_embeds: config.guidance_embeds,
         })
     }
 
@@ -262,7 +325,7 @@ impl QwenImageTransformer2DModel {
         img_shapes: &[(usize, usize, usize)],
         txt_seq_lens: &[usize],
     ) -> Result<Tensor> {
-        self.forward_with_controlnet(
+        self.forward_with_guidance_and_controlnet(
             hidden_states,
             encoder_hidden_states,
             encoder_hidden_states_mask,
@@ -270,13 +333,11 @@ impl QwenImageTransformer2DModel {
             img_shapes,
             txt_seq_lens,
             None,
+            None,
         )
     }
 
-    /// Forward pass with optional ControlNet residuals.
-    ///
-    /// This method allows applying ControlNet-generated residuals at each
-    /// transformer block, enabling conditional control over the generation.
+    /// Forward pass with guidance scale (for guidance-distilled models).
     ///
     /// # Arguments
     /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
@@ -285,19 +346,77 @@ impl QwenImageTransformer2DModel {
     /// * `timestep` - Diffusion timestep [batch]
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
     /// * `txt_seq_lens` - Text sequence lengths per batch item
+    /// * `guidance` - Optional guidance scale tensor [batch]
+    ///
+    /// # Returns
+    /// Output predictions [batch, img_seq, patch_size² × out_channels]
+    pub fn forward_with_guidance(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        encoder_hidden_states_mask: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        txt_seq_lens: &[usize],
+        guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_with_guidance_and_controlnet(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            img_shapes,
+            txt_seq_lens,
+            guidance,
+            None,
+        )
+    }
+
+    /// Forward pass with optional ControlNet residuals (legacy, no guidance support).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_controlnet(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        encoder_hidden_states_mask: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        txt_seq_lens: &[usize],
+        controlnet_residuals: Option<&[Tensor]>,
+    ) -> Result<Tensor> {
+        self.forward_with_guidance_and_controlnet(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            img_shapes,
+            txt_seq_lens,
+            None,
+            controlnet_residuals,
+        )
+    }
+
+    /// Forward pass with optional guidance and ControlNet residuals.
+    ///
+    /// This is the full-featured forward method that supports:
+    /// - Guidance embeddings for guidance-distilled models
+    /// - ControlNet residuals for conditional control
+    /// - Zero conditioning for edit mode
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
+    /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
+    /// * `encoder_hidden_states_mask` - Text attention mask [batch, txt_seq]
+    /// * `timestep` - Diffusion timestep [batch]
+    /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
+    /// * `txt_seq_lens` - Text sequence lengths per batch item
+    /// * `guidance` - Optional guidance scale tensor [batch] (for guidance-distilled models)
     /// * `controlnet_residuals` - Optional residuals from ControlNet, one per block
     ///
     /// # Returns
     /// Output predictions [batch, img_seq, patch_size² × out_channels]
-    ///
-    /// # ControlNet Integration
-    ///
-    /// When `controlnet_residuals` is provided, each residual is added to the
-    /// corresponding block's output. Typically, ControlNet only provides residuals
-    /// for a subset of blocks (e.g., first 5 of 60), so residuals are applied
-    /// to blocks at matching indices.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_controlnet(
+    pub fn forward_with_guidance_and_controlnet(
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: &Tensor,
@@ -305,10 +424,18 @@ impl QwenImageTransformer2DModel {
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
         _txt_seq_lens: &[usize],
+        guidance: Option<&Tensor>,
         controlnet_residuals: Option<&[Tensor]>,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
         let device = hidden_states.device();
+
+        // Validate guidance configuration
+        if self.guidance_embeds && guidance.is_none() {
+            candle::bail!(
+                "guidance is required for guidance-distilled model (guidance_embeds=true)"
+            );
+        }
 
         // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
         let mut hidden_states = hidden_states.apply(&self.img_in)?;
@@ -338,7 +465,19 @@ impl QwenImageTransformer2DModel {
         };
 
         // Compute timestep embedding (doubled if zero_cond_t)
-        let temb = self.time_text_embed.forward(&timestep, dtype)?;
+        let mut temb = self.time_text_embed.forward(&timestep, dtype)?;
+
+        // Add guidance embedding if using guidance-distilled model
+        if let (Some(guidance_embedder), Some(guidance_tensor)) = (&self.guidance_embed, guidance) {
+            let guidance_emb = guidance_embedder.forward(guidance_tensor, dtype)?;
+            // For zero_cond_t mode, we need to expand guidance to match doubled timestep
+            let guidance_emb = if self.zero_cond_t {
+                Tensor::cat(&[&guidance_emb, &guidance_emb], 0)?
+            } else {
+                guidance_emb
+            };
+            temb = (&temb + &guidance_emb)?;
+        }
 
         // Derive text sequence length from actual encoder_hidden_states shape
         let txt_seq_len = encoder_hidden_states.dim(1)?;

@@ -20,9 +20,10 @@ pub struct LayeredArgs {
     pub negative_prompt: String,
     pub layers: usize,
     pub resolution: usize,
-    pub num_inference_steps: usize,
+    pub steps: usize,
     pub true_cfg_scale: f64,
     pub output_dir: String,
+    pub model_id: String,
 }
 
 /// Model paths for the layered pipeline.
@@ -83,7 +84,13 @@ pub fn run(
     // =========================================================================
     println!("\n[2/5] Loading VAE and encoding input image...");
 
-    let vae = common::load_vae(paths.vae_path.as_deref(), &api, device, dtype)?;
+    let vae = common::load_vae(
+        paths.vae_path.as_deref(),
+        &api,
+        device,
+        dtype,
+        &args.model_id,
+    )?;
     println!("  VAE loaded");
 
     let vae_input =
@@ -140,7 +147,7 @@ pub fn run(
         args.layers
     );
 
-    let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
+    let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
 
     // Create initial noise for all layers: [batch, layers+1, channels, height, width]
     // Keep in F32 to avoid BF16 quantization error accumulating across steps
@@ -187,7 +194,7 @@ pub fn run(
     let config = Config::qwen_image_layered();
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
-        common::DEFAULT_TRANSFORMER_ID,
+        &args.model_id,
         &config,
         &api,
         device,
@@ -211,12 +218,12 @@ pub fn run(
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
-    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
-        if step % 10 == 0 || step == args.num_inference_steps - 1 {
+    for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
+        if step % 10 == 0 || step == args.steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
                 step + 1,
-                args.num_inference_steps,
+                args.steps,
                 timestep
             );
         }

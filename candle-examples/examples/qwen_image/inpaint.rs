@@ -18,9 +18,10 @@ pub struct InpaintArgs {
     pub mask: String,
     pub prompt: String,
     pub negative_prompt: String,
-    pub num_inference_steps: usize,
+    pub steps: usize,
     pub true_cfg_scale: f64,
     pub output: String,
+    pub model_id: String,
 }
 
 /// Model paths for the inpaint pipeline.
@@ -50,7 +51,13 @@ pub fn run(
     // =========================================================================
     println!("\n[1/5] Loading VAE and encoding input image...");
 
-    let vae = common::load_vae(paths.vae_path.as_deref(), &api, device, dtype)?;
+    let vae = common::load_vae(
+        paths.vae_path.as_deref(),
+        &api,
+        device,
+        dtype,
+        &args.model_id,
+    )?;
     println!("  VAE loaded");
 
     // Load input image and get dimensions
@@ -132,7 +139,7 @@ pub fn run(
     // =========================================================================
     println!("\n[3/5] Setting up scheduler...");
 
-    let mut scheduler = common::create_scheduler(args.num_inference_steps, dims.image_seq_len);
+    let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
 
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use PyTorch-compatible RNG for consistent noise distribution
@@ -159,7 +166,7 @@ pub fn run(
     let config = Config::qwen_image();
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
-        common::DEFAULT_TRANSFORMER_ID,
+        &args.model_id,
         &config,
         &api,
         device,
@@ -173,13 +180,13 @@ pub fn run(
     let timesteps = scheduler.timesteps().to_vec();
     let sigmas = scheduler.sigmas().to_vec();
 
-    println!("  Running {} denoising steps...", args.num_inference_steps);
-    for (step, &timestep) in timesteps.iter().take(args.num_inference_steps).enumerate() {
-        if step % 10 == 0 || step == args.num_inference_steps - 1 {
+    println!("  Running {} denoising steps...", args.steps);
+    for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
+        if step % 10 == 0 || step == args.steps - 1 {
             println!(
                 "    Step {}/{}, timestep: {:.2}",
                 step + 1,
-                args.num_inference_steps,
+                args.steps,
                 timestep
             );
         }
