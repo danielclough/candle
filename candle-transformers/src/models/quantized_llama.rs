@@ -122,7 +122,8 @@ impl Module for MlpOrMoe {
                     let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
                     let selected_rws =
                         Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
-                            .reshape(((), 1))?;
+                            .reshape(((), 1))?
+                            .to_dtype(xs.dtype())?;
                     // Index the correct hidden states and compute the expert hidden state for
                     // the current expert. We need to make sure to multiply the output hidden
                     // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
