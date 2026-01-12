@@ -141,7 +141,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         device,
         DType::F32,
     )?;
-    println!("  Vision encoder loaded (F32)");
+    println!("  Vision encoder loaded ({:?})",dtype);
 
     // Preprocess input image for vision encoder (F32)
     // Constrain to target dimensions to match Python behavior
@@ -173,7 +173,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let encoder_type = if text_model.is_quantized() {
         "quantized GGUF"
     } else {
-        "FP16"
+        &format!("{:?}",dtype)
     };
     println!("  Text encoder loaded ({})", encoder_type);
 
@@ -260,7 +260,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let model_type = if transformer.is_quantized() {
         "quantized GGUF"
     } else {
-        "FP16"
+        &format!("{:?}",dtype)
     };
     println!(
         "  Transformer loaded ({} layers, {})",
@@ -277,10 +277,13 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         (1, dims.packed_height, dims.packed_width), // Noise latents
         (1, dims.packed_height, dims.packed_width), // Image latents
     ];
-    // Text sequence lengths for RoPE - must match actual embedding lengths!
+    // Text sequence lengths for RoPE - compute from attention mask sum (matching HuggingFace)
+    // This correctly handles any padding in the embeddings.
     // Positive and negative prompts may have different token counts.
-    let pos_txt_seq_lens = vec![pos_embeds.dim(1)?];
-    let neg_txt_seq_lens = neg_embeds.as_ref().map(|e| vec![e.dim(1).unwrap()]);
+    let pos_txt_seq_lens = vec![pos_mask.sum_all()?.to_scalar::<f32>()? as usize];
+    let neg_txt_seq_lens = neg_mask
+        .as_ref()
+        .map(|m| vec![m.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]);
 
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;

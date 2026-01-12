@@ -66,7 +66,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     let encoder_type = if text_model.is_quantized() {
         "quantized GGUF"
     } else {
-        "FP16"
+        &format!("{:?}",dtype)
     };
     println!("  Text encoder loaded ({})", encoder_type);
 
@@ -195,7 +195,12 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     );
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
-    let txt_seq_lens = vec![pos_embeds.dim(1)?];
+    // Compute txt_seq_lens from attention mask sum (matching HuggingFace diffusers)
+    // This correctly handles any padding in the embeddings.
+    let pos_txt_seq_lens = vec![pos_mask.sum_all()?.to_scalar::<f32>()? as usize];
+    let neg_txt_seq_lens = neg_data
+        .as_ref()
+        .map(|(_, neg_mask)| vec![neg_mask.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]);
     let timesteps = scheduler.timesteps().to_vec();
 
     // Pack latents immediately - PyTorch keeps latents packed throughout the loop
@@ -230,22 +235,26 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
             &pos_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
+            &pos_txt_seq_lens,
             dtype,
         )?;
 
         // Apply True CFG only if negative prompt was provided
-        let noise_pred = if let Some((ref neg_embeds, ref neg_mask)) = neg_data {
-            let neg_pred = transformer.forward(
-                &latents_bf16,
-                neg_embeds,
-                neg_mask,
-                &t,
-                &img_shapes,
-                &txt_seq_lens,
-                dtype,
-            )?;
-            apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
+        // Note: neg_txt_seq_lens is computed separately from neg_mask (matching HuggingFace)
+        let noise_pred =
+            if let (Some((ref neg_embeds, ref neg_mask)), Some(ref neg_seq_lens)) =
+                (&neg_data, &neg_txt_seq_lens)
+            {
+                let neg_pred = transformer.forward(
+                    &latents_bf16,
+                    neg_embeds,
+                    neg_mask,
+                    &t,
+                    &img_shapes,
+                    neg_seq_lens,
+                    dtype,
+                )?;
+                apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             noise_pred
         };

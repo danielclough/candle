@@ -107,15 +107,6 @@ pub fn setup_tracing(enabled: bool) -> Option<tracing_chrome::FlushGuard> {
     }
 }
 
-/// Setup compute device and dtype based on arguments.
-///
-/// Precision modes:
-/// - Default: BF16 (mixed precision - best balance of speed and quality)
-/// - `--use-f16`: Falls back to BF16 (F16 causes NaN in attention due to limited dynamic range)
-/// - `--use-f32`: F32 (maximum precision, useful for debugging)
-///
-/// Note: Device seeding is only supported on Metal/CUDA. For CPU, the seed is
-/// handled by `MtBoxMullerRng` in the generate pipeline for reproducible latents.
 pub fn setup_device_and_dtype(
     cpu: bool,
     use_f32: bool,
@@ -133,11 +124,7 @@ pub fn setup_device_and_dtype(
     let dtype = if use_f32 {
         DType::F32
     } else if use_f16 {
-        // F16 has insufficient dynamic range for attention computations in diffusion
-        // models, causing NaN/overflow in softmax. Fall back to BF16 which has the
-        // same dynamic range as F32 but with reduced precision.
-        println!("Warning: F16 causes NaN in attention, falling back to BF16");
-        device.bf16_default_to_f32()
+        DType::F16
     } else {
         // Default: BF16 with F32 fallback for devices that don't support BF16
         device.bf16_default_to_f32()
