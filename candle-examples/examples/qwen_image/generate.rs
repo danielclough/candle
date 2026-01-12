@@ -7,7 +7,6 @@ use anyhow::Result;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::qwen_image::{
     apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, PromptMode,
-    TransformerTextCache,
 };
 
 use crate::common;

@@ -1166,9 +1166,7 @@ impl BackendStorage for MetalStorage {
         let shape = layout.shape();
         let dims = shape.dims();
 
-        let d = dims[2];
-        let h = dims[3];
-        let w = dims[4];
+        // dims: [batch, channels, depth, height, width]
         let d_out = params.out_d();
         let h_out = params.out_h();
         let w_out = params.out_w();

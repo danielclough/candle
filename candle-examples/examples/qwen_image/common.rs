@@ -488,6 +488,7 @@ impl TransformerVariant {
 ///
 /// # Arguments
 /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
+#[allow(clippy::too_many_arguments)]
 pub fn load_transformer_variant(
     transformer_path: Option<&str>,
     gguf_path: Option<&str>,
