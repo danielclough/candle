@@ -309,10 +309,8 @@ impl QwenImageTransformer2DModel {
     /// # Arguments
     /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
     /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
-    /// * `encoder_hidden_states_mask` - Text attention mask [batch, txt_seq]
     /// * `timestep` - Diffusion timestep [batch]
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
-    /// * `txt_seq_lens` - Text sequence lengths per batch item
     ///
     /// # Returns
     /// Output predictions [batch, img_seq, patch_size² × out_channels]
@@ -320,18 +318,14 @@ impl QwenImageTransformer2DModel {
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: &Tensor,
-        encoder_hidden_states_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_seq_lens: &[usize],
     ) -> Result<Tensor> {
         self.forward_with_guidance_and_controlnet(
             hidden_states,
             encoder_hidden_states,
-            encoder_hidden_states_mask,
             timestep,
             img_shapes,
-            txt_seq_lens,
             None,
             None,
         )
@@ -342,10 +336,8 @@ impl QwenImageTransformer2DModel {
     /// # Arguments
     /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
     /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
-    /// * `encoder_hidden_states_mask` - Text attention mask [batch, txt_seq]
     /// * `timestep` - Diffusion timestep [batch]
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
-    /// * `txt_seq_lens` - Text sequence lengths per batch item
     /// * `guidance` - Optional guidance scale tensor [batch]
     ///
     /// # Returns
@@ -354,43 +346,34 @@ impl QwenImageTransformer2DModel {
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: &Tensor,
-        encoder_hidden_states_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_seq_lens: &[usize],
         guidance: Option<&Tensor>,
     ) -> Result<Tensor> {
         self.forward_with_guidance_and_controlnet(
             hidden_states,
             encoder_hidden_states,
-            encoder_hidden_states_mask,
             timestep,
             img_shapes,
-            txt_seq_lens,
             guidance,
             None,
         )
     }
 
     /// Forward pass with optional ControlNet residuals (legacy, no guidance support).
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_controlnet(
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: &Tensor,
-        encoder_hidden_states_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_seq_lens: &[usize],
         controlnet_residuals: Option<&[Tensor]>,
     ) -> Result<Tensor> {
         self.forward_with_guidance_and_controlnet(
             hidden_states,
             encoder_hidden_states,
-            encoder_hidden_states_mask,
             timestep,
             img_shapes,
-            txt_seq_lens,
             None,
             controlnet_residuals,
         )
@@ -406,24 +389,19 @@ impl QwenImageTransformer2DModel {
     /// # Arguments
     /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
     /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
-    /// * `encoder_hidden_states_mask` - Text attention mask [batch, txt_seq]
     /// * `timestep` - Diffusion timestep [batch]
     /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
-    /// * `txt_seq_lens` - Text sequence lengths per batch item
     /// * `guidance` - Optional guidance scale tensor [batch] (for guidance-distilled models)
     /// * `controlnet_residuals` - Optional residuals from ControlNet, one per block
     ///
     /// # Returns
     /// Output predictions [batch, img_seq, patch_size² × out_channels]
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_guidance_and_controlnet(
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: &Tensor,
-        _encoder_hidden_states_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        _txt_seq_lens: &[usize],
         guidance: Option<&Tensor>,
         controlnet_residuals: Option<&[Tensor]>,
     ) -> Result<Tensor> {

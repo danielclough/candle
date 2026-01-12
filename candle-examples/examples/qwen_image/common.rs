@@ -383,24 +383,16 @@ pub enum TransformerVariant {
 
 impl TransformerVariant {
     /// Unified forward pass.
-    ///
-    /// Note: The `txt_mask` parameter is used by FP16 but ignored by quantized.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         img: &Tensor,
         txt: &Tensor,
-        txt_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_lens: &[usize],
-        dtype: DType,
     ) -> candle::Result<Tensor> {
         match self {
-            Self::FP16(model) => model.forward(img, txt, txt_mask, timestep, img_shapes, txt_lens),
-            Self::Quantized(model) => {
-                model.forward(img, txt, timestep, img_shapes, txt_lens, dtype)
-            }
+            Self::FP16(model) => model.forward(img, txt, timestep, img_shapes),
+            Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes),
         }
     }
 
@@ -408,22 +400,18 @@ impl TransformerVariant {
     ///
     /// For guidance-distilled models (Edit Plus, 2509/2511+), pass the guidance tensor.
     /// For legacy models or when guidance is None, this behaves like `forward`.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_guidance(
         &self,
         img: &Tensor,
         txt: &Tensor,
-        txt_mask: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_lens: &[usize],
         guidance: Option<&Tensor>,
-        dtype: DType,
     ) -> candle::Result<Tensor> {
         match self {
-            Self::FP16(model) => model.forward_with_guidance(
-                img, txt, txt_mask, timestep, img_shapes, txt_lens, guidance,
-            ),
+            Self::FP16(model) => {
+                model.forward_with_guidance(img, txt, timestep, img_shapes, guidance)
+            }
             Self::Quantized(model) => {
                 // Quantized models don't support guidance yet
                 if guidance.is_some() {
@@ -431,7 +419,7 @@ impl TransformerVariant {
                         "Warning: guidance_scale is not supported with quantized models, ignoring."
                     );
                 }
-                model.forward(img, txt, timestep, img_shapes, txt_lens, dtype)
+                model.forward(img, txt, timestep, img_shapes)
             }
         }
     }
@@ -761,32 +749,54 @@ pub fn create_scheduler(steps: usize, image_seq_len: usize) -> FlowMatchEulerDis
     scheduler
 }
 
-/// Calculate latent dimensions from image dimensions.
-pub fn calculate_latent_dims(height: usize, width: usize) -> LatentDims {
-    let latent_height = height / VAE_SCALE_FACTOR;
-    let latent_width = width / VAE_SCALE_FACTOR;
-    let packed_height = latent_height / PATCH_SIZE;
-    let packed_width = latent_width / PATCH_SIZE;
-    let image_seq_len = packed_height * packed_width;
+/// Output image dimensions and all derived sizes for the generation pipeline.
+///
+/// This struct encapsulates the relationship between:
+/// - User-specified output image size (`image_height`, `image_width`)
+/// - VAE latent space size (`latent_height`, `latent_width`) = image / 8
+/// - Transformer patch size (`packed_height`, `packed_width`) = latent / 2
+/// - Sequence length for transformer (`seq_len`)
+#[derive(Debug, Clone, Copy)]
+pub struct OutputDims {
+    /// Output image height in pixels
+    pub image_height: usize,
+    /// Output image width in pixels
+    pub image_width: usize,
+    /// VAE latent height (image_height / 8)
+    pub latent_height: usize,
+    /// VAE latent width (image_width / 8)
+    pub latent_width: usize,
+    /// Transformer packed height (latent_height / 2)
+    pub packed_height: usize,
+    /// Transformer packed width (latent_width / 2)
+    pub packed_width: usize,
+    /// Transformer image sequence length (packed_height * packed_width)
+    pub image_seq_len: usize,
+}
 
-    LatentDims {
-        latent_height,
-        latent_width,
-        packed_height,
-        packed_width,
-        image_seq_len,
+impl OutputDims {
+    /// Create output dimensions from the desired image size.
+    ///
+    /// Computes all derived dimensions (latent, packed, sequence length).
+    pub fn new(height: usize, width: usize) -> Self {
+        let latent_height = height / VAE_SCALE_FACTOR;
+        let latent_width = width / VAE_SCALE_FACTOR;
+        let packed_height = latent_height / PATCH_SIZE;
+        let packed_width = latent_width / PATCH_SIZE;
+        let image_seq_len = packed_height * packed_width;
+
+        Self {
+            image_height: height,
+            image_width: width,
+            latent_height,
+            latent_width,
+            packed_height,
+            packed_width,
+            image_seq_len,
+        }
     }
 }
 
-/// Latent space dimensions.
-#[derive(Debug, Clone, Copy)]
-pub struct LatentDims {
-    pub latent_height: usize,
-    pub latent_width: usize,
-    pub packed_height: usize,
-    pub packed_width: usize,
-    pub image_seq_len: usize,
-}
 
 // ============================================================================
 // Dimension validation

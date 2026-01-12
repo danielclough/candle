@@ -418,7 +418,7 @@ fn main() -> Result<()> {
                 input_image,
                 prompt,
                 negative_prompt,
-                steps: steps,
+                steps,
                 true_cfg_scale,
                 guidance_scale,
                 model_id,

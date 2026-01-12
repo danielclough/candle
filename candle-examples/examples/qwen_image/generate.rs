@@ -50,7 +50,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     }
 
     let api = hf_hub::api::sync::Api::new()?;
-    let dims = common::calculate_latent_dims(args.height, args.width);
+    let dims = common::OutputDims::new(args.height, args.width);
 
     // =========================================================================
     // Stage 1: Load tokenizer and text encoder
@@ -76,7 +76,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     // =========================================================================
     println!("\n[2/5] Encoding prompts...");
 
-    let (pos_embeds, pos_mask) = common::encode_text_prompt_variant(
+    let (pos_embeds, _pos_mask) = common::encode_text_prompt_variant(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -88,8 +88,8 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 
     // Only encode negative prompt if provided - True CFG requires an explicit negative prompt
     let do_true_cfg = args.true_cfg_scale > 1.0 && !args.negative_prompt.is_empty();
-    let neg_data = if do_true_cfg {
-        let (neg_embeds, neg_mask) = common::encode_text_prompt_variant(
+    let neg_embeds = if do_true_cfg {
+        let (neg_embeds, _) = common::encode_text_prompt_variant(
             &tokenizer,
             &mut text_model,
             &args.negative_prompt,
@@ -98,7 +98,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
             dtype,
         )?;
         println!("  Negative embeddings: {:?}", neg_embeds.dims());
-        Some((neg_embeds, neg_mask))
+        Some(neg_embeds)
     } else {
         if args.true_cfg_scale > 1.0 {
             println!(
@@ -144,17 +144,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 
     // Create initial latents
     let latents = if let Some(ref init_path) = args.init_image {
-        create_img2img_latents(
-            init_path,
-            &vae,
-            &scheduler,
-            &dims,
-            start_step,
-            args.height,
-            args.width,
-            device,
-            dtype,
-        )?
+        create_img2img_latents(init_path, &vae, &scheduler, &dims, start_step, device)?
     } else {
         // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
@@ -202,12 +192,6 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     );
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
-    // Compute txt_seq_lens from attention mask sum (matching HuggingFace diffusers)
-    // This correctly handles any padding in the embeddings.
-    let pos_txt_seq_lens = vec![pos_mask.sum_all()?.to_scalar::<f32>()? as usize];
-    let neg_txt_seq_lens = neg_data.as_ref().map(|(_, neg_mask)| {
-        vec![neg_mask.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]
-    });
     let timesteps = scheduler.timesteps().to_vec();
 
     // Pack latents immediately - PyTorch keeps latents packed throughout the loop
@@ -239,26 +223,17 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         let noise_pred = transformer.forward(
             &latents_bf16,
             &pos_embeds,
-            &pos_mask,
             &t,
             &img_shapes,
-            &pos_txt_seq_lens,
-            dtype,
         )?;
 
         // Apply True CFG only if negative prompt was provided
-        // Note: neg_txt_seq_lens is computed separately from neg_mask (matching HuggingFace)
-        let noise_pred = if let (Some((ref neg_embeds, ref neg_mask)), Some(ref neg_seq_lens)) =
-            (&neg_data, &neg_txt_seq_lens)
-        {
+        let noise_pred = if let Some(ref neg_emb) = &neg_embeds {
             let neg_pred = transformer.forward(
                 &latents_bf16,
-                neg_embeds,
-                neg_mask,
+                neg_emb,
                 &t,
                 &img_shapes,
-                neg_seq_lens,
-                dtype,
             )?;
             apply_true_cfg(&noise_pred, &neg_pred, args.true_cfg_scale)?
         } else {
@@ -295,21 +270,17 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 }
 
 /// Create initial latents for img2img by encoding the init image and adding noise.
-#[allow(clippy::too_many_arguments)]
 fn create_img2img_latents(
     init_path: &str,
     vae: &candle_transformers::models::qwen_image::AutoencoderKLQwenImage,
     scheduler: &candle_transformers::models::qwen_image::FlowMatchEulerDiscreteScheduler,
-    dims: &common::LatentDims,
+    dims: &common::OutputDims,
     start_step: usize,
-    height: usize,
-    width: usize,
     device: &Device,
-    _dtype: DType,
 ) -> Result<Tensor> {
     println!("  Loading init image: {}", init_path);
 
-    let init_image = common::load_image_for_vae(init_path, height, width, device)?;
+    let init_image = common::load_image_for_vae(init_path, dims.image_height, dims.image_width, device)?;
 
     let dist = vae.encode(&init_image)?;
     // VAE outputs [B, C, T, H, W] format

@@ -680,17 +680,15 @@ impl QwenImageTransformer2DModelQuantized {
     /// * `txt` - Text embeddings [batch, txt_seq, 3584]
     /// * `timestep` - Timestep values [batch]
     /// * `img_shapes` - Image shapes [(frames, height, width), ...]
-    /// * `txt_lens` - Text sequence lengths
-    /// * `dtype` - Working dtype
     pub fn forward(
         &self,
         img: &Tensor,
         txt: &Tensor,
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
-        txt_lens: &[usize],
-        dtype: DType,
     ) -> Result<Tensor> {
+        let dtype = img.dtype();
+
         // Project inputs (QMatMul handles dtype conversion automatically)
         let mut img = self.img_in.forward(img)?;
 
@@ -700,7 +698,8 @@ impl QwenImageTransformer2DModelQuantized {
         // Timestep embeddings
         let temb = self.time_text_embed.forward(timestep, dtype)?;
 
-        // Compute RoPE frequencies
+        // Compute RoPE frequencies (derive txt_lens from tensor shape)
+        let txt_lens = &[txt.dim(1)?];
         let (img_freqs, txt_freqs) = self.pos_embed.forward(img_shapes, txt_lens)?;
 
         // Process through transformer blocks

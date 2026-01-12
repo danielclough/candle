@@ -131,7 +131,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     };
     println!("  Output size: {}x{}", target_width, target_height);
 
-    let dims = common::calculate_latent_dims(target_height, target_width);
+    let dims = common::OutputDims::new(target_height, target_width);
 
     // =========================================================================
     // Stage 2: Load VAE and encode input image
@@ -210,7 +210,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     println!("  Text encoder loaded ({})", encoder_type);
 
     // Encode prompts with vision (text encoder outputs F32, convert to transformer dtype)
-    let (pos_embeds, pos_mask) = encode_prompt_with_vision(
+    let (pos_embeds, _) = encode_prompt_with_vision(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -223,8 +223,8 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
     // Only encode negative prompt if one is provided (matching Python behavior)
-    let (neg_embeds, neg_mask) = if !args.negative_prompt.is_empty() {
-        let (neg_embeds, neg_mask) = encode_prompt_with_vision(
+    let neg_embeds = if !args.negative_prompt.is_empty() {
+        let (neg_embeds, _) = encode_prompt_with_vision(
             &tokenizer,
             &mut text_model,
             &args.negative_prompt,
@@ -235,10 +235,10 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         )?;
         let neg_embeds = neg_embeds.to_dtype(dtype)?;
         println!("  Negative prompt embeddings: {:?}", neg_embeds.dims());
-        (Some(neg_embeds), Some(neg_mask))
+        Some(neg_embeds)
     } else {
         // No negative prompt → skip encoding entirely (Python skips CFG in this case)
-        (None, None)
+        None
     };
 
     // Free text encoder from memory before loading transformer
@@ -313,14 +313,6 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         (1, dims.packed_height, dims.packed_width), // Noise latents
         (1, dims.packed_height, dims.packed_width), // Image latents
     ];
-    // Text sequence lengths for RoPE - compute from attention mask sum (matching HuggingFace)
-    // This correctly handles any padding in the embeddings.
-    // Positive and negative prompts may have different token counts.
-    let pos_txt_seq_lens = vec![pos_mask.sum_all()?.to_scalar::<f32>()? as usize];
-    let neg_txt_seq_lens = neg_mask
-        .as_ref()
-        .map(|m| vec![m.sum_all().unwrap().to_scalar::<f32>().unwrap() as usize]);
-
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
@@ -356,12 +348,9 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let pos_pred = transformer.forward_with_guidance(
             &latent_model_input,
             &pos_embeds,
-            &pos_mask,
             &t,
             &img_shapes,
-            &pos_txt_seq_lens,
             guidance.as_ref(),
-            dtype,
         )?;
 
         // Extract only the noise prediction part
@@ -369,18 +358,13 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let pos_pred = pos_pred.narrow(1, 0, noise_seq_len)?;
 
         // Only apply CFG if we have a negative prompt (matching Python behavior)
-        let model_pred = if let (Some(neg_embeds), Some(neg_mask), Some(neg_seq_lens)) =
-            (&neg_embeds, &neg_mask, &neg_txt_seq_lens)
-        {
+        let model_pred = if let Some(ref neg_emb) = &neg_embeds {
             let neg_pred = transformer.forward_with_guidance(
                 &latent_model_input,
-                neg_embeds,
-                neg_mask,
+                neg_emb,
                 &t,
                 &img_shapes,
-                neg_seq_lens,
                 guidance.as_ref(),
-                dtype,
             )?;
 
             let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;

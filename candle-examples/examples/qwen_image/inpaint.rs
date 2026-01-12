@@ -73,7 +73,7 @@ pub fn run(
         orig_width, orig_height, target_width, target_height
     );
 
-    let dims = common::calculate_latent_dims(target_height, target_width);
+    let dims = common::OutputDims::new(target_height, target_width);
     println!(
         "  Latent size: {}x{}",
         dims.latent_height, dims.latent_width
@@ -108,7 +108,7 @@ pub fn run(
     println!("  Text encoder loaded");
 
     // Encode prompts
-    let (pos_embeds, pos_mask) = common::encode_text_prompt(
+    let (pos_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -122,7 +122,7 @@ pub fn run(
     } else {
         &args.negative_prompt
     };
-    let (neg_embeds, neg_mask) = common::encode_text_prompt(
+    let (neg_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         neg_prompt,
@@ -175,8 +175,6 @@ pub fn run(
     println!("  Transformer loaded ({} layers)", config.num_layers);
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
-    let txt_seq_lens = vec![pos_embeds.dim(1)?];
-
     let timesteps = scheduler.timesteps().to_vec();
     let sigmas = scheduler.sigmas().to_vec();
 
@@ -206,18 +204,14 @@ pub fn run(
         let pos_pred = transformer.forward(
             &packed,
             &pos_embeds,
-            &pos_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
         )?;
         let neg_pred = transformer.forward(
             &packed,
             &neg_embeds,
-            &neg_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
         )?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;

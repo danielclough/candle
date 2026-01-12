@@ -52,7 +52,7 @@ pub fn run(
     println!("ControlNet scale: {:.2}", args.controlnet_scale);
 
     let api = hf_hub::api::sync::Api::new()?;
-    let dims = common::calculate_latent_dims(args.height, args.width);
+    let dims = common::OutputDims::new(args.height, args.width);
 
     // =========================================================================
     // Stage 1: Load VAE and encode control image
@@ -87,7 +87,7 @@ pub fn run(
     println!("  Text encoder loaded");
 
     // Encode prompts
-    let (pos_embeds, pos_mask) = common::encode_text_prompt(
+    let (pos_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -101,7 +101,7 @@ pub fn run(
     } else {
         &args.negative_prompt
     };
-    let (neg_embeds, neg_mask) = common::encode_text_prompt(
+    let (neg_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         neg_prompt,
@@ -221,10 +221,8 @@ pub fn run(
         let pos_pred = transformer.forward_with_controlnet(
             &packed,
             &pos_embeds,
-            &pos_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
             Some(&controlnet_output.block_residuals),
         )?;
 
@@ -232,10 +230,8 @@ pub fn run(
         let neg_pred = transformer.forward(
             &packed,
             &neg_embeds,
-            &neg_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
         )?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;

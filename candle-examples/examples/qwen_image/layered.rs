@@ -77,7 +77,7 @@ pub fn run(
     let target_height = (target_height / 16) * 16;
     println!("  Output size: {}x{}", target_width, target_height);
 
-    let dims = common::calculate_latent_dims(target_height, target_width);
+    let dims = common::OutputDims::new(target_height, target_width);
 
     // =========================================================================
     // Stage 2: Load VAE and encode input image
@@ -109,7 +109,7 @@ pub fn run(
         common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
     println!("  Text encoder loaded");
 
-    let (pos_embeds, pos_mask) = common::encode_text_prompt(
+    let (pos_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         &args.prompt,
@@ -124,7 +124,7 @@ pub fn run(
     } else {
         &args.negative_prompt
     };
-    let (neg_embeds, neg_mask) = common::encode_text_prompt(
+    let (neg_embeds, _) = common::encode_text_prompt(
         &tokenizer,
         &mut text_model,
         neg_prompt,
@@ -214,7 +214,6 @@ pub fn run(
     }
     img_shapes.push((1, dims.packed_height, dims.packed_width)); // For image condition
 
-    let txt_seq_lens = vec![pos_embeds.dim(1)?];
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
@@ -237,18 +236,14 @@ pub fn run(
         let pos_pred = transformer.forward(
             &latent_model_input,
             &pos_embeds,
-            &pos_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
         )?;
         let neg_pred = transformer.forward(
             &latent_model_input,
             &neg_embeds,
-            &neg_mask,
             &t,
             &img_shapes,
-            &txt_seq_lens,
         )?;
 
         // Extract only the layered noise prediction (not the image condition part)
