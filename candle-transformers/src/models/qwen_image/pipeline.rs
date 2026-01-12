@@ -204,8 +204,8 @@ pub fn expand_image_tokens(tokens: &[u32], num_image_tokens: usize) -> Vec<u32> 
 /// ```
 ///
 /// # Arguments
-/// * `pos_pred` - Positive (conditioned) prediction
-/// * `neg_pred` - Negative (unconditioned) prediction
+/// * `pos_pred` - Positive prediction
+/// * `neg_pred` - Negative prediction
 /// * `cfg_scale` - Guidance scale (typically 4.0)
 ///
 /// # Returns
