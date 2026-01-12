@@ -114,6 +114,7 @@ impl Model {
     }
 
     /// Generate tokens for images with streaming output (FP16 only).
+    #[allow(clippy::too_many_arguments)]
     fn generate_streaming<F, G>(
         &mut self,
         input_ids: &Tensor,
@@ -200,6 +201,7 @@ impl Model {
     }
 
     /// Generate tokens for video (FP16 only).
+    #[allow(clippy::too_many_arguments)]
     fn generate_video_streaming<F, G>(
         &mut self,
         input_ids: &Tensor,
@@ -233,6 +235,7 @@ impl Model {
     }
 
     /// Generate tokens for video with sampler (FP16 only).
+    #[allow(clippy::too_many_arguments)]
     fn generate_video_with_sampler<F>(
         &mut self,
         input_ids: &Tensor,

@@ -389,6 +389,7 @@ pub fn load_transformer_quantized(
 ///
 /// This enum provides a common interface for both model types, handling the
 /// differences in their forward signatures internally.
+#[allow(clippy::large_enum_variant)]
 pub enum TransformerVariant {
     FP16(QwenImageTransformer2DModel),
     Quantized(QwenImageTransformer2DModelQuantized),
@@ -398,6 +399,7 @@ impl TransformerVariant {
     /// Unified forward pass.
     ///
     /// Note: The `txt_mask` parameter is used by FP16 but ignored by quantized.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         img: &Tensor,

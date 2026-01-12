@@ -296,6 +296,7 @@ impl QwenImageTransformer2DModel {
     /// corresponding block's output. Typically, ControlNet only provides residuals
     /// for a subset of blocks (e.g., first 5 of 60), so residuals are applied
     /// to blocks at matching indices.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_controlnet(
         &self,
         hidden_states: &Tensor,
