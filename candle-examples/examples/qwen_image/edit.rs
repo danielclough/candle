@@ -14,8 +14,8 @@ use candle_transformers::models::{
         DEFAULT_MIN_PIXELS,
     },
     qwen_image::{
-        apply_true_cfg, pack_latents, unpack_latents, Config, TiledDecodeConfig, EDIT_DROP_TOKENS,
-        EDIT_PROMPT_TEMPLATE,
+        apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, TiledDecodeConfig,
+        EDIT_DROP_TOKENS, EDIT_PROMPT_TEMPLATE,
     },
 };
 use tokenizers::Tokenizer;
@@ -268,6 +268,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     } else {
         Config::qwen_image_edit()
     };
+    let inference_config = InferenceConfig::default();
     let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
@@ -276,15 +277,13 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         &api,
         device,
         dtype,
+        &inference_config,
     )?;
-    let model_type = if transformer.is_quantized() {
-        "quantized GGUF"
-    } else {
-        &format!("{:?}", dtype)
-    };
-    println!(
-        "  Transformer loaded ({} layers, {})",
-        config.num_layers, model_type
+    common::log_transformer_loaded(
+        config.num_layers,
+        transformer.is_quantized(),
+        dtype,
+        &inference_config,
     );
 
     // =========================================================================

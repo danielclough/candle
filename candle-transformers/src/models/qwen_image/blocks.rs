@@ -258,17 +258,36 @@ impl AddedQkNorm {
 /// Scaled dot-product attention.
 ///
 /// Input shapes: Q, K, V are [batch, heads, seq, head_dim]
-fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+///
+/// # Arguments
+/// * `q` - Query tensor
+/// * `k` - Key tensor
+/// * `v` - Value tensor
+/// * `upcast_attention` - If true, upcast Q, K, V to F32 for numerical stability.
+///   If false, compute in the input dtype (e.g., BF16) for faster inference.
+fn scaled_dot_product_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    upcast_attention: bool,
+) -> Result<Tensor> {
     let head_dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (head_dim as f64).sqrt();
+    let orig_dtype = q.dtype();
 
-    // Upcast to F32 for numerical stability
+    // Optionally upcast to F32 for numerical stability
     // Note: Must call contiguous() because input tensors are non-contiguous after transpose.
     // When already F32, to_dtype is a no-op preserving non-contiguous layout, but Metal
     // matmul requires contiguous tensors.
-    let q = q.to_dtype(DType::F32)?.contiguous()?;
-    let k = k.to_dtype(DType::F32)?.contiguous()?;
-    let v = v.to_dtype(DType::F32)?.contiguous()?;
+    let (q, k, v) = if upcast_attention {
+        (
+            q.to_dtype(DType::F32)?.contiguous()?,
+            k.to_dtype(DType::F32)?.contiguous()?,
+            v.to_dtype(DType::F32)?.contiguous()?,
+        )
+    } else {
+        (q.contiguous()?, k.contiguous()?, v.contiguous()?)
+    };
 
     let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
     let attn_logits = q.matmul(&k_t)?;
@@ -278,7 +297,12 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
 
     let attn_output = attn_probs.matmul(&v)?;
 
-    Ok(attn_output)
+    // Cast back to original dtype if we upcasted
+    if upcast_attention && orig_dtype != DType::F32 {
+        attn_output.to_dtype(orig_dtype)
+    } else {
+        Ok(attn_output)
+    }
 }
 
 /// Dual-stream attention for Qwen-Image.
@@ -307,6 +331,9 @@ pub struct QwenDoubleStreamAttention {
 
     num_heads: usize,
     head_dim: usize,
+
+    /// Whether to upcast attention to F32 for numerical stability
+    upcast_attention: bool,
 }
 
 impl QwenDoubleStreamAttention {
@@ -316,6 +343,7 @@ impl QwenDoubleStreamAttention {
         head_dim: usize,
         vb: VarBuilder,
         eps: f64,
+        upcast_attention: bool,
     ) -> Result<Self> {
         let inner_dim = num_heads * head_dim;
 
@@ -348,6 +376,7 @@ impl QwenDoubleStreamAttention {
             txt_norm,
             num_heads,
             head_dim,
+            upcast_attention,
         })
     }
 
@@ -417,14 +446,14 @@ impl QwenDoubleStreamAttention {
         let joint_v = joint_v.transpose(1, 2)?;
 
         // Compute attention
-        let joint_attn = scaled_dot_product_attention(&joint_q, &joint_k, &joint_v)?;
+        let joint_attn =
+            scaled_dot_product_attention(&joint_q, &joint_k, &joint_v, self.upcast_attention)?;
 
         // Transpose back: [B, H, S, D] -> [B, S, H, D]
         let joint_attn = joint_attn.transpose(1, 2)?;
 
         // Flatten: [B, S, H, D] -> [B, S, H*D]
         let joint_attn = joint_attn.flatten_from(2)?;
-        let joint_attn = joint_attn.to_dtype(hidden_states.dtype())?;
 
         // Split back to text and image
         let txt_attn = joint_attn.narrow(1, 0, txt_seq)?;
@@ -468,6 +497,7 @@ impl QwenImageTransformerBlock {
         num_attention_heads: usize,
         attention_head_dim: usize,
         vb: VarBuilder,
+        upcast_attention: bool,
     ) -> Result<Self> {
         let eps = 1e-6;
         let device = vb.device();
@@ -494,6 +524,7 @@ impl QwenImageTransformerBlock {
             attention_head_dim,
             vb.pp("attn"),
             eps,
+            upcast_attention,
         )?;
 
         Ok(Self {

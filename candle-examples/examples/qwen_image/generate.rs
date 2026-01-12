@@ -6,7 +6,7 @@
 use anyhow::Result;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::qwen_image::{
-    apply_true_cfg, pack_latents, unpack_latents, Config, PromptMode,
+    apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, PromptMode,
 };
 
 use crate::common;
@@ -172,6 +172,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     println!("\n[4/5] Loading transformer and denoising...");
 
     let config = Config::qwen_image();
+    let inference_config = InferenceConfig::default();
     let transformer = common::load_transformer_variant(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
@@ -180,15 +181,13 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         &api,
         device,
         dtype,
+        &inference_config,
     )?;
-    let model_type = if transformer.is_quantized() {
-        "quantized GGUF"
-    } else {
-        "FP16"
-    };
-    println!(
-        "  Transformer loaded ({} layers, {})",
-        config.num_layers, model_type
+    common::log_transformer_loaded(
+        config.num_layers,
+        transformer.is_quantized(),
+        dtype,
+        &inference_config,
     );
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];

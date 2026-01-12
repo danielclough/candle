@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen_image::{
-    apply_true_cfg, pack_latents, unpack_latents, Config, ControlNetConfig, PromptMode,
-    QwenImageControlNetModel,
+    apply_true_cfg, pack_latents, unpack_latents, Config, ControlNetConfig, InferenceConfig,
+    PromptMode, QwenImageControlNetModel,
 };
 
 use crate::common;
@@ -162,8 +162,15 @@ pub fn run(
 
     let vb_controlnet =
         unsafe { VarBuilder::from_mmaped_safetensors(&controlnet_files, dtype, device)? };
-    let controlnet = QwenImageControlNetModel::new(&controlnet_config, vb_controlnet)?;
-    println!("  ControlNet loaded ({} layers)", controlnet.num_layers());
+    let inference_config = InferenceConfig::default();
+    let controlnet =
+        QwenImageControlNetModel::new(&controlnet_config, vb_controlnet, &inference_config)?;
+    let attn_dtype = common::format_attention_dtype(&inference_config, dtype);
+    println!(
+        "  ControlNet loaded ({} layers, attention: {})",
+        controlnet.num_layers(),
+        attn_dtype
+    );
 
     // =========================================================================
     // Stage 5: Load transformer and run denoising loop
@@ -178,8 +185,9 @@ pub fn run(
         &api,
         device,
         dtype,
+        &inference_config,
     )?;
-    println!("  Transformer loaded ({} layers)", config.num_layers);
+    common::log_transformer_loaded(config.num_layers, false, dtype, &inference_config);
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
     let txt_seq_lens = vec![pos_embeds.dim(1)?];

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::qwen_image::{
-    apply_true_cfg, pack_latents, unpack_latents, Config, PromptMode,
+    apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, PromptMode,
 };
 
 use crate::common;
@@ -164,6 +164,7 @@ pub fn run(
     println!("\n[4/5] Loading transformer and inpainting...");
 
     let config = Config::qwen_image();
+    let inference_config = InferenceConfig::default();
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
         &args.model_id,
@@ -171,8 +172,9 @@ pub fn run(
         &api,
         device,
         dtype,
+        &inference_config,
     )?;
-    println!("  Transformer loaded ({} layers)", config.num_layers);
+    common::log_transformer_loaded(config.num_layers, false, dtype, &inference_config);
 
     let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
     let timesteps = scheduler.timesteps().to_vec();

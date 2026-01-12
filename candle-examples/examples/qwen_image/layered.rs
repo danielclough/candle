@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::qwen_image::{
     apply_true_cfg, calculate_dimensions_with_resolution, pack_layered_latents,
-    unpack_layered_latents, Config, PromptMode,
+    unpack_layered_latents, Config, InferenceConfig, PromptMode,
 };
 
 use crate::common;
@@ -192,6 +192,7 @@ pub fn run(
 
     // Load transformer with layered config
     let config = Config::qwen_image_layered();
+    let inference_config = InferenceConfig::default();
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
         &args.model_id,
@@ -199,8 +200,9 @@ pub fn run(
         &api,
         device,
         dtype,
+        &inference_config,
     )?;
-    println!("  Transformer loaded ({} layers)", config.num_layers);
+    common::log_transformer_loaded(config.num_layers, false, dtype, &inference_config);
 
     // =========================================================================
     // Stage 5: Denoising loop

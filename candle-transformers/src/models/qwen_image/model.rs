@@ -13,7 +13,7 @@ use candle::{DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 use super::blocks::QwenImageTransformerBlock;
-use super::config::Config;
+use super::config::{Config, InferenceConfig};
 use super::rope::{timestep_embedding, QwenEmbedRope};
 
 /// Create a parameter-free LayerNorm (equivalent to PyTorch's elementwise_affine=False).
@@ -167,7 +167,13 @@ pub struct QwenImageTransformer2DModel {
 }
 
 impl QwenImageTransformer2DModel {
-    pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    /// Create a new QwenImageTransformer2DModel.
+    ///
+    /// # Arguments
+    /// * `config` - Model architecture configuration
+    /// * `vb` - Variable builder for loading weights
+    /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
+    pub fn new(config: &Config, vb: VarBuilder, inference_config: &InferenceConfig) -> Result<Self> {
         let inner_dim = config.inner_dim();
         let device = vb.device();
         let dtype = vb.dtype();
@@ -205,6 +211,7 @@ impl QwenImageTransformer2DModel {
                 config.num_attention_heads,
                 config.attention_head_dim,
                 vb_blocks.pp(idx),
+                inference_config.upcast_attention,
             )?;
             transformer_blocks.push(block);
         }

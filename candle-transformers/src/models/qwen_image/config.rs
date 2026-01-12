@@ -357,6 +357,48 @@ impl SchedulerConfig {
     }
 }
 
+/// Runtime inference configuration.
+///
+/// These options control inference-time behavior and performance tradeoffs,
+/// separate from the model architecture configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceConfig {
+    /// Upcast Q, K, V to F32 for numerical stability (default: true).
+    ///
+    /// When true, attention computation is done in F32 then cast back to the
+    /// model's dtype. This is safer but slower.
+    ///
+    /// When false, attention stays in the model's dtype (e.g., BF16), matching
+    /// PyTorch's `upcast_attention=False`. Faster but may cause numerical
+    /// instability with long sequences or deep models.
+    pub upcast_attention: bool,
+
+    /// Use flash attention if the feature is enabled (default: auto-detect).
+    ///
+    /// When true and compiled with `--features flash-attn`, uses flash attention
+    /// for faster and more memory-efficient attention computation.
+    ///
+    /// When false or the feature is not enabled, falls back to standard attention.
+    pub use_flash_attention: bool,
+
+    /// Use memory-efficient chunked attention for long sequences (default: false).
+    ///
+    /// When true, splits attention computation into chunks to reduce peak memory
+    /// usage. Useful for very long sequences that would otherwise OOM.
+    pub memory_efficient_attention: bool,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            upcast_attention: true,
+            // Auto-enable flash attention if compiled with the feature
+            use_flash_attention: cfg!(feature = "flash-attn"),
+            memory_efficient_attention: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -65,7 +65,7 @@ pub mod vae;
 mod blocks;
 mod model;
 
-pub use config::{Config, SchedulerConfig, VaeConfig};
+pub use config::{Config, InferenceConfig, SchedulerConfig, VaeConfig};
 pub use controlnet::{ControlNetConfig, ControlNetOutput, QwenImageControlNetModel};
 pub use edit_helpers::{
     calculate_dimensions, calculate_dimensions_with_resolution, extract_and_pad_embeddings,

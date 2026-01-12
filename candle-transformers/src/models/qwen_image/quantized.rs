@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::models::with_tracing::QMatMul;
 
+use super::config::InferenceConfig;
 use super::rope::{apply_rotary_emb_qwen, timestep_embedding, QwenEmbedRope};
 
 // ============================================================================
@@ -181,6 +182,9 @@ pub struct QwenDoubleStreamAttentionQuantized {
 
     num_heads: usize,
     head_dim: usize,
+
+    /// Whether to upcast attention to F32 for numerical stability
+    upcast_attention: bool,
 }
 
 impl QwenDoubleStreamAttentionQuantized {
@@ -237,11 +241,18 @@ impl QwenDoubleStreamAttentionQuantized {
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        // Scaled dot-product attention (in F32 for numerical stability)
+        // Scaled dot-product attention (optionally in F32 for numerical stability)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
+        let orig_dtype = img.dtype();
+        let (q, k, v) = if self.upcast_attention {
+            (
+                q.to_dtype(DType::F32)?,
+                k.to_dtype(DType::F32)?,
+                v.to_dtype(DType::F32)?,
+            )
+        } else {
+            (q, k, v)
+        };
 
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
@@ -249,7 +260,11 @@ impl QwenDoubleStreamAttentionQuantized {
 
         // Transpose back: [B, H, S, D] -> [B, S, H, D]
         let attn_output = attn_output.transpose(1, 2)?;
-        let attn_output = attn_output.to_dtype(img.dtype())?;
+        let attn_output = if self.upcast_attention && orig_dtype != DType::F32 {
+            attn_output.to_dtype(orig_dtype)?
+        } else {
+            attn_output
+        };
 
         // Flatten: [B, S, H, D] -> [B, S, H*D]
         let attn_output = attn_output.flatten_from(2)?;
@@ -412,6 +427,7 @@ impl QwenImageTransformer2DModelQuantized {
     /// * `reader` - Reader for tensor data
     /// * `device` - Device to load model on
     /// * `dtype` - Working dtype for biases and normalization layers
+    /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
     ///
     /// # Note
     /// The GGUF tensor names must follow the llama.cpp convention for Qwen-Image.
@@ -421,6 +437,7 @@ impl QwenImageTransformer2DModelQuantized {
         reader: &mut R,
         device: &Device,
         dtype: DType,
+        inference_config: &InferenceConfig,
     ) -> Result<Self> {
         // Extract config from metadata
         let get_u32 = |keys: &[&str]| -> Result<u32> {
@@ -600,6 +617,7 @@ impl QwenImageTransformer2DModelQuantized {
                 ),
                 num_heads,
                 head_dim,
+                upcast_attention: inference_config.upcast_attention,
             };
 
             // MLPs (GGUF uses img_mlp/txt_mlp naming from Flux)

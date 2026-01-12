@@ -15,8 +15,9 @@ use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
     qwen_image::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
-        FlowMatchEulerDiscreteScheduler, PromptMode, QwenImageTransformer2DModel,
-        QwenImageTransformer2DModelQuantized, SchedulerConfig, VaeConfig,
+        FlowMatchEulerDiscreteScheduler, InferenceConfig, PromptMode,
+        QwenImageTransformer2DModel, QwenImageTransformer2DModelQuantized, SchedulerConfig,
+        VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -326,6 +327,7 @@ pub fn load_transformer(
     api: &hf_hub::api::sync::Api,
     device: &Device,
     dtype: DType,
+    inference_config: &InferenceConfig,
 ) -> Result<QwenImageTransformer2DModel> {
     let model_files = match transformer_path {
         Some(path) => candle_examples::hub_load_local_safetensors(
@@ -342,7 +344,7 @@ pub fn load_transformer(
     };
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, device)? };
-    Ok(QwenImageTransformer2DModel::new(config, vb)?)
+    Ok(QwenImageTransformer2DModel::new(config, vb, inference_config)?)
 }
 
 /// Load the quantized transformer model from GGUF file.
@@ -351,6 +353,7 @@ pub fn load_transformer(
 /// * `gguf_path` - Path to the GGUF transformer file
 /// * `device` - Device to load on
 /// * `dtype` - Working dtype for biases and normalization layers
+/// * `inference_config` - Runtime inference configuration
 ///
 /// # Returns
 /// Quantized transformer model
@@ -358,13 +361,55 @@ pub fn load_transformer_quantized(
     gguf_path: &str,
     device: &Device,
     dtype: DType,
+    inference_config: &InferenceConfig,
 ) -> Result<QwenImageTransformer2DModelQuantized> {
     println!("Loading quantized transformer from {}...", gguf_path);
     let mut file = std::fs::File::open(gguf_path)?;
     let content = gguf_file::Content::read(&mut file)?;
     Ok(QwenImageTransformer2DModelQuantized::from_gguf(
-        content, &mut file, device, dtype,
+        content,
+        &mut file,
+        device,
+        dtype,
+        inference_config,
     )?)
+}
+
+// ============================================================================
+// Inference Logging Helpers
+// ============================================================================
+
+/// Format the attention dtype for logging based on InferenceConfig.
+///
+/// Returns a string like "F32 (upcasted)" or "BF16" depending on settings.
+pub fn format_attention_dtype(inference_config: &InferenceConfig, model_dtype: DType) -> String {
+    if inference_config.upcast_attention {
+        "F32 (upcasted)".to_string()
+    } else {
+        format!("{:?}", model_dtype)
+    }
+}
+
+/// Log transformer loading info.
+///
+/// Prints a formatted message like:
+/// "  Transformer loaded (60 layers, FP16, attention: F32 (upcasted))"
+pub fn log_transformer_loaded(
+    num_layers: usize,
+    is_quantized: bool,
+    model_dtype: DType,
+    inference_config: &InferenceConfig,
+) {
+    let model_type = if is_quantized {
+        "quantized GGUF"
+    } else {
+        "FP16"
+    };
+    let attn_dtype = format_attention_dtype(inference_config, model_dtype);
+    println!(
+        "  Transformer loaded ({} layers, {}, attention: {})",
+        num_layers, model_type, attn_dtype
+    );
 }
 
 // ============================================================================
@@ -406,6 +451,9 @@ impl TransformerVariant {
 ///
 /// If `gguf_path` is provided, loads a quantized GGUF model.
 /// Otherwise, loads the FP16 safetensors model.
+///
+/// # Arguments
+/// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
 pub fn load_transformer_variant(
     transformer_path: Option<&str>,
     gguf_path: Option<&str>,
@@ -414,15 +462,29 @@ pub fn load_transformer_variant(
     api: &hf_hub::api::sync::Api,
     device: &Device,
     dtype: DType,
+    inference_config: &InferenceConfig,
 ) -> Result<TransformerVariant> {
     if let Some(gguf_value) = gguf_path {
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
         let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TRANSFORMER, api)?;
         println!("Loading quantized transformer from {:?}...", resolved_path);
-        let model = load_transformer_quantized(resolved_path.to_str().unwrap(), device, dtype)?;
+        let model = load_transformer_quantized(
+            resolved_path.to_str().unwrap(),
+            device,
+            dtype,
+            inference_config,
+        )?;
         Ok(TransformerVariant::Quantized(model))
     } else {
-        let model = load_transformer(transformer_path, model_id, config, api, device, dtype)?;
+        let model = load_transformer(
+            transformer_path,
+            model_id,
+            config,
+            api,
+            device,
+            dtype,
+            inference_config,
+        )?;
         Ok(TransformerVariant::FP16(model))
     }
 }

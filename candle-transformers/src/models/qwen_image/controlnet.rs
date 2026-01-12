@@ -43,7 +43,7 @@ use candle::{DType, Result, Tensor};
 use candle_nn::{Linear, Module, RmsNorm, VarBuilder};
 
 use super::blocks::QwenImageTransformerBlock;
-use super::config::Config;
+use super::config::{Config, InferenceConfig};
 use super::model::QwenTimestepProjEmbeddings;
 use super::rope::QwenEmbedRope;
 
@@ -165,7 +165,16 @@ pub struct QwenImageControlNetModel {
 
 impl QwenImageControlNetModel {
     /// Create a new ControlNet model from config and weights.
-    pub fn new(config: &ControlNetConfig, vb: VarBuilder) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `config` - ControlNet architecture configuration
+    /// * `vb` - Variable builder for loading weights
+    /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
+    pub fn new(
+        config: &ControlNetConfig,
+        vb: VarBuilder,
+        inference_config: &InferenceConfig,
+    ) -> Result<Self> {
         let inner_dim = config.base_config.inner_dim();
         let device = vb.device();
         let dtype = vb.dtype();
@@ -215,6 +224,7 @@ impl QwenImageControlNetModel {
                 config.base_config.num_attention_heads,
                 config.base_config.attention_head_dim,
                 vb_blocks.pp(idx),
+                inference_config.upcast_attention,
             )?;
             transformer_blocks.push(block);
         }
