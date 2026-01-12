@@ -190,10 +190,6 @@ enum Command {
         #[arg(long, default_value_t = 1.7)]
         true_cfg_scale: f64,
 
-        /// Guidance scale for distilled models (edit-plus only, 2509/2511+).
-        #[arg(long)]
-        guidance_scale: Option<f64>,
-
         /// HuggingFace model ID for the transformer.
         #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
         model_id: String,
@@ -404,7 +400,6 @@ fn main() -> Result<()> {
             negative_prompt,
             steps,
             true_cfg_scale,
-            guidance_scale,
             model_id,
             height,
             width,
@@ -420,7 +415,6 @@ fn main() -> Result<()> {
                 negative_prompt,
                 steps,
                 true_cfg_scale,
-                guidance_scale,
                 model_id,
                 height,
                 width,

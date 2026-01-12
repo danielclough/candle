@@ -35,7 +35,6 @@ pub struct EditArgs {
     pub negative_prompt: String,
     pub steps: usize,
     pub true_cfg_scale: f64,
-    pub guidance_scale: Option<f64>,
     pub model_id: String,
     pub height: Option<usize>,
     pub width: Option<usize>,
@@ -69,16 +68,6 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         "QwenImageEditPipeline"
     };
 
-    // Warn about guidance_scale with legacy pipeline
-    if !use_plus && args.guidance_scale.is_some() {
-        println!();
-        println!("{}", "!".repeat(60));
-        println!("WARNING: --guidance-scale has no effect with legacy pipeline.");
-        println!("Use a newer model (2509/2511) for guidance_scale support.");
-        println!("{}", "!".repeat(60));
-        println!();
-    }
-
     println!("Qwen-Image Edit");
     println!("Pipeline: {}", pipeline_name);
     println!("Device: {:?}, DType: {:?}", device, dtype);
@@ -94,11 +83,6 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         }
     );
     println!("True CFG scale: {}", args.true_cfg_scale);
-    if use_plus {
-        if let Some(gs) = args.guidance_scale {
-            println!("Guidance scale: {}", gs);
-        }
-    }
     println!("Steps: {}", args.steps);
 
     // Warn if CFG is specified but no negative prompt (matching Python behavior)
@@ -316,18 +300,6 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let timesteps = scheduler.timesteps().to_vec();
     let mut latents = packed_noise;
 
-    // Create guidance tensor for guidance-distilled models (Edit Plus)
-    let guidance = if use_plus {
-        args.guidance_scale.map(|gs| {
-            Tensor::new(&[gs as f32], device)
-                .unwrap()
-                .to_dtype(dtype)
-                .unwrap()
-        })
-    } else {
-        None
-    };
-
     for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
         if step % 10 == 0 || step == args.steps - 1 {
             println!(
@@ -345,12 +317,11 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         // Note: Timestep doubling for zero_cond_t is handled internally by the transformer
-        let pos_pred = transformer.forward_with_guidance(
+        let pos_pred = transformer.forward(
             &latent_model_input,
             &pos_embeds,
             &t,
             &img_shapes,
-            guidance.as_ref(),
         )?;
 
         // Extract only the noise prediction part
@@ -359,12 +330,11 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
 
         // Only apply CFG if we have a negative prompt (matching Python behavior)
         let model_pred = if let Some(ref neg_emb) = &neg_embeds {
-            let neg_pred = transformer.forward_with_guidance(
+            let neg_pred = transformer.forward(
                 &latent_model_input,
                 neg_emb,
                 &t,
                 &img_shapes,
-                guidance.as_ref(),
             )?;
 
             let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
@@ -372,7 +342,6 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
             apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?
         } else {
             // No negative prompt → skip CFG, use positive prediction directly
-            // (CFG requires both pos and neg predictions to compute the guidance direction)
             pos_pred
         };
 

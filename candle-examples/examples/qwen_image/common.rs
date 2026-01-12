@@ -396,34 +396,6 @@ impl TransformerVariant {
         }
     }
 
-    /// Unified forward pass with guidance support.
-    ///
-    /// For guidance-distilled models (Edit Plus, 2509/2511+), pass the guidance tensor.
-    /// For legacy models or when guidance is None, this behaves like `forward`.
-    pub fn forward_with_guidance(
-        &self,
-        img: &Tensor,
-        txt: &Tensor,
-        timestep: &Tensor,
-        img_shapes: &[(usize, usize, usize)],
-        guidance: Option<&Tensor>,
-    ) -> candle::Result<Tensor> {
-        match self {
-            Self::FP16(model) => {
-                model.forward_with_guidance(img, txt, timestep, img_shapes, guidance)
-            }
-            Self::Quantized(model) => {
-                // Quantized models don't support guidance yet
-                if guidance.is_some() {
-                    println!(
-                        "Warning: guidance_scale is not supported with quantized models, ignoring."
-                    );
-                }
-                model.forward(img, txt, timestep, img_shapes)
-            }
-        }
-    }
-
     /// Returns true if this is a quantized model.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized(_))

@@ -47,10 +47,6 @@ pub struct Config {
     #[serde(default = "default_theta")]
     pub theta: usize,
 
-    /// Whether to use guidance embeddings (default: false, uses true CFG instead).
-    #[serde(default)]
-    pub guidance_embeds: bool,
-
     /// Whether to use zero conditioning for timestep (for CFG) (default: false).
     #[serde(default)]
     pub zero_cond_t: bool,
@@ -111,7 +107,6 @@ impl Config {
             joint_attention_dim: 3584,
             axes_dims_rope: (16, 56, 56),
             theta: 10000,
-            guidance_embeds: false,
             zero_cond_t: false,
             use_additional_t_cond: false,
             use_layer3d_rope: false,
@@ -138,11 +133,10 @@ impl Config {
     /// - Low-res (384px) condition image for vision encoder understanding
     /// - High-res (1024px) VAE image for detail preservation
     ///
-    /// Key difference: `guidance_embeds: true` enables guidance scale as input.
+    /// Uses `zero_cond_t: true` for per-token modulation (same as Edit).
     pub fn qwen_image_edit_plus() -> Self {
         Self {
             zero_cond_t: true,
-            guidance_embeds: true, // Enables guidance_scale input parameter
             ..Self::qwen_image()
         }
     }
@@ -163,7 +157,6 @@ impl Config {
             joint_attention_dim: 3584,
             axes_dims_rope: (16, 56, 56),
             theta: 10000,
-            guidance_embeds: false,
             zero_cond_t: false,
             use_additional_t_cond: true, // Enables is_rgb conditioning for RGBA output
             use_layer3d_rope: true,      // Enables 3D RoPE for layer dimension
