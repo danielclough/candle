@@ -1225,16 +1225,6 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     Ok((vision_model, vision_config))
 }
 
-/// Print all tensor names in the GGUF file (for debugging tensor name mapping).
-pub fn debug_print_gguf_tensors(ct: &gguf_file::Content) {
-    println!("GGUF tensors ({} total):", ct.tensor_infos.len());
-    let mut names: Vec<_> = ct.tensor_infos.keys().collect();
-    names.sort();
-    for name in names {
-        println!("  {}", name);
-    }
-}
-
 // ============================================================================
 // Combined Quantized Model
 // ============================================================================

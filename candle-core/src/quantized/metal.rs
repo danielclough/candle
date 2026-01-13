@@ -36,6 +36,9 @@ impl QMetalStorage {
     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 
+        // Debug flag - set DEBUG_DEQUANT=1 to trace dequantization values
+        let debug = std::env::var("DEBUG_DEQUANT").is_ok();
+
         let buffer = self.device.allocate_buffer(self.buffer.length())?;
         let blit = self.device.blit_command_encoder()?;
         blit.set_label("blit_to_cpu");
@@ -44,18 +47,45 @@ impl QMetalStorage {
         self.device.wait_until_completed()?;
         let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
+
+        if debug {
+            eprintln!(
+                "[DEBUG DEQUANT] dtype={:?}, elem_count={}, block_len={}, buffer_len={}",
+                self.dtype,
+                elem_count,
+                block_len,
+                self.buffer.length()
+            );
+        }
+
         match self.dtype {
             GgmlDType::F32 => {
                 let vec: Vec<f32> = read_to_vec(&buffer, block_len);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] F32 vec.len()={}, first 5: {:?}", vec.len(), &vec[..5.min(vec.len())]);
+                }
                 f32::to_float(&vec, &mut out);
             }
             GgmlDType::F16 => {
                 let vec: Vec<half::f16> = read_to_vec(&buffer, block_len);
+                if debug {
+                    let first5: Vec<f32> = vec.iter().take(5).map(|v| v.to_f32()).collect();
+                    eprintln!("[DEBUG DEQUANT] F16 vec.len()={}, first 5 as f32: {:?}", vec.len(), first5);
+                }
                 half::f16::to_float(&vec, &mut out);
             }
             GgmlDType::BF16 => {
                 let vec: Vec<half::bf16> = read_to_vec(&buffer, block_len);
+                if debug {
+                    let first5: Vec<f32> = vec.iter().take(5).map(|v| v.to_f32()).collect();
+                    let raw5: Vec<u16> = vec.iter().take(5).map(|v| v.to_bits()).collect();
+                    eprintln!("[DEBUG DEQUANT] BF16 vec.len()={}, first 5 raw bits: {:?}", vec.len(), raw5);
+                    eprintln!("[DEBUG DEQUANT] BF16 first 5 as f32: {:?}", first5);
+                }
                 half::bf16::to_float(&vec, &mut out);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] BF16 after to_float, out first 5: {:?}", &out[..5.min(out.len())]);
+                }
             }
             GgmlDType::Q4_0 => {
                 let vec: Vec<crate::quantized::BlockQ4_0> = read_to_vec(&buffer, block_len);
@@ -91,20 +121,52 @@ impl QMetalStorage {
             }
             GgmlDType::Q4K => {
                 let vec: Vec<crate::quantized::BlockQ4K> = read_to_vec(&buffer, block_len);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q4K block_len={}", block_len);
+                }
                 crate::quantized::BlockQ4K::to_float(&vec, &mut out);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q4K after to_float, out first 10: {:?}", &out[..10.min(out.len())]);
+                }
             }
             GgmlDType::Q5K => {
                 let vec: Vec<crate::quantized::BlockQ5K> = read_to_vec(&buffer, block_len);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q5K block_len={}", block_len);
+                }
                 crate::quantized::BlockQ5K::to_float(&vec, &mut out);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q5K after to_float, out first 10: {:?}", &out[..10.min(out.len())]);
+                }
             }
             GgmlDType::Q6K => {
                 let vec: Vec<crate::quantized::BlockQ6K> = read_to_vec(&buffer, block_len);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q6K block_len={}", block_len);
+                }
                 crate::quantized::BlockQ6K::to_float(&vec, &mut out);
+                if debug {
+                    eprintln!("[DEBUG DEQUANT] Q6K after to_float, out first 10: {:?}", &out[..10.min(out.len())]);
+                }
             }
             GgmlDType::Q8K => {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+        }
+
+        if debug {
+            let sum: f32 = out.iter().sum();
+            let mean = sum / out.len() as f32;
+            let min = out.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "[DEBUG DEQUANT] Final out: len={}, min={:.6}, max={:.6}, mean={:.6}",
+                out.len(),
+                min,
+                max,
+                mean
+            );
         }
 
         let buffer = self.device.new_buffer_with_data(&out)?;

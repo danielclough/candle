@@ -146,7 +146,31 @@ impl<L: Module> Modulation<L> {
     /// Forward pass: compute modulation parameters for both norm1 and norm2.
     pub fn forward(&self, vec_: &Tensor) -> Result<(ModulationOut, ModulationOut)> {
         // SiLU activation then linear projection
-        let ys = self.lin.forward(&vec_.silu()?)?.unsqueeze(1)?;
+        let silu_out = vec_.silu()?;
+        let lin_out = self.lin.forward(&silu_out)?;
+
+        // DEBUG: Check raw linear output before unsqueeze/chunking
+        if std::env::var("DEBUG_MOD_LINEAR").is_ok() {
+            let flat = lin_out.flatten_all()?;
+            let vals: Vec<f32> = flat.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG MOD] lin_out shape: {:?}, first 10: {:?}", lin_out.shape(), &vals[..10.min(vals.len())]);
+            eprintln!("[DEBUG MOD] lin_out stats: min={:.4}, max={:.4}, mean={:.6}",
+                vals.iter().cloned().fold(f32::INFINITY, f32::min),
+                vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                vals.iter().sum::<f32>() / vals.len() as f32);
+            // Check each chunk's range
+            let chunk_size = vals.len() / 6;
+            for i in 0..6 {
+                let start = i * chunk_size;
+                let end = start + chunk_size;
+                let chunk_vals = &vals[start..end];
+                let chunk_mean = chunk_vals.iter().sum::<f32>() / chunk_vals.len() as f32;
+                eprintln!("[DEBUG MOD] chunk {} ({}): mean={:.6}", i,
+                    ["shift1", "scale1", "gate1", "shift2", "scale2", "gate2"][i], chunk_mean);
+            }
+        }
+
+        let ys = lin_out.unsqueeze(1)?;
 
         // Split into 6 parts
         let chunks = ys.chunk(6, D::Minus1)?;
@@ -522,52 +546,6 @@ impl<L: Module> QwenDoubleStreamAttention<L> {
 
         Ok((img_out, txt_out))
     }
-}
-
-impl QwenDoubleStreamAttention<Linear> {
-    /// Load from VarBuilder (FP16/BF16 models).
-    pub fn new(
-        dim: usize,
-        num_heads: usize,
-        head_dim: usize,
-        vb: VarBuilder,
-        eps: f64,
-        upcast_attention: bool,
-    ) -> Result<Self> {
-        let inner_dim = num_heads * head_dim;
-
-        // Image stream projections
-        let to_q = candle_nn::linear(dim, inner_dim, vb.pp("to_q"))?;
-        let to_k = candle_nn::linear(dim, inner_dim, vb.pp("to_k"))?;
-        let to_v = candle_nn::linear(dim, inner_dim, vb.pp("to_v"))?;
-        let to_out = candle_nn::linear(inner_dim, dim, vb.pp("to_out.0"))?;
-
-        // Text stream projections
-        let add_q_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_q_proj"))?;
-        let add_k_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_k_proj"))?;
-        let add_v_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_v_proj"))?;
-        let to_add_out = candle_nn::linear(inner_dim, dim, vb.pp("to_add_out"))?;
-
-        // QK normalization
-        let img_norm = QkNorm::new_img(head_dim, vb.clone(), eps)?;
-        let txt_norm = QkNorm::new_txt(head_dim, vb, eps)?;
-
-        Ok(Self {
-            to_q,
-            to_k,
-            to_v,
-            to_out,
-            add_q_proj,
-            add_k_proj,
-            add_v_proj,
-            to_add_out,
-            img_norm,
-            txt_norm,
-            num_heads,
-            head_dim,
-            upcast_attention,
-        })
-    }
 
     /// Forward pass with optional text Q, K, V caching for CFG optimization.
     ///
@@ -713,6 +691,52 @@ impl QwenDoubleStreamAttention<Linear> {
     }
 }
 
+impl QwenDoubleStreamAttention<Linear> {
+    /// Load from VarBuilder (FP16/BF16 models).
+    pub fn new(
+        dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        vb: VarBuilder,
+        eps: f64,
+        upcast_attention: bool,
+    ) -> Result<Self> {
+        let inner_dim = num_heads * head_dim;
+
+        // Image stream projections
+        let to_q = candle_nn::linear(dim, inner_dim, vb.pp("to_q"))?;
+        let to_k = candle_nn::linear(dim, inner_dim, vb.pp("to_k"))?;
+        let to_v = candle_nn::linear(dim, inner_dim, vb.pp("to_v"))?;
+        let to_out = candle_nn::linear(inner_dim, dim, vb.pp("to_out.0"))?;
+
+        // Text stream projections
+        let add_q_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_q_proj"))?;
+        let add_k_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_k_proj"))?;
+        let add_v_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_v_proj"))?;
+        let to_add_out = candle_nn::linear(inner_dim, dim, vb.pp("to_add_out"))?;
+
+        // QK normalization
+        let img_norm = QkNorm::new_img(head_dim, vb.clone(), eps)?;
+        let txt_norm = QkNorm::new_txt(head_dim, vb, eps)?;
+
+        Ok(Self {
+            to_q,
+            to_k,
+            to_v,
+            to_out,
+            add_q_proj,
+            add_k_proj,
+            add_v_proj,
+            to_add_out,
+            img_norm,
+            txt_norm,
+            num_heads,
+            head_dim,
+            upcast_attention,
+        })
+    }
+}
+
 /// Qwen-Image Transformer Block.
 ///
 /// Implements the dual-stream architecture where:
@@ -845,8 +869,41 @@ impl<L: Module> QwenImageTransformerBlock<L> {
         let orig_dtype = hidden_states.dtype();
         let batch_size = hidden_states.dim(0)?;
 
+        // DEBUG: Check for block 0 debugging
+        let debug_block0 = std::env::var("DEBUG_BLOCK0").is_ok();
+
         // Get modulation parameters for image stream (uses full temb if doubled)
+        // DEBUG: Check temb shape and values before silu
+        if debug_block0 {
+            let flat = temb.flatten_all()?;
+            let vals: Vec<f32> = flat.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG BLOCK0] temb BEFORE mod: shape {:?}, first 5: {:?}", temb.shape(), &vals[..5.min(vals.len())]);
+            // Also check after silu
+            let temb_silu = temb.silu()?;
+            let flat2 = temb_silu.flatten_all()?;
+            let vals2: Vec<f32> = flat2.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG BLOCK0] temb AFTER silu: shape {:?}, first 5: {:?}, mean: {:.6}",
+                temb_silu.shape(), &vals2[..5.min(vals2.len())], vals2.iter().sum::<f32>() / vals2.len() as f32);
+        }
         let (img_mod1, img_mod2) = self.img_mod.forward(temb)?;
+
+        if debug_block0 {
+            let scale_flat = img_mod1.scale.flatten_all()?;
+            let scale_vals: Vec<f32> = scale_flat.to_dtype(DType::F32)?.to_vec1()?;
+            let shift_flat = img_mod1.shift.flatten_all()?;
+            let shift_vals: Vec<f32> = shift_flat.to_dtype(DType::F32)?.to_vec1()?;
+            let gate_flat = img_mod1.gate.flatten_all()?;
+            let gate_vals: Vec<f32> = gate_flat.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG BLOCK0] img_mod1.scale first 5: {:?}, mean: {:.6}",
+                &scale_vals[..5.min(scale_vals.len())],
+                scale_vals.iter().sum::<f32>() / scale_vals.len() as f32);
+            eprintln!("[DEBUG BLOCK0] img_mod1.shift first 5: {:?}, mean: {:.6}",
+                &shift_vals[..5.min(shift_vals.len())],
+                shift_vals.iter().sum::<f32>() / shift_vals.len() as f32);
+            eprintln!("[DEBUG BLOCK0] img_mod1.gate first 5: {:?}, mean: {:.6}",
+                &gate_vals[..5.min(gate_vals.len())],
+                gate_vals.iter().sum::<f32>() / gate_vals.len() as f32);
+        }
 
         // For text stream, use only first half of temb if modulate_index is provided (zero_cond_t mode)
         let txt_temb = if modulate_index.is_some() {
@@ -883,6 +940,14 @@ impl<L: Module> QwenImageTransformerBlock<L> {
             self.attn
                 .forward(&img_modulated, &txt_modulated, image_rotary_emb)?;
 
+        if debug_block0 {
+            let flat = img_attn_out.flatten_all()?;
+            let vals: Vec<f32> = flat.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG BLOCK0] img_attn_out first 5: {:?}, mean: {:.6}",
+                &vals[..5.min(vals.len())],
+                vals.iter().sum::<f32>() / vals.len() as f32);
+        }
+
         // === F32 ACCUMULATION FOR RESIDUAL ADDITIONS ===
         // The MLP outputs have std > 2000, and accumulated values reach ±2.3M
         // This exceeds BF16's max of ±65536, so we MUST compute residuals in F32
@@ -915,6 +980,14 @@ impl<L: Module> QwenImageTransformerBlock<L> {
 
         let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
         let gated_img_mlp = img_gate2.broadcast_mul(&img_mlp_out)?;
+
+        if debug_block0 {
+            let flat = img_mlp_out.flatten_all()?;
+            let vals: Vec<f32> = flat.to_dtype(DType::F32)?.to_vec1()?;
+            eprintln!("[DEBUG BLOCK0] img_mlp_out first 5: {:?}, mean: {:.6}",
+                &vals[..5.min(vals.len())],
+                vals.iter().sum::<f32>() / vals.len() as f32);
+        }
 
         // Residual add in F32
         let hidden_states = (hidden_states.to_dtype(DType::F32)?

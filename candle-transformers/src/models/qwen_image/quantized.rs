@@ -127,10 +127,6 @@ impl QwenImageTransformer2DModelQuantized {
     /// * `dtype` - Working dtype for biases and normalization layers
     /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
     /// * `zero_cond_t` - Enable edit mode with per-token modulation
-    ///
-    /// # Note
-    /// The GGUF tensor names must follow the llama.cpp convention for Qwen-Image.
-    /// Use `debug_print_gguf_tensors()` to inspect actual tensor names in your file.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -200,6 +196,37 @@ impl QwenImageTransformer2DModelQuantized {
                 let weight_name: &str = &$weight_name;
                 let bias_name: &str = &$bias_name;
                 let qt = ct.tensor(reader, weight_name, device)?;
+                // DEBUG: Print shape and dequantized values for key tensors
+                if weight_name == "transformer_blocks.0.attn.to_q.weight"
+                    || weight_name == "img_in.weight"
+                    || weight_name == "transformer_blocks.0.img_mod.1.weight" {
+                    eprintln!("[DEBUG] Loading {}: shape {:?}, dtype {:?}", weight_name, qt.shape(), qt.dtype());
+                    // Debug: Dequantize and check first few values (with error handling)
+                    match qt.dequantize(device) {
+                        Ok(dequant) => {
+                            match dequant.flatten_all() {
+                                Ok(flat) => {
+                                    match flat.to_vec1::<f32>() {
+                                        Ok(dequant_vec) => {
+                                            let len = dequant_vec.len().min(10);
+                                            eprintln!("[DEBUG] Dequantized first {} values: {:?}", len, &dequant_vec[..len]);
+                                            eprintln!("[DEBUG] Dequantized stats: min={:.4}, max={:.4}, mean={:.6}",
+                                                dequant_vec.iter().cloned().fold(f32::INFINITY, f32::min),
+                                                dequant_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                                                dequant_vec.iter().sum::<f32>() / dequant_vec.len() as f32);
+                                        }
+                                        Err(e) => eprintln!("[DEBUG] to_vec1 failed: {}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!("[DEBUG] flatten_all failed: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("[DEBUG] dequantize failed: {}", e),
+                    }
+                }
+                // Use regular loading - city96/ComfyUI-GGUF just reverses the shape (which Candle
+                // already does), no actual transpose needed. The data layout matches PyTorch after
+                // the shape reversal.
                 let weight = QMatMul::from_weights(Arc::new(qt))?;
                 let bias = if ct.tensor_infos.contains_key(bias_name) {
                     let bt = ct.tensor(reader, bias_name, device)?;

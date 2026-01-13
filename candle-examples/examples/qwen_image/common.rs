@@ -32,20 +32,35 @@ pub const PATCH_SIZE: usize = 2;
 /// Default HuggingFace model IDs (FP16 safetensors).
 pub const DEFAULT_TEXT_ENCODER_ID: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
 
-/// Default GGUF model paths (HuggingFace format: owner/repo/filename).
-/// Text encoder and vision encoder use Qwen2.5-VL GGUF files from unsloth.
+// =============================================================================
+// GGUF Model Sources
+// =============================================================================
+// Qwen-Image architecture uses components from DIFFERENT repos:
+//
+//   1. Text encoder (unsloth): Qwen2.5-VL-7B encodes text prompts
+//      - The diffusion model reuses Qwen2.5-VL's text understanding
+//
+//   2. Diffusion transformer (city96): The actual image generation model
+//      - This is the 20B parameter MMDiT that generates images
+//
+//   3. Vision encoder (unsloth): mmproj for edit mode with reference images
+//      - Must match the text encoder version
+//
+// This split is intentional - see: https://huggingface.co/city96/Qwen-Image-gguf
+// =============================================================================
+
+/// Text encoder: Qwen2.5-VL-7B (encodes prompts for the diffusion model)
 pub const DEFAULT_GGUF_TEXT_ENCODER: &str =
     "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf";
-/// Vision encoder (mmproj) files at different precision levels - matched to working dtype.
+
+/// Vision encoder (mmproj) for edit mode - must match text encoder version
 pub const DEFAULT_GGUF_VISION_ENCODER_F32: &str =
     "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F32.gguf";
 pub const DEFAULT_GGUF_VISION_ENCODER_F16: &str =
     "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F16.gguf";
 pub const DEFAULT_GGUF_VISION_ENCODER_BF16: &str =
     "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-BF16.gguf";
-/// Default GGUF transformer from city96/Qwen-Image-gguf.
-/// Available quants: Q2_K (7GB), Q3_K_M (9.7GB), Q4_K_M (13GB), Q5_K_M (15GB), Q8_0 (22GB), BF16 (41GB)
-pub const DEFAULT_GGUF_TRANSFORMER: &str = "city96/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf";
+pub const DEFAULT_GGUF_TRANSFORMER: &str = "unsloth/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf";
 
 // ============================================================================
 // GGUF Path Resolution
@@ -416,6 +431,7 @@ pub fn load_transformer_quantized(
     println!("Loading quantized transformer from {}...", gguf_path);
     let mut file = std::fs::File::open(gguf_path)?;
     let content = gguf_file::Content::read(&mut file)?;
+
     Ok(QwenImageTransformer2DModelQuantized::from_gguf(
         content,
         &mut file,
