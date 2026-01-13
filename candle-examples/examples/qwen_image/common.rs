@@ -92,6 +92,19 @@ pub fn resolve_gguf_path(
 // Setup utilities
 // ============================================================================
 
+/// Get the seed value, or generate one from current time if not provided.
+///
+/// Uses system time in nanoseconds for reproducible but unique seeds.
+pub fn get_seed_or_current_time(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    })
+}
+
 /// Initialize Chrome tracing if enabled.
 ///
 /// Returns a guard that must be kept alive for the duration of tracing.
@@ -213,6 +226,38 @@ pub fn load_mask_for_latents(
     }
 
     Ok(Tensor::from_vec(data, (1, 1, 1, latent_height, latent_width), device)?.to_dtype(dtype)?)
+}
+
+/// Encode an image tensor and normalize the latents.
+///
+/// Combines the VAE encode + normalize pattern that appears in multiple pipelines.
+/// Returns normalized latents in [B, C, T, H, W] format.
+pub fn encode_and_normalize_image(
+    vae: &AutoencoderKLQwenImage,
+    image: &Tensor,
+) -> Result<Tensor> {
+    let dist = vae.encode(image)?;
+    Ok(vae.normalize_latents(&dist.mode().clone())?)
+}
+
+/// Denormalize latents and decode to image using 3D VAE.
+///
+/// Returns the decoded image tensor in [B, C, T, H, W] format.
+pub fn denormalize_and_decode(vae: &AutoencoderKLQwenImage, latents: &Tensor) -> Result<Tensor> {
+    let denormalized = vae.denormalize_latents(latents)?;
+    Ok(vae.decode(&denormalized)?)
+}
+
+/// Denormalize latents and decode to a single-frame image.
+///
+/// Uses `decode_image` which extracts the first temporal frame.
+/// Returns the decoded image tensor in [B, C, H, W] format.
+pub fn denormalize_and_decode_image(
+    vae: &AutoencoderKLQwenImage,
+    latents: &Tensor,
+) -> Result<Tensor> {
+    let denormalized = vae.denormalize_latents(latents)?;
+    Ok(vae.decode_image(&denormalized)?)
 }
 
 /// Post-process VAE output and save to file.
@@ -384,6 +429,33 @@ pub fn load_transformer_quantized(
 // ============================================================================
 // Inference Logging Helpers
 // ============================================================================
+
+/// Log text encoder loading info.
+///
+/// Prints a formatted message like:
+/// "  Text encoder loaded (quantized GGUF)" or "  Text encoder loaded (BF16)"
+pub fn log_text_encoder_loaded(is_quantized: bool, model_dtype: DType) {
+    let encoder_type = if is_quantized {
+        "quantized GGUF".to_string()
+    } else {
+        format!("{:?}", model_dtype)
+    };
+    println!("  Text encoder loaded ({})", encoder_type);
+}
+
+/// Log progress during the denoising loop.
+///
+/// Prints a status message every 10 steps and on the final step.
+pub fn log_denoising_step(step: usize, total_steps: usize, timestep: f64) {
+    if step % 10 == 0 || step == total_steps - 1 {
+        println!(
+            "    Step {}/{}, timestep: {:.2}",
+            step + 1,
+            total_steps,
+            timestep
+        );
+    }
+}
 
 /// Format the attention dtype for logging based on InferenceConfig.
 ///
@@ -806,6 +878,27 @@ pub fn encode_text_prompt(
 // ============================================================================
 // Scheduler utilities
 // ============================================================================
+
+/// Encode a negative prompt, defaulting to empty string if not provided.
+///
+/// This is a convenience wrapper around `encode_text_prompt` for the common pattern
+/// of handling optional negative prompts.
+pub fn encode_negative_prompt(
+    tokenizer: &Tokenizer,
+    text_model: &mut Qwen25VLTextModel,
+    negative_prompt: &str,
+    mode: PromptMode,
+    device: &Device,
+    target_dtype: DType,
+) -> Result<Tensor> {
+    let neg_prompt = if negative_prompt.is_empty() {
+        ""
+    } else {
+        negative_prompt
+    };
+    let (neg_embeds, _) = encode_text_prompt(tokenizer, text_model, neg_prompt, mode, device, target_dtype)?;
+    Ok(neg_embeds)
+}
 
 /// Create and configure the FlowMatch Euler scheduler.
 ///

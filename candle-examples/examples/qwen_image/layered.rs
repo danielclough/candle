@@ -95,8 +95,7 @@ pub fn run(
 
     let vae_input =
         common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
-    let dist = vae.encode(&vae_input)?;
-    let image_latents = vae.normalize_latents(&dist.mode().clone())?;
+    let image_latents = common::encode_and_normalize_image(&vae, &vae_input)?;
     println!("  Image latents shape: {:?}", image_latents.dims());
 
     // =========================================================================
@@ -119,15 +118,10 @@ pub fn run(
     )?;
     println!("  Positive prompt embeddings: {:?}", pos_embeds.dims());
 
-    let neg_prompt = if args.negative_prompt.is_empty() {
-        ""
-    } else {
-        &args.negative_prompt
-    };
-    let (neg_embeds, _) = common::encode_text_prompt(
+    let neg_embeds = common::encode_negative_prompt(
         &tokenizer,
         &mut text_model,
-        neg_prompt,
+        &args.negative_prompt,
         PromptMode::Layered,
         device,
         dtype,
@@ -152,11 +146,7 @@ pub fn run(
     // Create initial noise for all layers: [batch, layers+1, channels, height, width]
     // Keep in F32 to avoid BF16 quantization error accumulating across steps
     // Use PyTorch-compatible RNG for consistent noise distribution
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let seed = common::get_seed_or_current_time(None);
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let noise_latents = rng.randn(
         &[
@@ -220,14 +210,7 @@ pub fn run(
     let mut latents = packed_noise;
 
     for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
-        if step % 10 == 0 || step == args.steps - 1 {
-            println!(
-                "    Step {}/{}, timestep: {:.2}",
-                step + 1,
-                args.steps,
-                timestep
-            );
-        }
+        common::log_denoising_step(step, args.steps, timestep);
 
         // Convert F32 latents to BF16 for transformer (weights are BF16)
         let latents_bf16 = latents.to_dtype(dtype)?;
@@ -293,8 +276,7 @@ pub fn run(
         let layer_latents = final_latents.narrow(2, layer_idx, 1)?;
 
         // Denormalize and decode (both latents and VAE are F32 for precision)
-        let layer_latents = vae.denormalize_latents(&layer_latents)?;
-        let decoded = vae.decode(&layer_latents)?;
+        let decoded = common::denormalize_and_decode(&vae, &layer_latents)?;
 
         // Post-process: [1, 3, T, H, W] -> [3, H, W]
         let decoded = decoded.squeeze(0)?;

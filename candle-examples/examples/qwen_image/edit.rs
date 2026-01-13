@@ -134,10 +134,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let vae_input =
         common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
 
-    let dist = vae.encode(&vae_input)?;
-    let image_latents_raw = dist.mode().clone();
-
-    let image_latents = vae.normalize_latents(&image_latents_raw)?;
+    let image_latents = common::encode_and_normalize_image(&vae, &vae_input)?;
     // Permute from VAE format [B, C, T, H, W] to pack format [B, T, C, H, W]
     let image_latents = image_latents.permute([0, 2, 1, 3, 4])?;
     println!("  Image latents shape: {:?}", image_latents.dims());
@@ -186,12 +183,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         &api,
         device,
     )?;
-    let encoder_type = if text_model.is_quantized() {
-        "quantized GGUF"
-    } else {
-        &format!("{:?}", dtype)
-    };
-    println!("  Text encoder loaded ({})", encoder_type);
+    common::log_text_encoder_loaded(text_model.is_quantized(), dtype);
 
     // Encode prompts with vision (text encoder outputs F32, convert to transformer dtype)
     let (pos_embeds, _) = encode_prompt_with_vision(
@@ -239,13 +231,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use [B, T, C, H, W] format to match PyTorch diffusers
     // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
-    let seed = args.seed.unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
-    });
+    let seed = common::get_seed_or_current_time(args.seed);
     println!("  Using seed: {}", seed);
     let mut rng = MtBoxMullerRng::new(seed);
     let noise_latents = rng
@@ -300,14 +286,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     let mut latents = packed_noise;
 
     for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
-        if step % 10 == 0 || step == args.steps - 1 {
-            println!(
-                "    Step {}/{}, timestep: {:.2}",
-                step + 1,
-                args.steps,
-                timestep
-            );
-        }
+        common::log_denoising_step(step, args.steps, timestep);
 
         // Convert F32 latents to BF16 for transformer (weights are BF16)
         let latents_bf16 = latents.to_dtype(dtype)?;

@@ -70,12 +70,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         &api,
         device,
     )?;
-    let encoder_type = if text_model.is_quantized() {
-        "quantized GGUF"
-    } else {
-        &format!("{:?}", dtype)
-    };
-    println!("  Text encoder loaded ({})", encoder_type);
+    common::log_text_encoder_loaded(text_model.is_quantized(), dtype);
 
     // =========================================================================
     // Stage 2: Encode prompts
@@ -173,13 +168,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         // Always use PyTorch-compatible MT19937 + Box-Muller RNG for consistent noise distribution
         // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
         // Use [B, T, C, H, W] format to match PyTorch diffusers
-        let seed = args.seed.unwrap_or_else(|| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        });
+        let seed = common::get_seed_or_current_time(args.seed);
         println!("  Using seed: {}", seed);
         let mut rng = MtBoxMullerRng::new(seed);
         rng.randn(
@@ -247,14 +236,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         .enumerate()
     {
         let step = step_idx + start_step;
-        if step_idx % 10 == 0 || step_idx == num_actual_steps - 1 {
-            println!(
-                "    Step {}/{}, timestep: {:.2}",
-                step + 1,
-                args.steps,
-                timestep
-            );
-        }
+        common::log_denoising_step(step, args.steps, timestep);
 
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
@@ -298,11 +280,9 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 
     // Unpack latents for VAE: [B, seq, C*4] -> [B, C, T, H, W]
     let latents = unpack_latents(&latents, dims.latent_height, dims.latent_width, 16)?;
-    let denormalized = vae.denormalize_latents(&latents)?;
-
     // Use decode_image for single-frame output (matches PyTorch: vae.decode(z)[:, :, 0])
     // Note: Both latents and VAE are F32 for numerical precision
-    let image = vae.decode_image(&denormalized)?;
+    let image = common::denormalize_and_decode_image(&vae, &latents)?;
 
     common::postprocess_and_save_4d(&image, &args.output)?;
     println!("\nImage saved to: {}", args.output);
@@ -324,20 +304,15 @@ fn create_img2img_latents(
     let init_image =
         common::load_image_for_vae(init_path, dims.image_height, dims.image_width, device)?;
 
-    let dist = vae.encode(&init_image)?;
     // VAE outputs [B, C, T, H, W] format
-    let encoded_latents = vae.normalize_latents(&dist.mode().clone())?;
+    let encoded_latents = common::encode_and_normalize_image(vae, &init_image)?;
     // Transpose to [B, T, C, H, W] format for packing
     let encoded_latents = encoded_latents.permute([0, 2, 1, 3, 4])?;
 
     // Keep noise in F32 to avoid BF16 quantization error
     // Use [B, T, C, H, W] format to match transposed VAE output
     // Use PyTorch-compatible RNG for consistent noise distribution
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let seed = common::get_seed_or_current_time(None);
     let mut rng = MtBoxMullerRng::new(seed);
     let noise = rng.randn(
         &[1, 1, 16, dims.latent_height, dims.latent_width],

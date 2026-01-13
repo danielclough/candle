@@ -96,15 +96,10 @@ pub fn run(
         dtype,
     )?;
 
-    let neg_prompt = if args.negative_prompt.is_empty() {
-        ""
-    } else {
-        &args.negative_prompt
-    };
-    let (neg_embeds, _) = common::encode_text_prompt(
+    let neg_embeds = common::encode_negative_prompt(
         &tokenizer,
         &mut text_model,
-        neg_prompt,
+        &args.negative_prompt,
         PromptMode::TextOnly,
         device,
         dtype,
@@ -122,11 +117,7 @@ pub fn run(
 
     // Keep latents in F32 to avoid BF16 quantization error accumulating across steps
     // Use PyTorch-compatible RNG for consistent noise distribution
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let seed = common::get_seed_or_current_time(None);
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let latents = rng.randn(
         &[1, 16, 1, dims.latent_height, dims.latent_width],
@@ -200,14 +191,7 @@ pub fn run(
         args.steps
     );
     for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
-        if step % 10 == 0 || step == args.steps - 1 {
-            println!(
-                "    Step {}/{}, timestep: {:.2}",
-                step + 1,
-                args.steps,
-                timestep
-            );
-        }
+        common::log_denoising_step(step, args.steps, timestep);
 
         let packed = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
         // Convert F32 latents to BF16 for transformer/controlnet (weights are BF16)
@@ -255,8 +239,7 @@ pub fn run(
     println!("\n[6/6] Decoding latents...");
 
     // Note: Both latents and VAE are F32 for numerical precision
-    let latents = vae.denormalize_latents(&latents)?;
-    let image = vae.decode(&latents)?;
+    let image = common::denormalize_and_decode(&vae, &latents)?;
 
     common::postprocess_and_save(&image, &args.output)?;
     println!("\nControlNet image saved to: {}", args.output);
@@ -271,7 +254,6 @@ fn encode_control_condition(
     latent_height: usize,
     latent_width: usize,
 ) -> Result<Tensor> {
-    let dist = vae.encode(control_image)?;
-    let latents = vae.normalize_latents(&dist.mode().clone())?;
+    let latents = common::encode_and_normalize_image(vae, control_image)?;
     Ok(pack_latents(&latents, latent_height, latent_width)?)
 }

@@ -82,8 +82,7 @@ pub fn run(
     // Encode input image
     let input_image =
         common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
-    let dist = vae.encode(&input_image)?;
-    let original_latents = vae.normalize_latents(&dist.mode().clone())?;
+    let original_latents = common::encode_and_normalize_image(&vae, &input_image)?;
     println!("  Encoded latents shape: {:?}", original_latents.dims());
 
     // Load mask
@@ -117,15 +116,10 @@ pub fn run(
         dtype,
     )?;
 
-    let neg_prompt = if args.negative_prompt.is_empty() {
-        ""
-    } else {
-        &args.negative_prompt
-    };
-    let (neg_embeds, _) = common::encode_text_prompt(
+    let neg_embeds = common::encode_negative_prompt(
         &tokenizer,
         &mut text_model,
-        neg_prompt,
+        &args.negative_prompt,
         PromptMode::TextOnly,
         device,
         dtype,
@@ -143,11 +137,7 @@ pub fn run(
 
     // Create initial noise (F32 to avoid BF16 quantization error)
     // Use PyTorch-compatible RNG for consistent noise distribution
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let seed = common::get_seed_or_current_time(None);
     let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
     let noise = rng.randn(
         &[1, 16, 1, dims.latent_height, dims.latent_width],
@@ -182,14 +172,7 @@ pub fn run(
 
     println!("  Running {} denoising steps...", args.steps);
     for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
-        if step % 10 == 0 || step == args.steps - 1 {
-            println!(
-                "    Step {}/{}, timestep: {:.2}",
-                step + 1,
-                args.steps,
-                timestep
-            );
-        }
+        common::log_denoising_step(step, args.steps, timestep);
 
         // Get current sigma
         let sigma = sigmas[step];
@@ -227,8 +210,7 @@ pub fn run(
     println!("\n[5/5] Decoding latents...");
 
     // Note: Both latents and VAE are F32 for numerical precision
-    let latents = vae.denormalize_latents(&latents)?;
-    let image = vae.decode(&latents)?;
+    let image = common::denormalize_and_decode(&vae, &latents)?;
 
     common::postprocess_and_save(&image, &args.output)?;
     println!("\nInpainted image saved to: {}", args.output);
