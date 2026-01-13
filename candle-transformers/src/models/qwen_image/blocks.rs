@@ -18,7 +18,7 @@ use super::rope::apply_rotary_emb_qwen;
 ///
 /// This is used in Qwen-Image transformer blocks where the modulation provides
 /// the scale and shift instead of learned LayerNorm parameters.
-fn layer_norm_no_affine(
+pub fn layer_norm_no_affine(
     size: usize,
     eps: f64,
     device: &candle::Device,
@@ -130,22 +130,23 @@ pub fn apply_modulation_with_index(
 ///
 /// Projects the timestep embedding to 6 × dim parameters:
 /// (shift1, scale1, gate1, shift2, scale2, gate2) for norm1 and norm2.
+///
+/// Generic over `L: Module` to support both FP16 Linear and quantized QLinear.
 #[derive(Debug, Clone)]
-pub struct Modulation {
-    lin: Linear,
+pub struct Modulation<L: Module> {
+    lin: L,
 }
 
-impl Modulation {
-    pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        // Linear: dim -> 6 * dim (for 2 modulations × 3 params each)
-        let lin = candle_nn::linear(dim, 6 * dim, vb.pp("1"))?;
-        Ok(Self { lin })
+impl<L: Module> Modulation<L> {
+    /// Create modulation from a pre-constructed linear layer.
+    pub fn from_linear(lin: L) -> Self {
+        Self { lin }
     }
 
     /// Forward pass: compute modulation parameters for both norm1 and norm2.
     pub fn forward(&self, vec_: &Tensor) -> Result<(ModulationOut, ModulationOut)> {
         // SiLU activation then linear projection
-        let ys = vec_.silu()?.apply(&self.lin)?.unsqueeze(1)?;
+        let ys = self.lin.forward(&vec_.silu()?)?.unsqueeze(1)?;
 
         // Split into 6 parts
         let chunks = ys.chunk(6, D::Minus1)?;
@@ -168,14 +169,38 @@ impl Modulation {
     }
 }
 
-/// Feed-forward network with GELU activation.
-#[derive(Debug, Clone)]
-pub struct FeedForward {
-    proj_in: Linear,
-    proj_out: Linear,
+impl Modulation<Linear> {
+    /// Load modulation weights from VarBuilder (FP16/BF16 models).
+    pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+        // Linear: dim -> 6 * dim (for 2 modulations × 3 params each)
+        let lin = candle_nn::linear(dim, 6 * dim, vb.pp("1"))?;
+        Ok(Self { lin })
+    }
 }
 
-impl FeedForward {
+/// Feed-forward network with GELU activation.
+///
+/// Generic over `L: Module` to support both FP16 Linear and quantized QLinear.
+#[derive(Debug, Clone)]
+pub struct FeedForward<L: Module> {
+    proj_in: L,
+    proj_out: L,
+}
+
+impl<L: Module> FeedForward<L> {
+    /// Create from pre-constructed linear layers.
+    pub fn from_linears(proj_in: L, proj_out: L) -> Self {
+        Self { proj_in, proj_out }
+    }
+
+    /// Forward pass: proj_in -> GELU -> proj_out
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.apply(&self.proj_in)?.gelu()?.apply(&self.proj_out)
+    }
+}
+
+impl FeedForward<Linear> {
+    /// Load from VarBuilder (FP16/BF16 models).
     pub fn new(dim: usize, dim_out: usize, vb: VarBuilder) -> Result<Self> {
         // MLP: dim -> 4*dim -> dim_out (using GELU-approximate)
         let hidden_dim = dim * 4;
@@ -185,10 +210,10 @@ impl FeedForward {
     }
 }
 
-impl Module for FeedForward {
+impl<L: Module> Module for FeedForward<L> {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // GELU-approximate activation (tanh approximation, matches PyTorch gelu-approximate)
-        xs.apply(&self.proj_in)?.gelu()?.apply(&self.proj_out)
+        // Delegate to the inherent forward method
+        FeedForward::forward(self, xs)
     }
 }
 
@@ -196,6 +221,9 @@ impl Module for FeedForward {
 ///
 /// Applies separate normalization to queries and keys before attention,
 /// which helps stabilize training with large hidden dimensions.
+///
+/// Used for both image stream (`norm_q`, `norm_k`) and text stream
+/// (`norm_added_q`, `norm_added_k`) by passing different prefixes.
 #[derive(Debug, Clone)]
 pub struct QkNorm {
     query_norm: RmsNorm,
@@ -203,17 +231,49 @@ pub struct QkNorm {
 }
 
 impl QkNorm {
-    pub fn new(dim: usize, vb: VarBuilder, eps: f64) -> Result<Self> {
-        let query_norm_weight = vb.get(dim, "norm_q.weight")?;
+    /// Create QK normalization with custom weight name prefix.
+    ///
+    /// # Arguments
+    /// * `dim` - Normalization dimension (head_dim)
+    /// * `vb` - VarBuilder for loading weights
+    /// * `eps` - Epsilon for RMSNorm
+    /// * `q_name` - Weight name for query norm (e.g., "norm_q" or "norm_added_q")
+    /// * `k_name` - Weight name for key norm (e.g., "norm_k" or "norm_added_k")
+    pub fn new(
+        dim: usize,
+        vb: VarBuilder,
+        eps: f64,
+        q_name: &str,
+        k_name: &str,
+    ) -> Result<Self> {
+        let query_norm_weight = vb.get(dim, &format!("{q_name}.weight"))?;
         let query_norm = RmsNorm::new(query_norm_weight, eps);
 
-        let key_norm_weight = vb.get(dim, "norm_k.weight")?;
+        let key_norm_weight = vb.get(dim, &format!("{k_name}.weight"))?;
         let key_norm = RmsNorm::new(key_norm_weight, eps);
 
         Ok(Self {
             query_norm,
             key_norm,
         })
+    }
+
+    /// Create QK normalization for image stream (norm_q, norm_k).
+    pub fn new_img(dim: usize, vb: VarBuilder, eps: f64) -> Result<Self> {
+        Self::new(dim, vb, eps, "norm_q", "norm_k")
+    }
+
+    /// Create QK normalization for text stream (norm_added_q, norm_added_k).
+    pub fn new_txt(dim: usize, vb: VarBuilder, eps: f64) -> Result<Self> {
+        Self::new(dim, vb, eps, "norm_added_q", "norm_added_k")
+    }
+
+    /// Create QK normalization from pre-loaded RmsNorm instances.
+    pub fn from_rms_norms(query_norm: RmsNorm, key_norm: RmsNorm) -> Self {
+        Self {
+            query_norm,
+            key_norm,
+        }
     }
 
     pub fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
@@ -225,32 +285,45 @@ impl QkNorm {
     }
 }
 
-/// QK Normalization for the added (text) stream.
-#[derive(Debug, Clone)]
-pub struct AddedQkNorm {
-    query_norm: RmsNorm,
-    key_norm: RmsNorm,
+// ============================================================================
+// QkNormForward Trait - Abstracts QkNorm and DirectRmsNormPair
+// ============================================================================
+
+/// Trait for QK normalization in attention.
+///
+/// This abstracts over `QkNorm` (wrapper struct) and `DirectRmsNormPair` (direct fields),
+/// allowing generic implementations of attention modules.
+pub trait QkNormForward {
+    fn forward_q(&self, q: &Tensor) -> Result<Tensor>;
+    fn forward_k(&self, k: &Tensor) -> Result<Tensor>;
 }
 
-impl AddedQkNorm {
-    pub fn new(dim: usize, vb: VarBuilder, eps: f64) -> Result<Self> {
-        let query_norm_weight = vb.get(dim, "norm_added_q.weight")?;
-        let query_norm = RmsNorm::new(query_norm_weight, eps);
-
-        let key_norm_weight = vb.get(dim, "norm_added_k.weight")?;
-        let key_norm = RmsNorm::new(key_norm_weight, eps);
-
-        Ok(Self {
-            query_norm,
-            key_norm,
-        })
+impl QkNormForward for QkNorm {
+    fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
+        QkNorm::forward_q(self, q)
     }
 
-    pub fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
+    fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
+        QkNorm::forward_k(self, k)
+    }
+}
+
+/// Direct RmsNorm pair for Q and K normalization.
+///
+/// Used in quantized models where the normalization layers are stored
+/// directly rather than wrapped in a `QkNorm` struct.
+#[derive(Debug, Clone)]
+pub struct DirectRmsNormPair {
+    pub query_norm: RmsNorm,
+    pub key_norm: RmsNorm,
+}
+
+impl QkNormForward for DirectRmsNormPair {
+    fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
         q.apply(&self.query_norm)
     }
 
-    pub fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
+    fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
         k.apply(&self.key_norm)
     }
 }
@@ -351,23 +424,27 @@ impl TextQKVCache {
 /// 1. Both image and text streams compute Q, K, V
 /// 2. Streams are concatenated for joint attention computation
 /// 3. Results are split back to separate streams
+///
+/// Generic over:
+/// - `L: Module` - Linear layer type (Linear or QLinear)
+/// - `N: QkNormForward` - QK normalization type (QkNorm or DirectRmsNormPair)
 #[derive(Debug, Clone)]
-pub struct QwenDoubleStreamAttention {
+pub struct QwenDoubleStreamAttention<L: Module, N: QkNormForward> {
     // Image stream projections
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: L,
+    to_k: L,
+    to_v: L,
+    to_out: L,
 
     // Text stream projections
-    add_q_proj: Linear,
-    add_k_proj: Linear,
-    add_v_proj: Linear,
-    to_add_out: Linear,
+    add_q_proj: L,
+    add_k_proj: L,
+    add_v_proj: L,
+    to_add_out: L,
 
     // QK normalization
-    img_norm: QkNorm,
-    txt_norm: AddedQkNorm,
+    img_norm: N,
+    txt_norm: N,
 
     num_heads: usize,
     head_dim: usize,
@@ -376,34 +453,25 @@ pub struct QwenDoubleStreamAttention {
     upcast_attention: bool,
 }
 
-impl QwenDoubleStreamAttention {
-    pub fn new(
-        dim: usize,
+impl<L: Module, N: QkNormForward> QwenDoubleStreamAttention<L, N> {
+    /// Create from pre-constructed components.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        to_q: L,
+        to_k: L,
+        to_v: L,
+        to_out: L,
+        add_q_proj: L,
+        add_k_proj: L,
+        add_v_proj: L,
+        to_add_out: L,
+        img_norm: N,
+        txt_norm: N,
         num_heads: usize,
         head_dim: usize,
-        vb: VarBuilder,
-        eps: f64,
         upcast_attention: bool,
-    ) -> Result<Self> {
-        let inner_dim = num_heads * head_dim;
-
-        // Image stream projections
-        let to_q = candle_nn::linear(dim, inner_dim, vb.pp("to_q"))?;
-        let to_k = candle_nn::linear(dim, inner_dim, vb.pp("to_k"))?;
-        let to_v = candle_nn::linear(dim, inner_dim, vb.pp("to_v"))?;
-        let to_out = candle_nn::linear(inner_dim, dim, vb.pp("to_out.0"))?;
-
-        // Text stream projections
-        let add_q_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_q_proj"))?;
-        let add_k_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_k_proj"))?;
-        let add_v_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_v_proj"))?;
-        let to_add_out = candle_nn::linear(inner_dim, dim, vb.pp("to_add_out"))?;
-
-        // QK normalization
-        let img_norm = QkNorm::new(head_dim, vb.clone(), eps)?;
-        let txt_norm = AddedQkNorm::new(head_dim, vb, eps)?;
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             to_q,
             to_k,
             to_v,
@@ -417,7 +485,7 @@ impl QwenDoubleStreamAttention {
             num_heads,
             head_dim,
             upcast_attention,
-        })
+        }
     }
 
     /// Forward pass for dual-stream attention.
@@ -439,14 +507,14 @@ impl QwenDoubleStreamAttention {
         let txt_seq = encoder_hidden_states.dim(1)?;
 
         // Compute QKV for image stream
-        let img_q = hidden_states.apply(&self.to_q)?;
-        let img_k = hidden_states.apply(&self.to_k)?;
-        let img_v = hidden_states.apply(&self.to_v)?;
+        let img_q = self.to_q.forward(hidden_states)?;
+        let img_k = self.to_k.forward(hidden_states)?;
+        let img_v = self.to_v.forward(hidden_states)?;
 
         // Compute QKV for text stream
-        let txt_q = encoder_hidden_states.apply(&self.add_q_proj)?;
-        let txt_k = encoder_hidden_states.apply(&self.add_k_proj)?;
-        let txt_v = encoder_hidden_states.apply(&self.add_v_proj)?;
+        let txt_q = self.add_q_proj.forward(encoder_hidden_states)?;
+        let txt_k = self.add_k_proj.forward(encoder_hidden_states)?;
+        let txt_v = self.add_v_proj.forward(encoder_hidden_states)?;
 
         // Reshape for multi-head attention: [batch, seq, heads, head_dim]
         let img_q = img_q.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
@@ -500,10 +568,56 @@ impl QwenDoubleStreamAttention {
         let img_attn = joint_attn.narrow(1, txt_seq, img_seq)?;
 
         // Output projections
-        let img_out = img_attn.apply(&self.to_out)?;
-        let txt_out = txt_attn.apply(&self.to_add_out)?;
+        let img_out = self.to_out.forward(&img_attn)?;
+        let txt_out = self.to_add_out.forward(&txt_attn)?;
 
         Ok((img_out, txt_out))
+    }
+}
+
+impl QwenDoubleStreamAttention<Linear, QkNorm> {
+    /// Load from VarBuilder (FP16/BF16 models).
+    pub fn new(
+        dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        vb: VarBuilder,
+        eps: f64,
+        upcast_attention: bool,
+    ) -> Result<Self> {
+        let inner_dim = num_heads * head_dim;
+
+        // Image stream projections
+        let to_q = candle_nn::linear(dim, inner_dim, vb.pp("to_q"))?;
+        let to_k = candle_nn::linear(dim, inner_dim, vb.pp("to_k"))?;
+        let to_v = candle_nn::linear(dim, inner_dim, vb.pp("to_v"))?;
+        let to_out = candle_nn::linear(inner_dim, dim, vb.pp("to_out.0"))?;
+
+        // Text stream projections
+        let add_q_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_q_proj"))?;
+        let add_k_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_k_proj"))?;
+        let add_v_proj = candle_nn::linear(dim, inner_dim, vb.pp("add_v_proj"))?;
+        let to_add_out = candle_nn::linear(inner_dim, dim, vb.pp("to_add_out"))?;
+
+        // QK normalization
+        let img_norm = QkNorm::new_img(head_dim, vb.clone(), eps)?;
+        let txt_norm = QkNorm::new_txt(head_dim, vb, eps)?;
+
+        Ok(Self {
+            to_q,
+            to_k,
+            to_v,
+            to_out,
+            add_q_proj,
+            add_k_proj,
+            add_v_proj,
+            to_add_out,
+            img_norm,
+            txt_norm,
+            num_heads,
+            head_dim,
+            upcast_attention,
+        })
     }
 
     /// Forward pass with optional text Q, K, V caching for CFG optimization.
@@ -659,19 +773,19 @@ impl QwenDoubleStreamAttention {
 #[derive(Debug, Clone)]
 pub struct QwenImageTransformerBlock {
     // Image stream
-    img_mod: Modulation,
+    img_mod: Modulation<Linear>,
     img_norm1: candle_nn::LayerNorm,
     img_norm2: candle_nn::LayerNorm,
-    img_mlp: FeedForward,
+    img_mlp: FeedForward<Linear>,
 
     // Text stream
-    txt_mod: Modulation,
+    txt_mod: Modulation<Linear>,
     txt_norm1: candle_nn::LayerNorm,
     txt_norm2: candle_nn::LayerNorm,
-    txt_mlp: FeedForward,
+    txt_mlp: FeedForward<Linear>,
 
     // Shared attention
-    attn: QwenDoubleStreamAttention,
+    attn: QwenDoubleStreamAttention<Linear, QkNorm>,
 }
 
 impl QwenImageTransformerBlock {

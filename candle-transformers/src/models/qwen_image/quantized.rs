@@ -16,15 +16,19 @@
 //! let model = QwenImageTransformer2DModelQuantized::from_gguf(content, &mut file, &device)?;
 //! ```
 
-use candle::{quantized::gguf_file, DType, Device, Result, Tensor, D};
+use candle::{quantized::gguf_file, DType, Device, Result, Tensor};
 use candle_nn::{LayerNorm, Module, RmsNorm};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use crate::models::with_tracing::QMatMul;
 
+use super::blocks::{
+    apply_modulation_with_index, layer_norm_no_affine, DirectRmsNormPair, FeedForward, Modulation,
+    QwenDoubleStreamAttention,
+};
 use super::config::InferenceConfig;
-use super::rope::{apply_rotary_emb_qwen, timestep_embedding, QwenEmbedRope};
+use super::rope::{timestep_embedding, QwenEmbedRope};
 
 // ============================================================================
 // QLinear: Quantized Linear with Bias Support
@@ -44,6 +48,16 @@ impl QLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let out = self.weight.forward(x)?;
+        match &self.bias {
+            Some(b) => out.broadcast_add(b),
+            None => Ok(out),
+        }
+    }
+}
+
+impl Module for QLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.weight.forward(x)?;
         match &self.bias {
             Some(b) => out.broadcast_add(b),
@@ -101,214 +115,30 @@ impl AdaLayerNormContinuousQuantized {
 }
 
 // ============================================================================
-// Quantized Modulation
+// Quantized Modulation (Type Alias)
 // ============================================================================
 
-/// Modulation output.
-pub struct ModulationOut {
-    pub shift: Tensor,
-    pub scale: Tensor,
-    pub gate: Tensor,
-}
-
-impl ModulationOut {
-    pub fn scale_shift(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.broadcast_mul(&(&self.scale + 1.0)?)?
-            .broadcast_add(&self.shift)
-    }
-
-    pub fn gate(&self, xs: &Tensor) -> Result<Tensor> {
-        self.gate.broadcast_mul(xs)
-    }
-}
-
-/// Quantized modulation layer.
-#[derive(Debug, Clone)]
-pub struct ModulationQuantized {
-    lin: QLinear,
-}
-
-impl ModulationQuantized {
-    pub fn forward(&self, timestep_emb: &Tensor) -> Result<(ModulationOut, ModulationOut)> {
-        let emb = timestep_emb.silu()?;
-        // Apply linear and unsqueeze to [batch, 1, 6*dim] for proper broadcasting over sequence
-        let out = self.lin.forward(&emb)?.unsqueeze(1)?;
-
-        // Split into 6 chunks for shift1, scale1, gate1, shift2, scale2, gate2
-        let chunks = out.chunk(6, D::Minus1)?;
-        if chunks.len() != 6 {
-            candle::bail!("Expected 6 chunks from modulation, got {}", chunks.len());
-        }
-
-        let mod1 = ModulationOut {
-            shift: chunks[0].clone(),
-            scale: chunks[1].clone(),
-            gate: chunks[2].clone(),
-        };
-        let mod2 = ModulationOut {
-            shift: chunks[3].clone(),
-            scale: chunks[4].clone(),
-            gate: chunks[5].clone(),
-        };
-
-        Ok((mod1, mod2))
-    }
-}
+/// Quantized modulation layer - uses the generic Modulation with QLinear.
+pub type ModulationQuantized = Modulation<QLinear>;
 
 // ============================================================================
-// Quantized Attention
+// Quantized Attention (Type Alias)
 // ============================================================================
 
-/// Quantized dual-stream attention.
-#[derive(Debug, Clone)]
-pub struct QwenDoubleStreamAttentionQuantized {
-    // Image stream projections
-    to_q: QLinear,
-    to_k: QLinear,
-    to_v: QLinear,
-    to_out: QLinear,
-
-    // Text stream projections
-    add_q_proj: QLinear,
-    add_k_proj: QLinear,
-    add_v_proj: QLinear,
-    to_add_out: QLinear,
-
-    // QK normalization (dequantized)
-    norm_q: RmsNorm,
-    norm_k: RmsNorm,
-    norm_add_q: RmsNorm,
-    norm_add_k: RmsNorm,
-
-    num_heads: usize,
-    head_dim: usize,
-
-    /// Whether to upcast attention to F32 for numerical stability
-    upcast_attention: bool,
-}
-
-impl QwenDoubleStreamAttentionQuantized {
-    pub fn forward(
-        &self,
-        img: &Tensor,
-        txt: &Tensor,
-        img_freqs: &Tensor,
-        txt_freqs: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let (batch, img_seq, _) = img.dims3()?;
-        let txt_seq = txt.dim(1)?;
-
-        // Image stream Q/K/V
-        let img_q = self.to_q.forward(img)?;
-        let img_k = self.to_k.forward(img)?;
-        let img_v = self.to_v.forward(img)?;
-
-        // Text stream Q/K/V
-        let txt_q = self.add_q_proj.forward(txt)?;
-        let txt_k = self.add_k_proj.forward(txt)?;
-        let txt_v = self.add_v_proj.forward(txt)?;
-
-        // Reshape for multi-head attention: [batch, seq, heads, head_dim]
-        let img_q = img_q.reshape((batch, img_seq, self.num_heads, self.head_dim))?;
-        let img_k = img_k.reshape((batch, img_seq, self.num_heads, self.head_dim))?;
-        let img_v = img_v.reshape((batch, img_seq, self.num_heads, self.head_dim))?;
-
-        let txt_q = txt_q.reshape((batch, txt_seq, self.num_heads, self.head_dim))?;
-        let txt_k = txt_k.reshape((batch, txt_seq, self.num_heads, self.head_dim))?;
-        let txt_v = txt_v.reshape((batch, txt_seq, self.num_heads, self.head_dim))?;
-
-        // QK normalization (on [batch, seq, heads, head_dim])
-        let img_q = self.norm_q.forward(&img_q)?;
-        let img_k = self.norm_k.forward(&img_k)?;
-        let txt_q = self.norm_add_q.forward(&txt_q)?;
-        let txt_k = self.norm_add_k.forward(&txt_k)?;
-
-        // Apply RoPE (expects [batch, seq, heads, head_dim])
-        let img_q = apply_rotary_emb_qwen(&img_q, img_freqs)?;
-        let img_k = apply_rotary_emb_qwen(&img_k, img_freqs)?;
-        let txt_q = apply_rotary_emb_qwen(&txt_q, txt_freqs)?;
-        let txt_k = apply_rotary_emb_qwen(&txt_k, txt_freqs)?;
-
-        // Concatenate for joint attention on dim 1: [txt, img] -> [batch, txt+img, heads, head_dim]
-        let q = Tensor::cat(&[&txt_q, &img_q], 1)?;
-        let k = Tensor::cat(&[&txt_k, &img_k], 1)?;
-        let v = Tensor::cat(&[&txt_v, &img_v], 1)?;
-
-        // Now transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
-        // Note: transpose creates non-contiguous tensors, so we must call contiguous()
-        // before matmul operations which require contiguous memory layouts.
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
-
-        // Scaled dot-product attention (optionally in F32 for numerical stability)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let orig_dtype = img.dtype();
-        let (q, k, v) = if self.upcast_attention {
-            (
-                q.to_dtype(DType::F32)?,
-                k.to_dtype(DType::F32)?,
-                v.to_dtype(DType::F32)?,
-            )
-        } else {
-            (q, k, v)
-        };
-
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // Transpose back: [B, H, S, D] -> [B, S, H, D]
-        let attn_output = attn_output.transpose(1, 2)?;
-        let attn_output = if self.upcast_attention && orig_dtype != DType::F32 {
-            attn_output.to_dtype(orig_dtype)?
-        } else {
-            attn_output
-        };
-
-        // Flatten: [B, S, H, D] -> [B, S, H*D]
-        let attn_output = attn_output.flatten_from(2)?;
-
-        // Split back to text and image on dim 1
-        let txt_attn = attn_output.narrow(1, 0, txt_seq)?;
-        let img_attn = attn_output.narrow(1, txt_seq, img_seq)?;
-
-        let txt_out = self.to_add_out.forward(&txt_attn)?;
-        let img_out = self.to_out.forward(&img_attn)?;
-
-        Ok((img_out, txt_out))
-    }
-}
+/// Quantized dual-stream attention - uses the generic QwenDoubleStreamAttention.
+pub type QwenDoubleStreamAttentionQuantized =
+    QwenDoubleStreamAttention<QLinear, DirectRmsNormPair>;
 
 // ============================================================================
-// Quantized MLP
+// Quantized MLP (Type Alias)
 // ============================================================================
 
-/// Quantized feed-forward MLP.
-#[derive(Debug, Clone)]
-pub struct MlpQuantized {
-    proj_in: QLinear,
-    proj_out: QLinear,
-}
-
-impl MlpQuantized {
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let x = self.proj_in.forward(xs)?;
-        // Use gelu() (tanh approximation) to match FP16 model
-        let x = x.gelu()?;
-        self.proj_out.forward(&x)
-    }
-}
+/// Quantized feed-forward MLP - uses the generic FeedForward with QLinear.
+pub type MlpQuantized = FeedForward<QLinear>;
 
 // ============================================================================
 // Quantized Transformer Block
 // ============================================================================
-
-/// Helper to create parameter-free LayerNorm.
-fn layer_norm_no_affine(size: usize, eps: f64, device: &Device, dtype: DType) -> Result<LayerNorm> {
-    let weight = Tensor::ones(size, dtype, device)?;
-    Ok(LayerNorm::new_no_bias(weight, eps))
-}
 
 /// Quantized dual-stream transformer block.
 #[derive(Debug, Clone)]
@@ -330,6 +160,7 @@ pub struct QwenImageTransformerBlockQuantized {
 }
 
 impl QwenImageTransformerBlockQuantized {
+    /// Forward pass through the dual-stream block (standard mode, no per-token modulation).
     pub fn forward(
         &self,
         img: &Tensor,
@@ -338,55 +169,101 @@ impl QwenImageTransformerBlockQuantized {
         img_freqs: &Tensor,
         txt_freqs: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // Get modulation parameters
+        self.forward_with_modulate_index(img, txt, temb, img_freqs, txt_freqs, None)
+    }
+
+    /// Forward pass with modulate_index for edit mode (zero_cond_t).
+    ///
+    /// When modulate_index is provided:
+    /// - `temb` is doubled: [2*batch, dim] with [actual_timestep, zero_timestep]
+    /// - Image modulation uses per-token selection based on modulate_index
+    /// - Text modulation uses only actual timestep (first half of temb)
+    pub fn forward_with_modulate_index(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        temb: &Tensor,
+        img_freqs: &Tensor,
+        txt_freqs: &Tensor,
+        modulate_index: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let batch_size = img.dim(0)?;
+
+        // Get modulation parameters for image stream (uses full temb if doubled)
         let (img_mod1, img_mod2) = self.modulation.forward(temb)?;
-        let (txt_mod1, txt_mod2) = self.modulation_context.forward(temb)?;
 
-        // Pre-attention norm + modulation
+        // For text stream, use only first half of temb if modulate_index is provided (zero_cond_t mode)
+        let txt_temb = if modulate_index.is_some() {
+            // In zero_cond_t mode, temb is doubled [2*batch, dim]
+            // Text uses only actual timestep (first half)
+            temb.narrow(0, 0, batch_size)?
+        } else {
+            temb.clone()
+        };
+        let (txt_mod1, txt_mod2) = self.modulation_context.forward(&txt_temb)?;
+
+        // === Attention phase ===
+
+        // Image: norm1 + modulate (with per-token selection if modulate_index provided)
         let img_normed = self.norm1.forward(img)?;
-        let img_modulated = img_mod1.scale_shift(&img_normed)?;
 
+        let (img_modulated, img_gate1) = if let Some(mod_idx) = modulate_index {
+            // Per-token modulation for edit mode
+            apply_modulation_with_index(&img_normed, &img_mod1, mod_idx)?
+        } else {
+            // Standard modulation
+            let modulated = img_mod1.scale_shift(&img_normed)?;
+            let gate = img_mod1.gate.clone();
+            (modulated, gate)
+        };
+
+        // Text: norm1 + modulate (always standard, no per-token selection)
         let txt_normed = self.norm1_context.forward(txt)?;
         let txt_modulated = txt_mod1.scale_shift(&txt_normed)?;
+        let txt_gate1 = txt_mod1.gate.clone();
 
-        // Joint attention
-        let (img_attn, txt_attn) =
-            self.attn
-                .forward(&img_modulated, &txt_modulated, img_freqs, txt_freqs)?;
+        // Joint attention - bundle freqs into tuple for generic forward
+        let freqs = (img_freqs.clone(), txt_freqs.clone());
+        let (img_attn, txt_attn) = self.attn.forward(&img_modulated, &txt_modulated, Some(&freqs))?;
 
-        // Gated residual (in F32 for numerical stability due to large values)
-        let img_gated = img_mod1.gate(&img_attn)?;
-        let img = img
-            .to_dtype(DType::F32)?
-            .add(&img_gated.to_dtype(DType::F32)?)?
+        // Gated residual for attention (use per-token gate for image if in edit mode)
+        let gated_img_attn = img_gate1.broadcast_mul(&img_attn)?;
+        let gated_txt_attn = txt_gate1.broadcast_mul(&txt_attn)?;
+
+        // Residual add in F32 to avoid overflow, then cast back
+        let img = (img.to_dtype(DType::F32)? + gated_img_attn.to_dtype(DType::F32)?)?
             .to_dtype(img.dtype())?;
-
-        let txt_gated = txt_mod1.gate(&txt_attn)?;
-        let txt = txt
-            .to_dtype(DType::F32)?
-            .add(&txt_gated.to_dtype(DType::F32)?)?
+        let txt = (txt.to_dtype(DType::F32)? + gated_txt_attn.to_dtype(DType::F32)?)?
             .to_dtype(txt.dtype())?;
 
-        // MLP
-        let img_mlp_in = self.norm1.forward(&img)?;
-        let img_mlp_in = img_mod2.scale_shift(&img_mlp_in)?;
-        let img_mlp_out = self.mlp.forward(&img_mlp_in)?;
-        let img_mlp_gated = img_mod2.gate(&img_mlp_out)?;
+        // === MLP phase ===
 
-        let txt_mlp_in = self.norm1_context.forward(&txt)?;
-        let txt_mlp_in = txt_mod2.scale_shift(&txt_mlp_in)?;
-        let txt_mlp_out = self.mlp_context.forward(&txt_mlp_in)?;
-        let txt_mlp_gated = txt_mod2.gate(&txt_mlp_out)?;
+        // Image: norm1 + modulate + MLP + gated residual
+        let img_normed2 = self.norm1.forward(&img)?;
 
-        // Final residual (in F32)
-        let img = img
-            .to_dtype(DType::F32)?
-            .add(&img_mlp_gated.to_dtype(DType::F32)?)?
+        let (img_modulated2, img_gate2) = if let Some(mod_idx) = modulate_index {
+            apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx)?
+        } else {
+            let modulated = img_mod2.scale_shift(&img_normed2)?;
+            let gate = img_mod2.gate.clone();
+            (modulated, gate)
+        };
+
+        let img_mlp_out = self.mlp.forward(&img_modulated2)?;
+        let gated_img_mlp = img_gate2.broadcast_mul(&img_mlp_out)?;
+
+        // Residual add in F32
+        let img = (img.to_dtype(DType::F32)? + gated_img_mlp.to_dtype(DType::F32)?)?
             .to_dtype(img.dtype())?;
 
-        let txt = txt
-            .to_dtype(DType::F32)?
-            .add(&txt_mlp_gated.to_dtype(DType::F32)?)?
+        // Text: norm1_context + modulate + MLP + gated residual (always standard)
+        let txt_normed2 = self.norm1_context.forward(&txt)?;
+        let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
+        let txt_mlp_out = self.mlp_context.forward(&txt_modulated2)?;
+        let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
+
+        // Residual add in F32
+        let txt = (txt.to_dtype(DType::F32)? + gated_txt_mlp.to_dtype(DType::F32)?)?
             .to_dtype(txt.dtype())?;
 
         Ok((img, txt))
@@ -400,6 +277,14 @@ impl QwenImageTransformerBlockQuantized {
 /// Quantized Qwen-Image Transformer 2D Model.
 ///
 /// A quantized version of the 20B parameter dual-stream MMDiT.
+///
+/// # Edit Mode (zero_cond_t)
+///
+/// When `zero_cond_t` is enabled (edit mode), the model uses per-token modulation:
+/// - Timestep is doubled: `[t, 0]` → creates two sets of modulation parameters
+/// - `modulate_index` tensor marks which modulation to use per token:
+///   - Index 0 (actual timestep): for noise latents being denoised
+///   - Index 1 (zero timestep): for reference image latents (conditioning)
 #[derive(Debug, Clone)]
 pub struct QwenImageTransformer2DModelQuantized {
     #[allow(dead_code)]
@@ -417,6 +302,10 @@ pub struct QwenImageTransformer2DModelQuantized {
     transformer_blocks: Vec<QwenImageTransformerBlockQuantized>,
     norm_out: AdaLayerNormContinuousQuantized,
     proj_out: QLinear,
+
+    /// Whether to use zero conditioning for timestep (edit mode).
+    /// When true, doubles timestep and uses per-token modulation.
+    zero_cond_t: bool,
 }
 
 impl QwenImageTransformer2DModelQuantized {
@@ -428,6 +317,7 @@ impl QwenImageTransformer2DModelQuantized {
     /// * `device` - Device to load model on
     /// * `dtype` - Working dtype for biases and normalization layers
     /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
+    /// * `zero_cond_t` - Enable edit mode with per-token modulation
     ///
     /// # Note
     /// The GGUF tensor names must follow the llama.cpp convention for Qwen-Image.
@@ -438,6 +328,7 @@ impl QwenImageTransformer2DModelQuantized {
         device: &Device,
         dtype: DType,
         inference_config: &InferenceConfig,
+        zero_cond_t: bool,
     ) -> Result<Self> {
         // Extract config from metadata
         let get_u32 = |keys: &[&str]| -> Result<u32> {
@@ -542,109 +433,112 @@ impl QwenImageTransformer2DModelQuantized {
             let prefix = format!("transformer_blocks.{idx}");
 
             // Modulation (GGUF uses img_mod/txt_mod naming from Flux)
-            let modulation = ModulationQuantized {
-                lin: load_qlinear!(
-                    format!("{prefix}.img_mod.1.weight"),
-                    format!("{prefix}.img_mod.1.bias"),
-                    bias_dtype
+            let modulation = Modulation::from_linear(load_qlinear!(
+                format!("{prefix}.img_mod.1.weight"),
+                format!("{prefix}.img_mod.1.bias"),
+                bias_dtype
+            ));
+            let modulation_context = Modulation::from_linear(load_qlinear!(
+                format!("{prefix}.txt_mod.1.weight"),
+                format!("{prefix}.txt_mod.1.bias"),
+                bias_dtype
+            ));
+
+            // Attention - using from_parts constructor
+            let img_norm = DirectRmsNormPair {
+                query_norm: RmsNorm::new(
+                    load_dequant!(format!("{prefix}.attn.norm_q.weight"), DType::F32),
+                    1e-6,
+                ),
+                key_norm: RmsNorm::new(
+                    load_dequant!(format!("{prefix}.attn.norm_k.weight"), DType::F32),
+                    1e-6,
                 ),
             };
-            let modulation_context = ModulationQuantized {
-                lin: load_qlinear!(
-                    format!("{prefix}.txt_mod.1.weight"),
-                    format!("{prefix}.txt_mod.1.bias"),
-                    bias_dtype
+            let txt_norm = DirectRmsNormPair {
+                query_norm: RmsNorm::new(
+                    load_dequant!(format!("{prefix}.attn.norm_added_q.weight"), DType::F32),
+                    1e-6,
+                ),
+                key_norm: RmsNorm::new(
+                    load_dequant!(format!("{prefix}.attn.norm_added_k.weight"), DType::F32),
+                    1e-6,
                 ),
             };
 
-            // Attention
-            let attn = QwenDoubleStreamAttentionQuantized {
-                to_q: load_qlinear!(
+            let attn = QwenDoubleStreamAttention::from_parts(
+                load_qlinear!(
                     format!("{prefix}.attn.to_q.weight"),
                     format!("{prefix}.attn.to_q.bias"),
                     bias_dtype
                 ),
-                to_k: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.to_k.weight"),
                     format!("{prefix}.attn.to_k.bias"),
                     bias_dtype
                 ),
-                to_v: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.to_v.weight"),
                     format!("{prefix}.attn.to_v.bias"),
                     bias_dtype
                 ),
-                to_out: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.to_out.0.weight"),
                     format!("{prefix}.attn.to_out.0.bias"),
                     bias_dtype
                 ),
-                add_q_proj: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.add_q_proj.weight"),
                     format!("{prefix}.attn.add_q_proj.bias"),
                     bias_dtype
                 ),
-                add_k_proj: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.add_k_proj.weight"),
                     format!("{prefix}.attn.add_k_proj.bias"),
                     bias_dtype
                 ),
-                add_v_proj: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.add_v_proj.weight"),
                     format!("{prefix}.attn.add_v_proj.bias"),
                     bias_dtype
                 ),
-                to_add_out: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.attn.to_add_out.weight"),
                     format!("{prefix}.attn.to_add_out.bias"),
                     bias_dtype
                 ),
-                norm_q: RmsNorm::new(
-                    load_dequant!(format!("{prefix}.attn.norm_q.weight"), DType::F32),
-                    1e-6,
-                ),
-                norm_k: RmsNorm::new(
-                    load_dequant!(format!("{prefix}.attn.norm_k.weight"), DType::F32),
-                    1e-6,
-                ),
-                norm_add_q: RmsNorm::new(
-                    load_dequant!(format!("{prefix}.attn.norm_added_q.weight"), DType::F32),
-                    1e-6,
-                ),
-                norm_add_k: RmsNorm::new(
-                    load_dequant!(format!("{prefix}.attn.norm_added_k.weight"), DType::F32),
-                    1e-6,
-                ),
+                img_norm,
+                txt_norm,
                 num_heads,
                 head_dim,
-                upcast_attention: inference_config.upcast_attention,
-            };
+                inference_config.upcast_attention,
+            );
 
             // MLPs (GGUF uses img_mlp/txt_mlp naming from Flux)
-            let mlp = MlpQuantized {
-                proj_in: load_qlinear!(
+            let mlp = FeedForward::from_linears(
+                load_qlinear!(
                     format!("{prefix}.img_mlp.net.0.proj.weight"),
                     format!("{prefix}.img_mlp.net.0.proj.bias"),
                     bias_dtype
                 ),
-                proj_out: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.img_mlp.net.2.weight"),
                     format!("{prefix}.img_mlp.net.2.bias"),
                     bias_dtype
                 ),
-            };
-            let mlp_context = MlpQuantized {
-                proj_in: load_qlinear!(
+            );
+            let mlp_context = FeedForward::from_linears(
+                load_qlinear!(
                     format!("{prefix}.txt_mlp.net.0.proj.weight"),
                     format!("{prefix}.txt_mlp.net.0.proj.bias"),
                     bias_dtype
                 ),
-                proj_out: load_qlinear!(
+                load_qlinear!(
                     format!("{prefix}.txt_mlp.net.2.weight"),
                     format!("{prefix}.txt_mlp.net.2.bias"),
                     bias_dtype
                 ),
-            };
+            );
 
             // Layer norms (parameter-free)
             let norm1 = layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?;
@@ -680,6 +574,7 @@ impl QwenImageTransformer2DModelQuantized {
             transformer_blocks,
             norm_out,
             proj_out,
+            zero_cond_t,
         })
     }
 
@@ -706,6 +601,7 @@ impl QwenImageTransformer2DModelQuantized {
         img_shapes: &[(usize, usize, usize)],
     ) -> Result<Tensor> {
         let dtype = img.dtype();
+        let device = img.device();
 
         // Project inputs (QMatMul handles dtype conversion automatically)
         let mut img = self.img_in.forward(img)?;
@@ -713,8 +609,28 @@ impl QwenImageTransformer2DModelQuantized {
         let txt_normed = self.txt_norm.forward(txt)?;
         let mut txt = self.txt_in.forward(&txt_normed)?;
 
-        // Timestep embeddings
-        let temb = self.time_text_embed.forward(timestep, dtype)?;
+        // Handle zero_cond_t for edit mode:
+        // - Double the timestep: [t, 0] creates two modulation sets
+        // - Create modulate_index: per-token mask for which modulation to use
+        let timestep = timestep.to_dtype(dtype)?;
+        let (timestep, modulate_index) = if self.zero_cond_t {
+            // Double timestep: [t, 0] for two different modulation parameter sets
+            let zero_timestep = (&timestep * 0.0)?;
+            let doubled_timestep = Tensor::cat(&[&timestep, &zero_timestep], 0)?;
+
+            // Create modulate_index: marks which tokens use which modulation
+            // In edit mode, img_shapes is [(noise_f, noise_h, noise_w), (img_f, img_h, img_w), ...]
+            // - First shape (index 0): noise latents -> use timestep modulation (index 0)
+            // - Remaining shapes (index 1+): reference images -> use zero-timestep modulation (index 1)
+            let modulate_idx = Self::create_modulate_index(img_shapes, device)?;
+
+            (doubled_timestep, Some(modulate_idx))
+        } else {
+            (timestep, None)
+        };
+
+        // Timestep embeddings (doubled if zero_cond_t)
+        let temb = self.time_text_embed.forward(&timestep, dtype)?;
 
         // Compute RoPE frequencies (derive txt_lens from tensor shape)
         let txt_lens = &[txt.dim(1)?];
@@ -722,13 +638,61 @@ impl QwenImageTransformer2DModelQuantized {
 
         // Process through transformer blocks
         for block in self.transformer_blocks.iter() {
-            let (new_img, new_txt) = block.forward(&img, &txt, &temb, &img_freqs, &txt_freqs)?;
+            let (new_img, new_txt) = block.forward_with_modulate_index(
+                &img,
+                &txt,
+                &temb,
+                &img_freqs,
+                &txt_freqs,
+                modulate_index.as_ref(),
+            )?;
             img = new_img;
             txt = new_txt;
         }
 
+        // For zero_cond_t, use only the first half of temb for final normalization
+        let temb_for_norm = if self.zero_cond_t {
+            let batch_size = temb.dim(0)? / 2;
+            temb.narrow(0, 0, batch_size)?
+        } else {
+            temb
+        };
+
         // Output projection
-        let img = self.norm_out.forward(&img, &temb)?;
+        let img = self.norm_out.forward(&img, &temb_for_norm)?;
         self.proj_out.forward(&img)
+    }
+
+    /// Create modulate_index tensor for edit mode.
+    ///
+    /// In edit mode, img_shapes contains multiple shapes:
+    /// - First shape: noise latents being denoised (use index 0 = actual timestep)
+    /// - Remaining shapes: reference image latents (use index 1 = zero timestep)
+    ///
+    /// Returns a tensor of shape [1, total_seq_len] with 0s for noise tokens and 1s for image tokens.
+    fn create_modulate_index(
+        img_shapes: &[(usize, usize, usize)],
+        device: &candle::Device,
+    ) -> Result<Tensor> {
+        if img_shapes.is_empty() {
+            candle::bail!("img_shapes cannot be empty for modulate_index creation");
+        }
+
+        let mut indices: Vec<i64> = Vec::new();
+
+        // First shape (noise latents) -> index 0
+        let (f0, h0, w0) = img_shapes[0];
+        let noise_seq_len = f0 * h0 * w0;
+        indices.extend(std::iter::repeat_n(0i64, noise_seq_len));
+
+        // Remaining shapes (reference images) -> index 1
+        for &(f, h, w) in img_shapes.iter().skip(1) {
+            let seq_len = f * h * w;
+            indices.extend(std::iter::repeat_n(1i64, seq_len));
+        }
+
+        // Create tensor with shape [1, total_seq_len] (batch dim = 1 for now)
+        let total_len = indices.len();
+        Tensor::from_vec(indices, (1, total_len), device)
     }
 }

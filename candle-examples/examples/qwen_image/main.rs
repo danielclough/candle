@@ -176,7 +176,7 @@ enum Command {
         steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 1.7)]
+        #[arg(long, default_value_t = 4.0)]
         true_cfg_scale: f64,
 
         /// Input image for img2img mode (optional).
@@ -192,7 +192,7 @@ enum Command {
         output: String,
 
         /// HuggingFace model ID for the transformer.
-        #[arg(long, default_value = "Qwen/Qwen-Image-2511")]
+        #[arg(long, default_value = "Qwen/Qwen-Image-2512")]
         model_id: String,
     },
 
@@ -215,7 +215,7 @@ enum Command {
         steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 1.7)]
+        #[arg(long, default_value_t = 4.0)]
         true_cfg_scale: f64,
 
         /// HuggingFace model ID for the transformer.
@@ -275,7 +275,7 @@ enum Command {
         steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 1.7)]
+        #[arg(long, default_value_t = 4.0)]
         true_cfg_scale: f64,
 
         /// Output filename.
@@ -314,7 +314,7 @@ enum Command {
         steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 1.7)]
+        #[arg(long, default_value_t = 4.0)]
         true_cfg_scale: f64,
 
         /// Output directory for layer images.
@@ -353,7 +353,7 @@ enum Command {
         steps: usize,
 
         /// True CFG guidance scale.
-        #[arg(long, default_value_t = 1.7)]
+        #[arg(long, default_value_t = 4.0)]
         true_cfg_scale: f64,
 
         /// ControlNet conditioning scale (0.0 = no control, 1.0 = full control).

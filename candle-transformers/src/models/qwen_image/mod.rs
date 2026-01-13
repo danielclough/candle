@@ -53,6 +53,7 @@
 //! - Model: <https://huggingface.co/Qwen/Qwen-Image>
 //! - Paper: Qwen-Image Technical Report
 
+pub mod blocks;
 pub mod config;
 pub mod controlnet;
 pub mod edit_helpers;
@@ -62,7 +63,6 @@ pub mod rope;
 pub mod scheduler;
 pub mod vae;
 
-mod blocks;
 mod model;
 
 pub use config::{Config, InferenceConfig, SchedulerConfig, VaeConfig};

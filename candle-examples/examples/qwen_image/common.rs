@@ -354,6 +354,7 @@ pub fn load_transformer(
 /// * `device` - Device to load on
 /// * `dtype` - Working dtype for biases and normalization layers
 /// * `inference_config` - Runtime inference configuration
+/// * `zero_cond_t` - Enable edit mode with per-token modulation
 ///
 /// # Returns
 /// Quantized transformer model
@@ -362,6 +363,7 @@ pub fn load_transformer_quantized(
     device: &Device,
     dtype: DType,
     inference_config: &InferenceConfig,
+    zero_cond_t: bool,
 ) -> Result<QwenImageTransformer2DModelQuantized> {
     println!("Loading quantized transformer from {}...", gguf_path);
     let mut file = std::fs::File::open(gguf_path)?;
@@ -372,6 +374,7 @@ pub fn load_transformer_quantized(
         device,
         dtype,
         inference_config,
+        zero_cond_t,
     )?)
 }
 
@@ -508,6 +511,7 @@ pub fn load_transformer_variant(
             device,
             dtype,
             inference_config,
+            config.zero_cond_t,
         )?;
         Ok(TransformerVariant::Quantized(model))
     } else {
