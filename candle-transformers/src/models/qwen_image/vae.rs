@@ -894,11 +894,7 @@ impl DiagonalGaussianDistribution {
         let mean = chunks[0].clone();
         let logvar = chunks[1].clamp(-30.0, 20.0)?;
         let std = (&logvar * 0.5)?.exp()?;
-        Ok(Self {
-            mean,
-            logvar,
-            std,
-        })
+        Ok(Self { mean, logvar, std })
     }
 
     /// Sample from the distribution (reparameterization trick).

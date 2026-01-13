@@ -203,18 +203,8 @@ pub fn run(
         let packed = packed.to_dtype(dtype)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
-        let pos_pred = transformer.forward(
-            &packed,
-            &pos_embeds,
-            &t,
-            &img_shapes,
-        )?;
-        let neg_pred = transformer.forward(
-            &packed,
-            &neg_embeds,
-            &t,
-            &img_shapes,
-        )?;
+        let pos_pred = transformer.forward(&packed, &pos_embeds, &t, &img_shapes)?;
+        let neg_pred = transformer.forward(&packed, &neg_embeds, &t, &img_shapes)?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;

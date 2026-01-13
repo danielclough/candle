@@ -169,50 +169,52 @@ impl AdaLayerNormContinuous<Linear> {
 ///     &[512],             // text sequence lengths
 /// )?;
 /// ```
+///
+/// Generic over `L: Module` for linear layer type (Linear or QLinear).
 #[derive(Debug, Clone)]
-pub struct QwenImageTransformer2DModel {
-    /// Inner dimension = num_heads × head_dim = 3072
-    _inner_dim: usize,
-    _out_channels: usize,
-    _patch_size: usize,
-
+pub struct QwenImageTransformer2DModel<L: Module> {
+    // Note: inner_dim, out_channels, patch_size are available via config at construction
+    // but not stored since they're not needed at inference time.
     /// RoPE embeddings for 3D positioning
-    pos_embed: QwenEmbedRope,
+    pub pos_embed: QwenEmbedRope,
 
     /// Timestep embedding projection
-    time_text_embed: QwenTimestepProjEmbeddings<Linear>,
+    pub time_text_embed: QwenTimestepProjEmbeddings<L>,
 
     /// Text input normalization
-    txt_norm: RmsNorm,
+    pub txt_norm: RmsNorm,
 
-    /// Image input projection: 64 -> 3072
-    img_in: Linear,
+    /// Image input projection
+    pub img_in: L,
 
-    /// Text input projection: 3584 -> 3072
-    txt_in: Linear,
+    /// Text input projection
+    pub txt_in: L,
 
-    /// Stack of 60 dual-stream transformer blocks
-    transformer_blocks: Vec<QwenImageTransformerBlock<Linear>>,
+    /// Stack of dual-stream transformer blocks
+    pub transformer_blocks: Vec<QwenImageTransformerBlock<L>>,
 
     /// Output normalization with AdaLN
-    norm_out: AdaLayerNormContinuous<Linear>,
+    pub norm_out: AdaLayerNormContinuous<L>,
 
-    /// Output projection: 3072 -> patch_size² × out_channels
-    proj_out: Linear,
+    /// Output projection
+    pub proj_out: L,
 
     /// Whether to use zero conditioning for timestep (edit mode).
-    /// When true, doubles timestep and uses per-token modulation.
-    zero_cond_t: bool,
+    pub zero_cond_t: bool,
 }
 
-impl QwenImageTransformer2DModel {
-    /// Create a new QwenImageTransformer2DModel.
+impl QwenImageTransformer2DModel<Linear> {
+    /// Create a new QwenImageTransformer2DModel from VarBuilder (safetensors).
     ///
     /// # Arguments
     /// * `config` - Model architecture configuration
     /// * `vb` - Variable builder for loading weights
     /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
-    pub fn new(config: &Config, vb: VarBuilder, inference_config: &InferenceConfig) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        vb: VarBuilder,
+        inference_config: &InferenceConfig,
+    ) -> Result<Self> {
         let inner_dim = config.inner_dim();
         let device = vb.device();
         let dtype = vb.dtype();
@@ -264,9 +266,6 @@ impl QwenImageTransformer2DModel {
         )?;
 
         Ok(Self {
-            _inner_dim: inner_dim,
-            _out_channels: config.out_channels,
-            _patch_size: config.patch_size,
             pos_embed,
             time_text_embed,
             txt_norm,
@@ -279,6 +278,69 @@ impl QwenImageTransformer2DModel {
         })
     }
 
+    /// Create a new text cache for CFG optimization.
+    ///
+    /// The cache stores text Q, K, V tensors for all transformer blocks,
+    /// allowing them to be reused across denoising steps.
+    pub fn create_text_cache(&self) -> TransformerTextCache {
+        TransformerTextCache::new(self.transformer_blocks.len())
+    }
+
+    /// Forward pass with text Q, K, V caching for CFG optimization.
+    ///
+    /// This is optimized for the CFG pattern where text embeddings don't change
+    /// during denoising. On first call, text projections are computed and cached.
+    /// On subsequent calls, cached text tensors are reused (skipping ~33% of compute).
+    ///
+    /// **Important**: Only use this in non-edit mode (zero_cond_t=false).
+    /// Edit mode requires per-token modulation which is incompatible with caching.
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: &Tensor,
+        img_shapes: &[(usize, usize, usize)],
+        cache: &mut TransformerTextCache,
+    ) -> Result<Tensor> {
+        if self.zero_cond_t {
+            candle::bail!(
+                "forward_with_cache is not supported in edit mode (zero_cond_t=true). \
+                 Use forward() instead."
+            );
+        }
+
+        let dtype = hidden_states.dtype();
+
+        let mut hidden_states = hidden_states.apply(&self.img_in)?;
+        let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
+        encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
+
+        let timestep = timestep.to_dtype(dtype)?;
+        let temb = self.time_text_embed.forward(&timestep, dtype)?;
+
+        let txt_seq_len = encoder_hidden_states.dim(1)?;
+        let txt_seq_lens = &[txt_seq_len];
+        let image_rotary_emb = self.pos_embed.forward(img_shapes, txt_seq_lens)?;
+
+        for (idx, block) in self.transformer_blocks.iter().enumerate() {
+            let block_cache = cache.block_caches.get_mut(idx);
+            let (enc_out, hid_out) = block.forward_with_cache(
+                &hidden_states,
+                &encoder_hidden_states,
+                &temb,
+                Some(&image_rotary_emb),
+                block_cache,
+            )?;
+            encoder_hidden_states = enc_out;
+            hidden_states = hid_out;
+        }
+
+        let hidden_states = self.norm_out.forward(&hidden_states, &temb)?;
+        hidden_states.apply(&self.proj_out)
+    }
+}
+
+impl<L: Module> QwenImageTransformer2DModel<L> {
     /// Compute the timestep embedding (temb) for a given timestep.
     ///
     /// This allows computing temb externally for debugging/substitution purposes.
@@ -304,7 +366,13 @@ impl QwenImageTransformer2DModel {
         timestep: &Tensor,
         img_shapes: &[(usize, usize, usize)],
     ) -> Result<Tensor> {
-        self.forward_with_controlnet(hidden_states, encoder_hidden_states, timestep, img_shapes, None)
+        self.forward_with_controlnet(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_shapes,
+            None,
+        )
     }
 
     /// Forward pass with optional ControlNet residuals.
@@ -396,114 +464,6 @@ impl QwenImageTransformer2DModel {
 
         // Final normalization with AdaLN
         let hidden_states = self.norm_out.forward(&hidden_states, &temb_for_norm)?;
-
-        // Project to output: [batch, seq, patch_size² × out_channels]
-        let output = hidden_states.apply(&self.proj_out)?;
-
-        Ok(output)
-    }
-
-    /// Create a new text cache for CFG optimization.
-    ///
-    /// The cache stores text Q, K, V tensors for all transformer blocks,
-    /// allowing them to be reused across denoising steps.
-    pub fn create_text_cache(&self) -> TransformerTextCache {
-        TransformerTextCache::new(self.transformer_blocks.len())
-    }
-
-    /// Forward pass with text Q, K, V caching for CFG optimization.
-    ///
-    /// This is optimized for the CFG pattern where text embeddings don't change
-    /// during denoising. On first call, text projections are computed and cached.
-    /// On subsequent calls, cached text tensors are reused (skipping ~33% of compute).
-    ///
-    /// **Important**: Only use this in non-edit mode (zero_cond_t=false).
-    /// Edit mode requires per-token modulation which is incompatible with caching.
-    ///
-    /// # Usage Pattern for CFG
-    /// ```ignore
-    /// // Create caches for positive and negative prompts
-    /// let mut pos_cache = model.create_text_cache();
-    /// let mut neg_cache = model.create_text_cache();
-    ///
-    /// // Denoising loop
-    /// for step in 0..num_steps {
-    ///     // Conditioned pass (first call populates cache)
-    ///     let cond_output = model.forward_with_cache(
-    ///         &latents, &pos_text_embeds, &timestep, &img_shapes, &mut pos_cache
-    ///     )?;
-    ///
-    ///     // Unconditioned pass (first call populates cache)
-    ///     let uncond_output = model.forward_with_cache(
-    ///         &latents, &neg_text_embeds, &timestep, &img_shapes, &mut neg_cache
-    ///     )?;
-    ///
-    ///     // CFG: output = uncond + guidance_scale * (cond - uncond)
-    ///     let output = (&uncond_output + guidance_scale * (&cond_output - &uncond_output)?)?;
-    /// }
-    /// ```
-    ///
-    /// # Arguments
-    /// * `hidden_states` - Packed image latents [batch, img_seq, in_channels]
-    /// * `encoder_hidden_states` - Text embeddings [batch, txt_seq, joint_attention_dim]
-    /// * `timestep` - Diffusion timestep [batch]
-    /// * `img_shapes` - List of (frame, height, width) tuples for RoPE
-    /// * `cache` - Mutable reference to text cache
-    ///
-    /// # Returns
-    /// Output predictions [batch, img_seq, patch_size² × out_channels]
-    pub fn forward_with_cache(
-        &self,
-        hidden_states: &Tensor,
-        encoder_hidden_states: &Tensor,
-        timestep: &Tensor,
-        img_shapes: &[(usize, usize, usize)],
-        cache: &mut TransformerTextCache,
-    ) -> Result<Tensor> {
-        // Note: Caching is only supported in non-edit mode
-        if self.zero_cond_t {
-            candle::bail!(
-                "forward_with_cache is not supported in edit mode (zero_cond_t=true). \
-                 Use forward() instead."
-            );
-        }
-
-        let dtype = hidden_states.dtype();
-
-        // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
-        let mut hidden_states = hidden_states.apply(&self.img_in)?;
-
-        // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
-        let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
-        encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
-
-        // Compute timestep embedding
-        let timestep = timestep.to_dtype(dtype)?;
-        let temb = self.time_text_embed.forward(&timestep, dtype)?;
-
-        // Derive text sequence length from actual encoder_hidden_states shape
-        let txt_seq_len = encoder_hidden_states.dim(1)?;
-        let txt_seq_lens = &[txt_seq_len];
-
-        // Compute RoPE frequencies
-        let image_rotary_emb = self.pos_embed.forward(img_shapes, txt_seq_lens)?;
-
-        // Process through transformer blocks WITH CACHING
-        for (idx, block) in self.transformer_blocks.iter().enumerate() {
-            let block_cache = cache.block_caches.get_mut(idx);
-            let (enc_out, hid_out) = block.forward_with_cache(
-                &hidden_states,
-                &encoder_hidden_states,
-                &temb,
-                Some(&image_rotary_emb),
-                block_cache,
-            )?;
-            encoder_hidden_states = enc_out;
-            hidden_states = hid_out;
-        }
-
-        // Final normalization with AdaLN
-        let hidden_states = self.norm_out.forward(&hidden_states, &temb)?;
 
         // Project to output: [batch, seq, patch_size² × out_channels]
         let output = hidden_states.apply(&self.proj_out)?;

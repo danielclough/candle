@@ -125,7 +125,6 @@ struct Cli {
     // =========================================================================
     // Memory optimization flags
     // =========================================================================
-
     /// Enable VAE slicing to reduce memory usage for batch processing.
     /// Processes batch dimension one sample at a time.
     #[arg(long, global = true)]

@@ -321,7 +321,8 @@ fn create_img2img_latents(
 ) -> Result<Tensor> {
     println!("  Loading init image: {}", init_path);
 
-    let init_image = common::load_image_for_vae(init_path, dims.image_height, dims.image_width, device)?;
+    let init_image =
+        common::load_image_for_vae(init_path, dims.image_height, dims.image_width, device)?;
 
     let dist = vae.encode(&init_image)?;
     // VAE outputs [B, C, T, H, W] format

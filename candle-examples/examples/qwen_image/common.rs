@@ -10,14 +10,13 @@
 use anyhow::{anyhow, Result};
 use candle::quantized::gguf_file;
 use candle::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{Linear, VarBuilder};
 use candle_transformers::models::{
     qwen2_5_vl::{Config as TextConfig, Qwen25VLTextModel},
     qwen_image::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
-        FlowMatchEulerDiscreteScheduler, InferenceConfig, PromptMode,
-        QwenImageTransformer2DModel, QwenImageTransformer2DModelQuantized, SchedulerConfig,
-        TransformerTextCache, VaeConfig,
+        FlowMatchEulerDiscreteScheduler, InferenceConfig, PromptMode, QwenImageTransformer2DModel,
+        QwenImageTransformer2DModelQuantized, SchedulerConfig, TransformerTextCache, VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -328,7 +327,7 @@ pub fn load_transformer(
     device: &Device,
     dtype: DType,
     inference_config: &InferenceConfig,
-) -> Result<QwenImageTransformer2DModel> {
+) -> Result<QwenImageTransformer2DModel<Linear>> {
     let model_files = match transformer_path {
         Some(path) => candle_examples::hub_load_local_safetensors(
             path,
@@ -344,7 +343,11 @@ pub fn load_transformer(
     };
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, device)? };
-    Ok(QwenImageTransformer2DModel::new(config, vb, inference_config)?)
+    Ok(QwenImageTransformer2DModel::new(
+        config,
+        vb,
+        inference_config,
+    )?)
 }
 
 /// Load the quantized transformer model from GGUF file.
@@ -425,7 +428,7 @@ pub fn log_transformer_loaded(
 /// differences in their forward signatures internally.
 #[allow(clippy::large_enum_variant)]
 pub enum TransformerVariant {
-    FP16(QwenImageTransformer2DModel),
+    FP16(QwenImageTransformer2DModel<Linear>),
     Quantized(QwenImageTransformer2DModelQuantized),
 }
 
@@ -869,7 +872,6 @@ impl OutputDims {
         }
     }
 }
-
 
 // ============================================================================
 // Dimension validation

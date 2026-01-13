@@ -239,13 +239,7 @@ impl QkNorm {
     /// * `eps` - Epsilon for RMSNorm
     /// * `q_name` - Weight name for query norm (e.g., "norm_q" or "norm_added_q")
     /// * `k_name` - Weight name for key norm (e.g., "norm_k" or "norm_added_k")
-    pub fn new(
-        dim: usize,
-        vb: VarBuilder,
-        eps: f64,
-        q_name: &str,
-        k_name: &str,
-    ) -> Result<Self> {
+    pub fn new(dim: usize, vb: VarBuilder, eps: f64, q_name: &str, k_name: &str) -> Result<Self> {
         let query_norm_weight = vb.get(dim, &format!("{q_name}.weight"))?;
         let query_norm = RmsNorm::new(query_norm_weight, eps);
 
@@ -284,7 +278,6 @@ impl QkNorm {
         k.apply(&self.key_norm)
     }
 }
-
 
 /// Scaled dot-product attention.
 ///

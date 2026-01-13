@@ -235,18 +235,8 @@ pub fn run(
         let latent_model_input = Tensor::cat(&[&latents_bf16, &packed_image], 1)?;
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
-        let pos_pred = transformer.forward(
-            &latent_model_input,
-            &pos_embeds,
-            &t,
-            &img_shapes,
-        )?;
-        let neg_pred = transformer.forward(
-            &latent_model_input,
-            &neg_embeds,
-            &t,
-            &img_shapes,
-        )?;
+        let pos_pred = transformer.forward(&latent_model_input, &pos_embeds, &t, &img_shapes)?;
+        let neg_pred = transformer.forward(&latent_model_input, &neg_embeds, &t, &img_shapes)?;
 
         // Extract only the layered noise prediction (not the image condition part)
         let noise_seq_len = latents.dim(1)?;

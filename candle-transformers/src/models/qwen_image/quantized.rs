@@ -28,6 +28,7 @@ use super::blocks::{
     QwenImageTransformerBlock,
 };
 use super::config::InferenceConfig;
+use super::model::QwenImageTransformer2DModel;
 use super::model::{AdaLayerNormContinuous, QwenTimestepProjEmbeddings};
 use super::rope::QwenEmbedRope;
 
@@ -110,42 +111,11 @@ pub type MlpQuantized = FeedForward<QLinear>;
 pub type QwenImageTransformerBlockQuantized = QwenImageTransformerBlock<QLinear>;
 
 // ============================================================================
-// Quantized Main Model
+// Quantized Main Model (Type Alias)
 // ============================================================================
 
-/// Quantized Qwen-Image Transformer 2D Model.
-///
-/// A quantized version of the 20B parameter dual-stream MMDiT.
-///
-/// # Edit Mode (zero_cond_t)
-///
-/// When `zero_cond_t` is enabled (edit mode), the model uses per-token modulation:
-/// - Timestep is doubled: `[t, 0]` → creates two sets of modulation parameters
-/// - `modulate_index` tensor marks which modulation to use per token:
-///   - Index 0 (actual timestep): for noise latents being denoised
-///   - Index 1 (zero timestep): for reference image latents (conditioning)
-#[derive(Debug, Clone)]
-pub struct QwenImageTransformer2DModelQuantized {
-    #[allow(dead_code)]
-    inner_dim: usize,
-    #[allow(dead_code)]
-    out_channels: usize,
-    #[allow(dead_code)]
-    patch_size: usize,
-
-    pos_embed: QwenEmbedRope,
-    time_text_embed: QwenTimestepProjEmbeddingsQuantized,
-    txt_norm: RmsNorm,
-    img_in: QLinear,
-    txt_in: QLinear,
-    transformer_blocks: Vec<QwenImageTransformerBlockQuantized>,
-    norm_out: AdaLayerNormContinuousQuantized,
-    proj_out: QLinear,
-
-    /// Whether to use zero conditioning for timestep (edit mode).
-    /// When true, doubles timestep and uses per-token modulation.
-    zero_cond_t: bool,
-}
+/// Quantized Qwen-Image Transformer 2D Model - uses the generic QwenImageTransformer2DModel.
+pub type QwenImageTransformer2DModelQuantized = QwenImageTransformer2DModel<QLinear>;
 
 impl QwenImageTransformer2DModelQuantized {
     /// Load model from GGUF file.
@@ -194,9 +164,9 @@ impl QwenImageTransformer2DModelQuantized {
         let num_layers =
             get_u32(&["qwen_image.num_layers", "transformer.num_layers"]).unwrap_or(60) as usize;
 
-        let patch_size = get_u32(&["qwen_image.patch_size"]).unwrap_or(2) as usize;
+        let _patch_size = get_u32(&["qwen_image.patch_size"]).unwrap_or(2) as usize;
 
-        let out_channels = get_u32(&["qwen_image.out_channels"]).unwrap_or(16) as usize;
+        let _out_channels = get_u32(&["qwen_image.out_channels"]).unwrap_or(16) as usize;
 
         let _joint_attention_dim =
             get_u32(&["qwen_image.joint_attention_dim"]).unwrap_or(3584) as usize;
@@ -402,9 +372,6 @@ impl QwenImageTransformer2DModelQuantized {
         let proj_out = load_qlinear!("proj_out.weight", "proj_out.bias", bias_dtype);
 
         Ok(Self {
-            inner_dim,
-            out_channels,
-            patch_size,
             pos_embed,
             time_text_embed,
             txt_norm,
@@ -415,123 +382,5 @@ impl QwenImageTransformer2DModelQuantized {
             proj_out,
             zero_cond_t,
         })
-    }
-
-    /// Compute timestep embeddings externally.
-    ///
-    /// This is useful for edit mode where temb needs to be computed once
-    /// and potentially substituted for debugging.
-    pub fn compute_temb(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
-        self.time_text_embed.forward(timestep, dtype)
-    }
-
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `img` - Packed image latents [batch, seq, 64]
-    /// * `txt` - Text embeddings [batch, txt_seq, 3584]
-    /// * `timestep` - Timestep values [batch]
-    /// * `img_shapes` - Image shapes [(frames, height, width), ...]
-    pub fn forward(
-        &self,
-        img: &Tensor,
-        txt: &Tensor,
-        timestep: &Tensor,
-        img_shapes: &[(usize, usize, usize)],
-    ) -> Result<Tensor> {
-        let dtype = img.dtype();
-        let device = img.device();
-
-        // Project inputs (QMatMul handles dtype conversion automatically)
-        let mut img = self.img_in.forward(img)?;
-
-        let txt_normed = self.txt_norm.forward(txt)?;
-        let mut txt = self.txt_in.forward(&txt_normed)?;
-
-        // Handle zero_cond_t for edit mode:
-        // - Double the timestep: [t, 0] creates two modulation sets
-        // - Create modulate_index: per-token mask for which modulation to use
-        let timestep = timestep.to_dtype(dtype)?;
-        let (timestep, modulate_index) = if self.zero_cond_t {
-            // Double timestep: [t, 0] for two different modulation parameter sets
-            let zero_timestep = (&timestep * 0.0)?;
-            let doubled_timestep = Tensor::cat(&[&timestep, &zero_timestep], 0)?;
-
-            // Create modulate_index: marks which tokens use which modulation
-            // In edit mode, img_shapes is [(noise_f, noise_h, noise_w), (img_f, img_h, img_w), ...]
-            // - First shape (index 0): noise latents -> use timestep modulation (index 0)
-            // - Remaining shapes (index 1+): reference images -> use zero-timestep modulation (index 1)
-            let modulate_idx = Self::create_modulate_index(img_shapes, device)?;
-
-            (doubled_timestep, Some(modulate_idx))
-        } else {
-            (timestep, None)
-        };
-
-        // Timestep embeddings (doubled if zero_cond_t)
-        let temb = self.time_text_embed.forward(&timestep, dtype)?;
-
-        // Compute RoPE frequencies (derive txt_lens from tensor shape)
-        let txt_lens = &[txt.dim(1)?];
-        let (img_freqs, txt_freqs) = self.pos_embed.forward(img_shapes, txt_lens)?;
-        let image_rotary_emb = (img_freqs, txt_freqs);
-
-        // Process through transformer blocks
-        for block in self.transformer_blocks.iter() {
-            let (new_txt, new_img) = block.forward_with_modulate_index(
-                &img,
-                &txt,
-                &temb,
-                Some(&image_rotary_emb),
-                modulate_index.as_ref(),
-            )?;
-            img = new_img;
-            txt = new_txt;
-        }
-
-        // For zero_cond_t, use only the first half of temb for final normalization
-        let temb_for_norm = if self.zero_cond_t {
-            let batch_size = temb.dim(0)? / 2;
-            temb.narrow(0, 0, batch_size)?
-        } else {
-            temb
-        };
-
-        // Output projection
-        let img = self.norm_out.forward(&img, &temb_for_norm)?;
-        self.proj_out.forward(&img)
-    }
-
-    /// Create modulate_index tensor for edit mode.
-    ///
-    /// In edit mode, img_shapes contains multiple shapes:
-    /// - First shape: noise latents being denoised (use index 0 = actual timestep)
-    /// - Remaining shapes: reference image latents (use index 1 = zero timestep)
-    ///
-    /// Returns a tensor of shape [1, total_seq_len] with 0s for noise tokens and 1s for image tokens.
-    fn create_modulate_index(
-        img_shapes: &[(usize, usize, usize)],
-        device: &candle::Device,
-    ) -> Result<Tensor> {
-        if img_shapes.is_empty() {
-            candle::bail!("img_shapes cannot be empty for modulate_index creation");
-        }
-
-        let mut indices: Vec<i64> = Vec::new();
-
-        // First shape (noise latents) -> index 0
-        let (f0, h0, w0) = img_shapes[0];
-        let noise_seq_len = f0 * h0 * w0;
-        indices.extend(std::iter::repeat_n(0i64, noise_seq_len));
-
-        // Remaining shapes (reference images) -> index 1
-        for &(f, h, w) in img_shapes.iter().skip(1) {
-            let seq_len = f * h * w;
-            indices.extend(std::iter::repeat_n(1i64, seq_len));
-        }
-
-        // Create tensor with shape [1, total_seq_len] (batch dim = 1 for now)
-        let total_len = indices.len();
-        Tensor::from_vec(indices, (1, total_len), device)
     }
 }

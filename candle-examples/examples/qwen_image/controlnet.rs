@@ -235,12 +235,7 @@ pub fn run(
         )?;
 
         // Negative prediction (without ControlNet for True CFG)
-        let neg_pred = transformer.forward(
-            &packed,
-            &neg_embeds,
-            &t,
-            &img_shapes,
-        )?;
+        let neg_pred = transformer.forward(&packed, &neg_embeds, &t, &img_shapes)?;
 
         let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
         let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;

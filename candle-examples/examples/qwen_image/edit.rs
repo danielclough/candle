@@ -316,12 +316,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
 
         // Note: Timestep doubling for zero_cond_t is handled internally by the transformer
-        let pos_pred = transformer.forward(
-            &latent_model_input,
-            &pos_embeds,
-            &t,
-            &img_shapes,
-        )?;
+        let pos_pred = transformer.forward(&latent_model_input, &pos_embeds, &t, &img_shapes)?;
 
         // Extract only the noise prediction part
         let noise_seq_len = latents.dim(1)?;
@@ -329,12 +324,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
 
         // Only apply CFG if we have a negative prompt (matching Python behavior)
         let model_pred = if let Some(ref neg_emb) = &neg_embeds {
-            let neg_pred = transformer.forward(
-                &latent_model_input,
-                neg_emb,
-                &t,
-                &img_shapes,
-            )?;
+            let neg_pred = transformer.forward(&latent_model_input, neg_emb, &t, &img_shapes)?;
 
             let neg_pred = neg_pred.narrow(1, 0, noise_seq_len)?;
 
