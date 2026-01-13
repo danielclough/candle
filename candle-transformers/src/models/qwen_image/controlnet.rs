@@ -141,7 +141,7 @@ pub struct QwenImageControlNetModel {
     pos_embed: QwenEmbedRope,
 
     /// Timestep embedding projection
-    time_text_embed: QwenTimestepProjEmbeddings,
+    time_text_embed: QwenTimestepProjEmbeddings<Linear>,
 
     /// Text input normalization
     txt_norm: RmsNorm,

@@ -10,7 +10,7 @@
 //! 4. Apply final normalization and project to output channels
 
 use candle::{DType, Result, Tensor};
-use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 
 use super::blocks::{QwenImageTransformerBlock, TextQKVCache};
 use super::config::{Config, InferenceConfig};
@@ -60,26 +60,17 @@ fn layer_norm_no_affine(
 /// Timestep projection embeddings.
 ///
 /// Converts timesteps to sinusoidal embeddings, then projects to hidden dimension.
+/// Generic over `L: Module` to support both Linear and QLinear.
 #[derive(Debug, Clone)]
-pub struct QwenTimestepProjEmbeddings {
-    /// Projects sinusoidal embeddings to hidden dimension
-    timestep_embedder_linear1: Linear,
-    timestep_embedder_linear2: Linear,
+pub struct QwenTimestepProjEmbeddings<L: Module> {
+    linear1: L,
+    linear2: L,
 }
 
-impl QwenTimestepProjEmbeddings {
-    pub fn new(embedding_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let timestep_embedder_linear1 =
-            candle_nn::linear(256, embedding_dim, vb.pp("timestep_embedder.linear_1"))?;
-        let timestep_embedder_linear2 = candle_nn::linear(
-            embedding_dim,
-            embedding_dim,
-            vb.pp("timestep_embedder.linear_2"),
-        )?;
-        Ok(Self {
-            timestep_embedder_linear1,
-            timestep_embedder_linear2,
-        })
+impl<L: Module> QwenTimestepProjEmbeddings<L> {
+    /// Create from pre-constructed linear layers.
+    pub fn from_linears(linear1: L, linear2: L) -> Self {
+        Self { linear1, linear2 }
     }
 
     pub fn forward(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
@@ -87,44 +78,62 @@ impl QwenTimestepProjEmbeddings {
         let timesteps_proj = timestep_embedding(timestep, 256, dtype)?;
 
         // Project through MLP: 256 -> embedding_dim -> embedding_dim
-        let timesteps_emb = timesteps_proj
-            .apply(&self.timestep_embedder_linear1)?
-            .silu()?
-            .apply(&self.timestep_embedder_linear2)?;
+        let x = self.linear1.forward(&timesteps_proj)?;
+        let x = x.silu()?;
+        self.linear2.forward(&x)
+    }
+}
 
-        Ok(timesteps_emb)
+impl QwenTimestepProjEmbeddings<Linear> {
+    pub fn new(embedding_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let linear1 = candle_nn::linear(256, embedding_dim, vb.pp("timestep_embedder.linear_1"))?;
+        let linear2 = candle_nn::linear(
+            embedding_dim,
+            embedding_dim,
+            vb.pp("timestep_embedder.linear_2"),
+        )?;
+        Ok(Self { linear1, linear2 })
     }
 }
 
 /// Adaptive Layer Normalization with continuous conditioning.
 ///
 /// Used for the final output layer, modulated by timestep embedding.
+/// Generic over `L: Module` to support both Linear and QLinear.
 #[derive(Debug, Clone)]
-pub struct AdaLayerNormContinuous {
+pub struct AdaLayerNormContinuous<L: Module> {
     norm: candle_nn::LayerNorm,
-    linear: Linear,
+    linear: L,
 }
 
-impl AdaLayerNormContinuous {
-    pub fn new(dim: usize, conditioning_dim: usize, vb: VarBuilder) -> Result<Self> {
-        // Note: elementwise_affine=False in PyTorch (no learned params for norm)
-        let norm = layer_norm_no_affine(dim, 1e-6, vb.device(), vb.dtype())?;
-        let linear = candle_nn::linear(conditioning_dim, 2 * dim, vb.pp("linear"))?;
-        Ok(Self { norm, linear })
+impl<L: Module> AdaLayerNormContinuous<L> {
+    /// Create from pre-constructed components.
+    pub fn from_parts(norm: LayerNorm, linear: L) -> Self {
+        Self { norm, linear }
     }
 
     pub fn forward(&self, xs: &Tensor, conditioning: &Tensor) -> Result<Tensor> {
-        let chunks = conditioning.silu()?.apply(&self.linear)?.chunk(2, 1)?;
+        let emb = conditioning.silu()?;
+        let emb = self.linear.forward(&emb)?;
+        let chunks = emb.chunk(2, 1)?;
         if chunks.len() != 2 {
             candle::bail!("Expected 2 chunks for AdaLN, got {}", chunks.len());
         }
-        // PyTorch: scale, shift = torch.chunk(emb, 2, dim=1)
         let scale = &chunks[0];
         let shift = &chunks[1];
 
         xs.apply(&self.norm)?
             .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&shift.unsqueeze(1)?)
+    }
+}
+
+impl AdaLayerNormContinuous<Linear> {
+    pub fn new(dim: usize, conditioning_dim: usize, vb: VarBuilder) -> Result<Self> {
+        // Note: elementwise_affine=False in PyTorch (no learned params for norm)
+        let norm = layer_norm_no_affine(dim, 1e-6, vb.device(), vb.dtype())?;
+        let linear = candle_nn::linear(conditioning_dim, 2 * dim, vb.pp("linear"))?;
+        Ok(Self { norm, linear })
     }
 }
 
@@ -171,7 +180,7 @@ pub struct QwenImageTransformer2DModel {
     pos_embed: QwenEmbedRope,
 
     /// Timestep embedding projection
-    time_text_embed: QwenTimestepProjEmbeddings,
+    time_text_embed: QwenTimestepProjEmbeddings<Linear>,
 
     /// Text input normalization
     txt_norm: RmsNorm,
@@ -186,7 +195,7 @@ pub struct QwenImageTransformer2DModel {
     transformer_blocks: Vec<QwenImageTransformerBlock>,
 
     /// Output normalization with AdaLN
-    norm_out: AdaLayerNormContinuous,
+    norm_out: AdaLayerNormContinuous<Linear>,
 
     /// Output projection: 3072 -> patch_size² × out_channels
     proj_out: Linear,

@@ -28,7 +28,8 @@ use super::blocks::{
     QwenDoubleStreamAttention,
 };
 use super::config::InferenceConfig;
-use super::rope::{timestep_embedding, QwenEmbedRope};
+use super::model::{AdaLayerNormContinuous, QwenTimestepProjEmbeddings};
+use super::rope::QwenEmbedRope;
 
 // ============================================================================
 // QLinear: Quantized Linear with Bias Support
@@ -67,52 +68,18 @@ impl Module for QLinear {
 }
 
 // ============================================================================
-// Quantized Timestep Embeddings
+// Quantized Timestep Embeddings (Type Alias)
 // ============================================================================
 
-/// Quantized timestep projection embeddings.
-#[derive(Debug, Clone)]
-pub struct QwenTimestepProjEmbeddingsQuantized {
-    linear1: QLinear,
-    linear2: QLinear,
-}
-
-impl QwenTimestepProjEmbeddingsQuantized {
-    pub fn forward(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
-        let timesteps_proj = timestep_embedding(timestep, 256, dtype)?;
-        let x = self.linear1.forward(&timesteps_proj)?;
-        let x = x.silu()?;
-        self.linear2.forward(&x)
-    }
-}
+/// Quantized timestep projection embeddings - uses the generic type with QLinear.
+pub type QwenTimestepProjEmbeddingsQuantized = QwenTimestepProjEmbeddings<QLinear>;
 
 // ============================================================================
-// Quantized AdaLayerNorm
+// Quantized AdaLayerNorm (Type Alias)
 // ============================================================================
 
-/// Quantized adaptive layer normalization.
-#[derive(Debug, Clone)]
-pub struct AdaLayerNormContinuousQuantized {
-    norm: LayerNorm,
-    linear: QLinear,
-}
-
-impl AdaLayerNormContinuousQuantized {
-    pub fn forward(&self, xs: &Tensor, conditioning: &Tensor) -> Result<Tensor> {
-        let emb = conditioning.silu()?;
-        let emb = self.linear.forward(&emb)?;
-        let chunks = emb.chunk(2, 1)?;
-        if chunks.len() != 2 {
-            candle::bail!("Expected 2 chunks for AdaLN, got {}", chunks.len());
-        }
-        let scale = &chunks[0];
-        let shift = &chunks[1];
-
-        xs.apply(&self.norm)?
-            .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
-            .broadcast_add(&shift.unsqueeze(1)?)
-    }
-}
+/// Quantized adaptive layer normalization - uses the generic type with QLinear.
+pub type AdaLayerNormContinuousQuantized = AdaLayerNormContinuous<QLinear>;
 
 // ============================================================================
 // Quantized Modulation (Type Alias)
@@ -143,20 +110,18 @@ pub type MlpQuantized = FeedForward<QLinear>;
 /// Quantized dual-stream transformer block.
 #[derive(Debug, Clone)]
 pub struct QwenImageTransformerBlockQuantized {
-    // Layer norms (parameter-free)
-    norm1: LayerNorm,
-    norm1_context: LayerNorm,
+    // Image stream
+    img_mod: ModulationQuantized,
+    img_norm1: LayerNorm,
+    img_mlp: MlpQuantized,
 
-    // Modulation
-    modulation: ModulationQuantized,
-    modulation_context: ModulationQuantized,
+    // Text stream
+    txt_mod: ModulationQuantized,
+    txt_norm1: LayerNorm,
+    txt_mlp: MlpQuantized,
 
-    // Attention
+    // Shared attention
     attn: QwenDoubleStreamAttentionQuantized,
-
-    // MLPs
-    mlp: MlpQuantized,
-    mlp_context: MlpQuantized,
 }
 
 impl QwenImageTransformerBlockQuantized {
@@ -190,7 +155,7 @@ impl QwenImageTransformerBlockQuantized {
         let batch_size = img.dim(0)?;
 
         // Get modulation parameters for image stream (uses full temb if doubled)
-        let (img_mod1, img_mod2) = self.modulation.forward(temb)?;
+        let (img_mod1, img_mod2) = self.img_mod.forward(temb)?;
 
         // For text stream, use only first half of temb if modulate_index is provided (zero_cond_t mode)
         let txt_temb = if modulate_index.is_some() {
@@ -200,12 +165,12 @@ impl QwenImageTransformerBlockQuantized {
         } else {
             temb.clone()
         };
-        let (txt_mod1, txt_mod2) = self.modulation_context.forward(&txt_temb)?;
+        let (txt_mod1, txt_mod2) = self.txt_mod.forward(&txt_temb)?;
 
         // === Attention phase ===
 
         // Image: norm1 + modulate (with per-token selection if modulate_index provided)
-        let img_normed = self.norm1.forward(img)?;
+        let img_normed = self.img_norm1.forward(img)?;
 
         let (img_modulated, img_gate1) = if let Some(mod_idx) = modulate_index {
             // Per-token modulation for edit mode
@@ -218,7 +183,7 @@ impl QwenImageTransformerBlockQuantized {
         };
 
         // Text: norm1 + modulate (always standard, no per-token selection)
-        let txt_normed = self.norm1_context.forward(txt)?;
+        let txt_normed = self.txt_norm1.forward(txt)?;
         let txt_modulated = txt_mod1.scale_shift(&txt_normed)?;
         let txt_gate1 = txt_mod1.gate.clone();
 
@@ -239,7 +204,7 @@ impl QwenImageTransformerBlockQuantized {
         // === MLP phase ===
 
         // Image: norm1 + modulate + MLP + gated residual
-        let img_normed2 = self.norm1.forward(&img)?;
+        let img_normed2 = self.img_norm1.forward(&img)?;
 
         let (img_modulated2, img_gate2) = if let Some(mod_idx) = modulate_index {
             apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx)?
@@ -249,17 +214,17 @@ impl QwenImageTransformerBlockQuantized {
             (modulated, gate)
         };
 
-        let img_mlp_out = self.mlp.forward(&img_modulated2)?;
+        let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
         let gated_img_mlp = img_gate2.broadcast_mul(&img_mlp_out)?;
 
         // Residual add in F32
         let img = (img.to_dtype(DType::F32)? + gated_img_mlp.to_dtype(DType::F32)?)?
             .to_dtype(img.dtype())?;
 
-        // Text: norm1_context + modulate + MLP + gated residual (always standard)
-        let txt_normed2 = self.norm1_context.forward(&txt)?;
+        // Text: txt_norm1 + modulate + MLP + gated residual (always standard)
+        let txt_normed2 = self.txt_norm1.forward(&txt)?;
         let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
-        let txt_mlp_out = self.mlp_context.forward(&txt_modulated2)?;
+        let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;
         let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
 
         // Residual add in F32
@@ -406,18 +371,18 @@ impl QwenImageTransformer2DModelQuantized {
         let bias_dtype = dtype;
 
         // Load timestep embeddings
-        let time_text_embed = QwenTimestepProjEmbeddingsQuantized {
-            linear1: load_qlinear!(
+        let time_text_embed = QwenTimestepProjEmbeddings::from_linears(
+            load_qlinear!(
                 "time_text_embed.timestep_embedder.linear_1.weight",
                 "time_text_embed.timestep_embedder.linear_1.bias",
                 bias_dtype
             ),
-            linear2: load_qlinear!(
+            load_qlinear!(
                 "time_text_embed.timestep_embedder.linear_2.weight",
                 "time_text_embed.timestep_embedder.linear_2.bias",
                 bias_dtype
             ),
-        };
+        );
 
         // Load text norm
         let txt_norm_weight = load_dequant!("txt_norm.weight", DType::F32);
@@ -433,12 +398,12 @@ impl QwenImageTransformer2DModelQuantized {
             let prefix = format!("transformer_blocks.{idx}");
 
             // Modulation (GGUF uses img_mod/txt_mod naming from Flux)
-            let modulation = Modulation::from_linear(load_qlinear!(
+            let img_mod = Modulation::from_linear(load_qlinear!(
                 format!("{prefix}.img_mod.1.weight"),
                 format!("{prefix}.img_mod.1.bias"),
                 bias_dtype
             ));
-            let modulation_context = Modulation::from_linear(load_qlinear!(
+            let txt_mod = Modulation::from_linear(load_qlinear!(
                 format!("{prefix}.txt_mod.1.weight"),
                 format!("{prefix}.txt_mod.1.bias"),
                 bias_dtype
@@ -515,7 +480,7 @@ impl QwenImageTransformer2DModelQuantized {
             );
 
             // MLPs (GGUF uses img_mlp/txt_mlp naming from Flux)
-            let mlp = FeedForward::from_linears(
+            let img_mlp = FeedForward::from_linears(
                 load_qlinear!(
                     format!("{prefix}.img_mlp.net.0.proj.weight"),
                     format!("{prefix}.img_mlp.net.0.proj.bias"),
@@ -527,7 +492,7 @@ impl QwenImageTransformer2DModelQuantized {
                     bias_dtype
                 ),
             );
-            let mlp_context = FeedForward::from_linears(
+            let txt_mlp = FeedForward::from_linears(
                 load_qlinear!(
                     format!("{prefix}.txt_mlp.net.0.proj.weight"),
                     format!("{prefix}.txt_mlp.net.0.proj.bias"),
@@ -540,26 +505,26 @@ impl QwenImageTransformer2DModelQuantized {
                 ),
             );
 
-            // Layer norms (parameter-free)
-            let norm1 = layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?;
-            let norm1_context = layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?;
+            // Layer norms (parameter-free, reused for both attention and MLP phases)
+            let img_norm1 = layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?;
+            let txt_norm1 = layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?;
 
             transformer_blocks.push(QwenImageTransformerBlockQuantized {
-                norm1,
-                norm1_context,
-                modulation,
-                modulation_context,
+                img_mod,
+                img_norm1,
+                img_mlp,
+                txt_mod,
+                txt_norm1,
+                txt_mlp,
                 attn,
-                mlp,
-                mlp_context,
             });
         }
 
         // Output layers
-        let norm_out = AdaLayerNormContinuousQuantized {
-            norm: layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?,
-            linear: load_qlinear!("norm_out.linear.weight", "norm_out.linear.bias", bias_dtype),
-        };
+        let norm_out = AdaLayerNormContinuous::from_parts(
+            layer_norm_no_affine(inner_dim, 1e-6, device, DType::F32)?,
+            load_qlinear!("norm_out.linear.weight", "norm_out.linear.bias", bias_dtype),
+        );
         let proj_out = load_qlinear!("proj_out.weight", "proj_out.bias", bias_dtype);
 
         Ok(Self {
