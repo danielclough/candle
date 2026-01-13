@@ -285,48 +285,6 @@ impl QkNorm {
     }
 }
 
-// ============================================================================
-// QkNormForward Trait - Abstracts QkNorm and DirectRmsNormPair
-// ============================================================================
-
-/// Trait for QK normalization in attention.
-///
-/// This abstracts over `QkNorm` (wrapper struct) and `DirectRmsNormPair` (direct fields),
-/// allowing generic implementations of attention modules.
-pub trait QkNormForward {
-    fn forward_q(&self, q: &Tensor) -> Result<Tensor>;
-    fn forward_k(&self, k: &Tensor) -> Result<Tensor>;
-}
-
-impl QkNormForward for QkNorm {
-    fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
-        QkNorm::forward_q(self, q)
-    }
-
-    fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
-        QkNorm::forward_k(self, k)
-    }
-}
-
-/// Direct RmsNorm pair for Q and K normalization.
-///
-/// Used in quantized models where the normalization layers are stored
-/// directly rather than wrapped in a `QkNorm` struct.
-#[derive(Debug, Clone)]
-pub struct DirectRmsNormPair {
-    pub query_norm: RmsNorm,
-    pub key_norm: RmsNorm,
-}
-
-impl QkNormForward for DirectRmsNormPair {
-    fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
-        q.apply(&self.query_norm)
-    }
-
-    fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
-        k.apply(&self.key_norm)
-    }
-}
 
 /// Scaled dot-product attention.
 ///
@@ -425,11 +383,9 @@ impl TextQKVCache {
 /// 2. Streams are concatenated for joint attention computation
 /// 3. Results are split back to separate streams
 ///
-/// Generic over:
-/// - `L: Module` - Linear layer type (Linear or QLinear)
-/// - `N: QkNormForward` - QK normalization type (QkNorm or DirectRmsNormPair)
+/// Generic over `L: Module` for linear layer type (Linear or QLinear).
 #[derive(Debug, Clone)]
-pub struct QwenDoubleStreamAttention<L: Module, N: QkNormForward> {
+pub struct QwenDoubleStreamAttention<L: Module> {
     // Image stream projections
     to_q: L,
     to_k: L,
@@ -443,8 +399,8 @@ pub struct QwenDoubleStreamAttention<L: Module, N: QkNormForward> {
     to_add_out: L,
 
     // QK normalization
-    img_norm: N,
-    txt_norm: N,
+    img_norm: QkNorm,
+    txt_norm: QkNorm,
 
     num_heads: usize,
     head_dim: usize,
@@ -453,7 +409,7 @@ pub struct QwenDoubleStreamAttention<L: Module, N: QkNormForward> {
     upcast_attention: bool,
 }
 
-impl<L: Module, N: QkNormForward> QwenDoubleStreamAttention<L, N> {
+impl<L: Module> QwenDoubleStreamAttention<L> {
     /// Create from pre-constructed components.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -465,8 +421,8 @@ impl<L: Module, N: QkNormForward> QwenDoubleStreamAttention<L, N> {
         add_k_proj: L,
         add_v_proj: L,
         to_add_out: L,
-        img_norm: N,
-        txt_norm: N,
+        img_norm: QkNorm,
+        txt_norm: QkNorm,
         num_heads: usize,
         head_dim: usize,
         upcast_attention: bool,
@@ -575,7 +531,7 @@ impl<L: Module, N: QkNormForward> QwenDoubleStreamAttention<L, N> {
     }
 }
 
-impl QwenDoubleStreamAttention<Linear, QkNorm> {
+impl QwenDoubleStreamAttention<Linear> {
     /// Load from VarBuilder (FP16/BF16 models).
     pub fn new(
         dim: usize,
@@ -769,26 +725,26 @@ impl QwenDoubleStreamAttention<Linear, QkNorm> {
 /// Implements the dual-stream architecture where:
 /// 1. Both streams get modulation parameters from timestep embedding
 /// 2. Norm1 + modulation + joint attention + gated residual
-/// 3. Norm2 + modulation + MLP + gated residual
+/// 3. Norm1 + modulation + MLP + gated residual (reuses norm1, valid since parameter-free)
+///
+/// Generic over `L: Module` for linear layer type (Linear or QLinear).
 #[derive(Debug, Clone)]
-pub struct QwenImageTransformerBlock {
+pub struct QwenImageTransformerBlock<L: Module> {
     // Image stream
-    img_mod: Modulation<Linear>,
-    img_norm1: candle_nn::LayerNorm,
-    img_norm2: candle_nn::LayerNorm,
-    img_mlp: FeedForward<Linear>,
+    pub img_mod: Modulation<L>,
+    pub img_norm1: candle_nn::LayerNorm,
+    pub img_mlp: FeedForward<L>,
 
     // Text stream
-    txt_mod: Modulation<Linear>,
-    txt_norm1: candle_nn::LayerNorm,
-    txt_norm2: candle_nn::LayerNorm,
-    txt_mlp: FeedForward<Linear>,
+    pub txt_mod: Modulation<L>,
+    pub txt_norm1: candle_nn::LayerNorm,
+    pub txt_mlp: FeedForward<L>,
 
     // Shared attention
-    attn: QwenDoubleStreamAttention<Linear, QkNorm>,
+    pub attn: QwenDoubleStreamAttention<L>,
 }
 
-impl QwenImageTransformerBlock {
+impl QwenImageTransformerBlock<Linear> {
     pub fn new(
         dim: usize,
         num_attention_heads: usize,
@@ -805,13 +761,11 @@ impl QwenImageTransformerBlock {
         // The modulation provides scale/shift instead
         let img_mod = Modulation::new(dim, vb.pp("img_mod"))?;
         let img_norm1 = layer_norm_no_affine(dim, eps, device, dtype)?;
-        let img_norm2 = layer_norm_no_affine(dim, eps, device, dtype)?;
         let img_mlp = FeedForward::new(dim, dim, vb.pp("img_mlp"))?;
 
         // Text stream
         let txt_mod = Modulation::new(dim, vb.pp("txt_mod"))?;
         let txt_norm1 = layer_norm_no_affine(dim, eps, device, dtype)?;
-        let txt_norm2 = layer_norm_no_affine(dim, eps, device, dtype)?;
         let txt_mlp = FeedForward::new(dim, dim, vb.pp("txt_mlp"))?;
 
         // Shared attention
@@ -827,16 +781,16 @@ impl QwenImageTransformerBlock {
         Ok(Self {
             img_mod,
             img_norm1,
-            img_norm2,
             img_mlp,
             txt_mod,
             txt_norm1,
-            txt_norm2,
             txt_mlp,
             attn,
         })
     }
+}
 
+impl<L: Module> QwenImageTransformerBlock<L> {
     /// Forward pass through the dual-stream block (standard mode, no per-token modulation).
     ///
     /// # Arguments
@@ -956,7 +910,7 @@ impl QwenImageTransformerBlock {
         // === MLP phase ===
 
         // Image: norm2 + modulate + MLP + gated residual
-        let img_normed2 = hidden_states.apply(&self.img_norm2)?;
+        let img_normed2 = hidden_states.apply(&self.img_norm1)?;
 
         let (img_modulated2, img_gate2) = if let Some(mod_idx) = modulate_index {
             apply_modulation_with_index(&img_normed2, &img_mod2, mod_idx)?
@@ -975,7 +929,7 @@ impl QwenImageTransformerBlock {
         .to_dtype(orig_dtype)?;
 
         // Text: norm2 + modulate + MLP + gated residual (always standard)
-        let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
+        let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm1)?;
         let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
         let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;
         let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;
@@ -987,7 +941,9 @@ impl QwenImageTransformerBlock {
 
         Ok((encoder_hidden_states, hidden_states))
     }
+}
 
+impl QwenImageTransformerBlock<Linear> {
     /// Forward pass with text Q, K, V caching for CFG optimization.
     ///
     /// Similar to `forward()` but accepts an optional cache for text tensors.
@@ -1050,8 +1006,8 @@ impl QwenImageTransformerBlock {
 
         // === MLP phase ===
 
-        // Image: norm2 + modulate + MLP + gated residual
-        let img_normed2 = hidden_states.apply(&self.img_norm2)?;
+        // Image: norm1 + modulate + MLP + gated residual
+        let img_normed2 = hidden_states.apply(&self.img_norm1)?;
         let img_modulated2 = img_mod2.scale_shift(&img_normed2)?;
         let img_mlp_out = self.img_mlp.forward(&img_modulated2)?;
         let gated_img_mlp = img_mod2.gate(&img_mlp_out)?;
@@ -1060,8 +1016,8 @@ impl QwenImageTransformerBlock {
             + gated_img_mlp.to_dtype(DType::F32)?)?
         .to_dtype(orig_dtype)?;
 
-        // Text: norm2 + modulate + MLP + gated residual
-        let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm2)?;
+        // Text: norm1 + modulate + MLP + gated residual
+        let txt_normed2 = encoder_hidden_states.apply(&self.txt_norm1)?;
         let txt_modulated2 = txt_mod2.scale_shift(&txt_normed2)?;
         let txt_mlp_out = self.txt_mlp.forward(&txt_modulated2)?;
         let gated_txt_mlp = txt_mod2.gate(&txt_mlp_out)?;

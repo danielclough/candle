@@ -192,7 +192,7 @@ pub struct QwenImageTransformer2DModel {
     txt_in: Linear,
 
     /// Stack of 60 dual-stream transformer blocks
-    transformer_blocks: Vec<QwenImageTransformerBlock>,
+    transformer_blocks: Vec<QwenImageTransformerBlock<Linear>>,
 
     /// Output normalization with AdaLN
     norm_out: AdaLayerNormContinuous<Linear>,

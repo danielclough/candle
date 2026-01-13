@@ -157,7 +157,7 @@ pub struct QwenImageControlNetModel {
     controlnet_x_embedder: ZeroLinear,
 
     /// Stack of transformer blocks (subset of main model)
-    transformer_blocks: Vec<QwenImageTransformerBlock>,
+    transformer_blocks: Vec<QwenImageTransformerBlock<Linear>>,
 
     /// Zero-initialized output projections for each block
     controlnet_blocks: Vec<ZeroLinear>,
