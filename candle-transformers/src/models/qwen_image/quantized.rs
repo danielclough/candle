@@ -196,35 +196,7 @@ impl QwenImageTransformer2DModelQuantized {
                 let weight_name: &str = &$weight_name;
                 let bias_name: &str = &$bias_name;
                 let qt = ct.tensor(reader, weight_name, device)?;
-                // DEBUG: Print shape and dequantized values for key tensors
-                if weight_name == "transformer_blocks.0.attn.to_q.weight"
-                    || weight_name == "img_in.weight"
-                    || weight_name == "transformer_blocks.0.img_mod.1.weight"
-                    || weight_name.contains("time_text_embed") {
-                    eprintln!("[DEBUG] Loading {}: shape {:?}, dtype {:?}", weight_name, qt.shape(), qt.dtype());
-                    // Debug: Dequantize and check first few values (with error handling)
-                    match qt.dequantize(device) {
-                        Ok(dequant) => {
-                            match dequant.flatten_all() {
-                                Ok(flat) => {
-                                    match flat.to_vec1::<f32>() {
-                                        Ok(dequant_vec) => {
-                                            let len = dequant_vec.len().min(10);
-                                            eprintln!("[DEBUG] Dequantized first {} values: {:?}", len, &dequant_vec[..len]);
-                                            eprintln!("[DEBUG] Dequantized stats: min={:.4}, max={:.4}, mean={:.6}",
-                                                dequant_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                                                dequant_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                                                dequant_vec.iter().sum::<f32>() / dequant_vec.len() as f32);
-                                        }
-                                        Err(e) => eprintln!("[DEBUG] to_vec1 failed: {}", e),
-                                    }
-                                }
-                                Err(e) => eprintln!("[DEBUG] flatten_all failed: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("[DEBUG] dequantize failed: {}", e),
-                    }
-                }
+                
                 // Use transposed data loading for diffusion model GGUFs (city96/stable-diffusion.cpp).
                 // These store weights in [in_features, out_features] row-major order, but Candle
                 // expects [out_features, in_features] row-major. The shape is reversed but data

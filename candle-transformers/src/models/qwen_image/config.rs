@@ -295,7 +295,7 @@ pub struct InferenceConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            upcast_attention: true,
+            upcast_attention: false,
             // Auto-enable flash attention if compiled with the feature
             use_flash_attention: cfg!(feature = "flash-attn"),
             memory_efficient_attention: false,
