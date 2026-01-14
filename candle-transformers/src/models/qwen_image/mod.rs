@@ -61,6 +61,7 @@ pub mod pipeline;
 pub mod quantized;
 pub mod rope;
 pub mod scheduler;
+pub mod streaming;
 pub mod vae;
 
 mod model;
@@ -85,6 +86,7 @@ pub use pipeline::{
 };
 pub use quantized::QwenImageTransformer2DModelQuantized;
 pub use rope::{apply_rotary_emb_qwen, QwenEmbedRope};
+pub use streaming::QwenImageTransformer2DModelStreaming;
 pub use scheduler::{calculate_shift, FlowMatchEulerDiscreteScheduler};
 pub use vae::{
     AutoencoderKLQwenImage, DiagonalGaussianDistribution, TiledDecodeConfig, TiledEncodeConfig,

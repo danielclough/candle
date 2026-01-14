@@ -148,6 +148,13 @@ struct Cli {
     /// Only effective when using True CFG with negative prompts.
     #[arg(long, global = true)]
     enable_text_cache: bool,
+
+    /// Enable streaming mode for GGUF transformer to reduce GPU memory.
+    /// Loads transformer blocks on-demand during inference instead of all at once.
+    /// Reduces GPU memory from ~10-12GB to ~200-400MB at the cost of increased latency.
+    /// Only effective when using --gguf-transformer.
+    #[arg(long, global = true)]
+    streaming: bool,
 }
 
 #[derive(Subcommand)]
@@ -414,6 +421,7 @@ fn main() -> Result<()> {
                 vae_tile_size: cli.vae_tile_size,
                 vae_tile_stride: cli.vae_tile_stride,
                 enable_text_cache: cli.enable_text_cache,
+                streaming: cli.streaming,
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,
@@ -455,6 +463,7 @@ fn main() -> Result<()> {
                 tile_size,
                 output,
                 seed: cli.seed,
+                streaming: cli.streaming,
             };
             let paths = edit::EditModelPaths {
                 transformer_path: cli.transformer_path,

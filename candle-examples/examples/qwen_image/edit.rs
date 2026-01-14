@@ -43,6 +43,7 @@ pub struct EditArgs {
     pub tile_size: usize,
     pub output: String,
     pub seed: Option<u64>,
+    pub streaming: bool,
 }
 
 /// Model paths for the edit pipeline.
@@ -255,7 +256,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         Config::qwen_image_edit()
     };
     let inference_config = InferenceConfig::default();
-    let transformer = common::load_transformer_variant(
+    let transformer = common::load_transformer_variant_with_streaming(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
         &args.model_id,
@@ -264,6 +265,7 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
         device,
         dtype,
         &inference_config,
+        args.streaming,
     )?;
     common::log_transformer_loaded(
         config.num_layers,

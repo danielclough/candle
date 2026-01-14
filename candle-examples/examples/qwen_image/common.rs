@@ -16,7 +16,8 @@ use candle_transformers::models::{
     qwen_image::{
         calculate_shift, AutoencoderKLQwenImage, Config as TransformerConfig,
         FlowMatchEulerDiscreteScheduler, InferenceConfig, PromptMode, QwenImageTransformer2DModel,
-        QwenImageTransformer2DModelQuantized, SchedulerConfig, TransformerTextCache, VaeConfig,
+        QwenImageTransformer2DModelQuantized, QwenImageTransformer2DModelStreaming,
+        SchedulerConfig, TransformerTextCache, VaeConfig,
     },
 };
 use tokenizers::Tokenizer;
@@ -507,14 +508,17 @@ pub fn log_transformer_loaded(
 // TransformerVariant - Unified interface for FP16 and quantized transformers
 // ============================================================================
 
-/// Unified transformer variant that abstracts over FP16 and quantized models.
+/// Unified transformer variant that abstracts over FP16, quantized, and streaming models.
 ///
-/// This enum provides a common interface for both model types, handling the
+/// This enum provides a common interface for all model types, handling the
 /// differences in their forward signatures internally.
 #[allow(clippy::large_enum_variant)]
 pub enum TransformerVariant {
     FP16(QwenImageTransformer2DModel<Linear>),
     Quantized(QwenImageTransformer2DModelQuantized),
+    /// Streaming variant that loads transformer blocks on-demand to reduce GPU memory.
+    /// Uses ~200-400MB instead of ~10-12GB, at the cost of increased latency.
+    Streaming(QwenImageTransformer2DModelStreaming),
 }
 
 impl TransformerVariant {
@@ -529,12 +533,13 @@ impl TransformerVariant {
         match self {
             Self::FP16(model) => model.forward(img, txt, timestep, img_shapes),
             Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes),
+            Self::Streaming(model) => model.forward(img, txt, timestep, img_shapes),
         }
     }
 
     /// Forward pass with text Q/K/V caching for CFG optimization.
     ///
-    /// Only supported for FP16 models. Quantized models fall back to regular forward.
+    /// Only supported for FP16 models. Quantized and streaming models fall back to regular forward.
     /// Cache stores text projections after QK norm and RoPE, skipping ~33% of compute.
     pub fn forward_with_cache(
         &self,
@@ -546,39 +551,48 @@ impl TransformerVariant {
     ) -> candle::Result<Tensor> {
         match self {
             Self::FP16(model) => model.forward_with_cache(img, txt, timestep, img_shapes, cache),
-            // Quantized models don't support caching, fall back to regular forward
+            // Quantized and streaming models don't support caching, fall back to regular forward
             Self::Quantized(model) => model.forward(img, txt, timestep, img_shapes),
+            Self::Streaming(model) => model.forward(img, txt, timestep, img_shapes),
         }
     }
 
     /// Create a new text cache for this transformer.
     ///
-    /// Returns None for quantized models (which don't support caching).
+    /// Returns None for quantized and streaming models (which don't support caching).
     pub fn create_text_cache(&self) -> Option<TransformerTextCache> {
         match self {
             Self::FP16(model) => Some(model.create_text_cache()),
-            Self::Quantized(_) => None,
+            Self::Quantized(_) | Self::Streaming(_) => None,
         }
     }
 
-    /// Returns true if this is a quantized model.
+    /// Returns true if this is a quantized or streaming model.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized(_))
+        matches!(self, Self::Quantized(_) | Self::Streaming(_))
     }
 
     /// Returns true if text caching is supported.
     pub fn supports_text_cache(&self) -> bool {
         matches!(self, Self::FP16(_))
     }
+
+    /// Returns true if this is a streaming model.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, Self::Streaming(_))
+    }
 }
 
-/// Load the transformer model, choosing FP16 or quantized based on provided paths.
+/// Load the transformer model, choosing FP16, quantized, or streaming based on arguments.
 ///
-/// If `gguf_path` is provided, loads a quantized GGUF model.
+/// If `streaming` is true and `gguf_path` is provided, loads a streaming GGUF model
+/// that loads transformer blocks on-demand to reduce GPU memory.
+/// If `gguf_path` is provided without streaming, loads a standard quantized GGUF model.
 /// Otherwise, loads the FP16 safetensors model.
 ///
 /// # Arguments
 /// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
+/// * `streaming` - If true and using GGUF, use streaming mode for reduced memory
 #[allow(clippy::too_many_arguments)]
 pub fn load_transformer_variant(
     transformer_path: Option<&str>,
@@ -590,17 +604,60 @@ pub fn load_transformer_variant(
     dtype: DType,
     inference_config: &InferenceConfig,
 ) -> Result<TransformerVariant> {
+    load_transformer_variant_with_streaming(
+        transformer_path,
+        gguf_path,
+        model_id,
+        config,
+        api,
+        device,
+        dtype,
+        inference_config,
+        false, // default: no streaming
+    )
+}
+
+/// Load the transformer model with optional streaming mode.
+///
+/// Streaming mode loads transformer blocks on-demand during inference,
+/// reducing GPU memory from ~10-12GB to ~200-400MB at the cost of latency.
+#[allow(clippy::too_many_arguments)]
+pub fn load_transformer_variant_with_streaming(
+    transformer_path: Option<&str>,
+    gguf_path: Option<&str>,
+    model_id: &str,
+    config: &TransformerConfig,
+    api: &hf_hub::api::sync::Api,
+    device: &Device,
+    dtype: DType,
+    inference_config: &InferenceConfig,
+    streaming: bool,
+) -> Result<TransformerVariant> {
     if let Some(gguf_value) = gguf_path {
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
         let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TRANSFORMER, api)?;
-        let model = load_transformer_quantized(
-            resolved_path.to_str().unwrap(),
-            device,
-            dtype,
-            inference_config,
-            config.zero_cond_t,
-        )?;
-        Ok(TransformerVariant::Quantized(model))
+
+        if streaming {
+            // Streaming mode: load blocks on-demand to reduce GPU memory
+            let model = QwenImageTransformer2DModelStreaming::from_gguf_path(
+                resolved_path.to_str().unwrap(),
+                device,
+                dtype,
+                inference_config,
+                config.zero_cond_t,
+            )?;
+            Ok(TransformerVariant::Streaming(model))
+        } else {
+            // Standard quantized mode: load all blocks into GPU memory
+            let model = load_transformer_quantized(
+                resolved_path.to_str().unwrap(),
+                device,
+                dtype,
+                inference_config,
+                config.zero_cond_t,
+            )?;
+            Ok(TransformerVariant::Quantized(model))
+        }
     } else {
         let model = load_transformer(
             transformer_path,
@@ -715,7 +772,7 @@ fn default_mmproj_for_dtype(dtype: DType) -> &'static str {
         DType::F16 => DEFAULT_GGUF_VISION_ENCODER_F16,
         DType::BF16 => DEFAULT_GGUF_VISION_ENCODER_BF16,
         // For other dtypes (quantized, etc.), default to F16 as a good balance
-        _ => DEFAULT_GGUF_VISION_ENCODER_F16,
+        _ => DEFAULT_GGUF_VISION_ENCODER_BF16,
     }
 }
 

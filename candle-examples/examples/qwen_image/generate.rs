@@ -25,12 +25,12 @@ pub struct GenerateArgs {
     pub output: String,
     pub seed: Option<u64>,
     pub model_id: String,
-    // Memory optimization flags
     pub enable_vae_slicing: bool,
     pub enable_vae_tiling: bool,
     pub vae_tile_size: usize,
     pub vae_tile_stride: usize,
     pub enable_text_cache: bool,
+    pub streaming: bool,
 }
 
 /// Shared model path arguments.
@@ -186,7 +186,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
 
     let config = Config::qwen_image();
     let inference_config = InferenceConfig::default();
-    let transformer = common::load_transformer_variant(
+    let transformer = common::load_transformer_variant_with_streaming(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
         &args.model_id,
@@ -195,6 +195,7 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
         device,
         dtype,
         &inference_config,
+        args.streaming,
     )?;
     common::log_transformer_loaded(
         config.num_layers,

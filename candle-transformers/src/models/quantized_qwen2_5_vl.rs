@@ -1013,6 +1013,8 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     }
 
     // Patch embedding
+    // GGUF files may store this as 4D [out, in, h, w] instead of 5D [out, in, temporal, h, w]
+    // We need to expand 4D to 5D by repeating along temporal dimension
     if let Some(t) = try_load_tensor(
         ct,
         reader,
@@ -1020,6 +1022,14 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         dtype,
         &["v.patch_embd.weight", "vision.patch_embed.proj.weight"],
     ) {
+        let t = if t.dims().len() == 4 {
+            // 4D tensor: [out_channels, in_channels, h, w] -> expand to [out, in, temporal, h, w]
+            // Repeat the 2D conv weights for each temporal frame
+            let t = t.unsqueeze(2)?; // [out, in, 1, h, w]
+            Tensor::cat(&[&t, &t], 2)? // [out, in, 2, h, w]
+        } else {
+            t
+        };
         tensors.insert("patch_embed.proj.weight".to_string(), t);
     }
 
@@ -1047,7 +1057,7 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
             tensors.insert(format!("blocks.{i}.norm2.weight"), t);
         }
 
-        // Attention QKV
+        // Attention QKV - try fused first, then separate Q/K/V
         let qkv_w_names: Vec<String> = vec![
             format!("v.blk.{i}.attn_qkv.weight"),
             format!("vision.blocks.{i}.attn.qkv.weight"),
@@ -1055,6 +1065,34 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         let qkv_w_refs: Vec<&str> = qkv_w_names.iter().map(|s| s.as_str()).collect();
         if let Some(t) = try_load_tensor(ct, reader, device, dtype, &qkv_w_refs) {
             tensors.insert(format!("blocks.{i}.attn.qkv.weight"), t);
+        } else {
+            // Try separate Q, K, V tensors and concatenate them
+            let q_w = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_q.weight")],
+            );
+            let k_w = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_k.weight")],
+            );
+            let v_w = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_v.weight")],
+            );
+            if let (Some(q), Some(k), Some(v)) = (q_w, k_w, v_w) {
+                if let Ok(qkv) = Tensor::cat(&[&q, &k, &v], 0) {
+                    tensors.insert(format!("blocks.{i}.attn.qkv.weight"), qkv);
+                }
+            }
         }
 
         let qkv_b_names: Vec<String> = vec![
@@ -1064,6 +1102,34 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         let qkv_b_refs: Vec<&str> = qkv_b_names.iter().map(|s| s.as_str()).collect();
         if let Some(t) = try_load_tensor(ct, reader, device, dtype, &qkv_b_refs) {
             tensors.insert(format!("blocks.{i}.attn.qkv.bias"), t);
+        } else {
+            // Try separate Q, K, V bias tensors and concatenate them
+            let q_b = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_q.bias")],
+            );
+            let k_b = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_k.bias")],
+            );
+            let v_b = try_load_tensor(
+                ct,
+                reader,
+                device,
+                dtype,
+                &[&format!("v.blk.{i}.attn_v.bias")],
+            );
+            if let (Some(q), Some(k), Some(v)) = (q_b, k_b, v_b) {
+                if let Ok(qkv) = Tensor::cat(&[&q, &k, &v], 0) {
+                    tensors.insert(format!("blocks.{i}.attn.qkv.bias"), qkv);
+                }
+            }
         }
 
         // Attention output projection
@@ -1159,12 +1225,14 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
     }
 
     // Merger MLP (2-layer with GELU)
+    // Note: some GGUF files use "mm.X" without "v." prefix
     if let Some(t) = try_load_tensor(
         ct,
         reader,
         device,
         dtype,
         &[
+            "mm.0.weight",
             "v.mm.0.weight",
             "v.mm_proj.0.weight",
             "vision.merger.mlp.0.weight",
@@ -1178,6 +1246,7 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         device,
         dtype,
         &[
+            "mm.0.bias",
             "v.mm.0.bias",
             "v.mm_proj.0.bias",
             "vision.merger.mlp.0.bias",
@@ -1192,6 +1261,7 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         device,
         dtype,
         &[
+            "mm.2.weight",
             "v.mm.2.weight",
             "v.mm_proj.2.weight",
             "vision.merger.mlp.2.weight",
@@ -1205,6 +1275,7 @@ pub fn load_vision_from_mmproj<R: Seek + Read>(
         device,
         dtype,
         &[
+            "mm.2.bias",
             "v.mm.2.bias",
             "v.mm_proj.2.bias",
             "vision.merger.mlp.2.bias",
