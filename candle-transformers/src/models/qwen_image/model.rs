@@ -74,49 +74,14 @@ impl<L: Module> QwenTimestepProjEmbeddings<L> {
     }
 
     pub fn forward(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
-        let debug = std::env::var("DEBUG_TEMB").is_ok();
 
         // Create sinusoidal embeddings (256-dim)
         let timesteps_proj = timestep_embedding(timestep, 256, dtype)?;
-        if debug {
-            let vals: Vec<f32> = timesteps_proj.flatten_all()?.to_vec1()?;
-            eprintln!(
-                "[DEBUG TEMB] timestep_embedding: first 5: {:?}, mean: {:.6}",
-                &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32
-            );
-        }
 
         // Project through MLP: 256 -> embedding_dim -> embedding_dim
         let x = self.linear1.forward(&timesteps_proj)?;
-        if debug {
-            let vals: Vec<f32> = x.flatten_all()?.to_vec1()?;
-            eprintln!(
-                "[DEBUG TEMB] after linear_1: first 5: {:?}, mean: {:.6}",
-                &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32
-            );
-        }
-
         let x = x.silu()?;
-        if debug {
-            let vals: Vec<f32> = x.flatten_all()?.to_vec1()?;
-            eprintln!(
-                "[DEBUG TEMB] after silu: first 5: {:?}, mean: {:.6}",
-                &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32
-            );
-        }
-
         let result = self.linear2.forward(&x)?;
-        if debug {
-            let vals: Vec<f32> = result.flatten_all()?.to_vec1()?;
-            eprintln!(
-                "[DEBUG TEMB] after linear_2 (final): first 5: {:?}, mean: {:.6}",
-                &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32
-            );
-        }
 
         Ok(result)
     }
@@ -379,14 +344,6 @@ impl QwenImageTransformer2DModel<Linear> {
 }
 
 impl<L: Module> QwenImageTransformer2DModel<L> {
-    /// Compute the timestep embedding (temb) for a given timestep.
-    ///
-    /// This allows computing temb externally for debugging/substitution purposes.
-    /// In zero_cond_t mode (edit), the timestep should already be doubled: [t, 0].
-    pub fn compute_temb(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
-        self.time_text_embed.forward(timestep, dtype)
-    }
-
     /// Forward pass through the transformer.
     ///
     /// # Arguments
@@ -435,36 +392,13 @@ impl<L: Module> QwenImageTransformer2DModel<L> {
         let dtype = hidden_states.dtype();
         let device = hidden_states.device();
 
-        // DEBUG: Check if layer-by-layer debug is enabled
-        let debug_layers = std::env::var("DEBUG_LAYERS").is_ok();
-
         // Project image latents: [batch, seq, 64] -> [batch, seq, 3072]
         let mut hidden_states = hidden_states.apply(&self.img_in)?;
-        if debug_layers {
-            let flat = hidden_states.flatten_all()?;
-            let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-            eprintln!("[DEBUG] After img_in: shape {:?}, first 5: {:?}, mean: {:.6}",
-                hidden_states.shape(), &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32);
-        }
 
         // Normalize and project text: [batch, seq, 3584] -> [batch, seq, 3072]
         let mut encoder_hidden_states = encoder_hidden_states.apply(&self.txt_norm)?;
-        if debug_layers {
-            let flat = encoder_hidden_states.flatten_all()?;
-            let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-            eprintln!("[DEBUG] After txt_norm: shape {:?}, first 5: {:?}, mean: {:.6}",
-                encoder_hidden_states.shape(), &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32);
-        }
+        
         encoder_hidden_states = encoder_hidden_states.apply(&self.txt_in)?;
-        if debug_layers {
-            let flat = encoder_hidden_states.flatten_all()?;
-            let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-            eprintln!("[DEBUG] After txt_in: shape {:?}, first 5: {:?}, mean: {:.6}",
-                encoder_hidden_states.shape(), &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32);
-        }
 
         // Handle zero_cond_t for edit mode:
         // - Double the timestep: [t, 0] creates two modulation sets
@@ -488,13 +422,6 @@ impl<L: Module> QwenImageTransformer2DModel<L> {
 
         // Compute timestep embedding (doubled if zero_cond_t)
         let temb = self.time_text_embed.forward(&timestep, dtype)?;
-        if debug_layers {
-            let flat = temb.flatten_all()?;
-            let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-            eprintln!("[DEBUG] After time_text_embed (temb): shape {:?}, first 5: {:?}, mean: {:.6}",
-                temb.shape(), &vals[..5.min(vals.len())],
-                vals.iter().sum::<f32>() / vals.len() as f32);
-        }
 
         // Derive text sequence length from actual encoder_hidden_states shape
         let txt_seq_len = encoder_hidden_states.dim(1)?;
@@ -514,20 +441,6 @@ impl<L: Module> QwenImageTransformer2DModel<L> {
             )?;
             encoder_hidden_states = enc_out;
             hidden_states = hid_out;
-
-            // DEBUG: Print after first transformer block
-            if debug_layers && idx == 0 {
-                let flat = hidden_states.flatten_all()?;
-                let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-                eprintln!("[DEBUG] After block 0 (hidden): shape {:?}, first 5: {:?}, mean: {:.6}",
-                    hidden_states.shape(), &vals[..5.min(vals.len())],
-                    vals.iter().sum::<f32>() / vals.len() as f32);
-                let flat = encoder_hidden_states.flatten_all()?;
-                let vals: Vec<f32> = flat.to_dtype(candle::DType::F32)?.to_vec1()?;
-                eprintln!("[DEBUG] After block 0 (encoder): shape {:?}, first 5: {:?}, mean: {:.6}",
-                    encoder_hidden_states.shape(), &vals[..5.min(vals.len())],
-                    vals.iter().sum::<f32>() / vals.len() as f32);
-            }
 
             // Apply ControlNet residual if available for this block
             if let Some(residuals) = controlnet_residuals {

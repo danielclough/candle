@@ -1233,42 +1233,6 @@ impl Qwen25VLTextModel {
         }
     }
 
-    /// Debug helper: Check tensor for NaN/Inf and print statistics.
-    fn _check_tensor_health(name: &str, tensor: &Tensor) -> Result<bool> {
-        let t_f32 = tensor.to_dtype(DType::F32)?;
-        let vec: Vec<f32> = t_f32.flatten_all()?.to_vec1()?;
-        let nan_count = vec.iter().filter(|x| x.is_nan()).count();
-        let inf_count = vec.iter().filter(|x| x.is_infinite()).count();
-
-        if nan_count > 0 || inf_count > 0 {
-            eprintln!(
-                "[DEBUG] ❌ {}: shape={:?}, {} NaN, {} Inf (out of {})",
-                name,
-                tensor.dims(),
-                nan_count,
-                inf_count,
-                vec.len()
-            );
-            return Ok(false);
-        }
-
-        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-        let variance = vec.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / vec.len() as f32;
-        let std = variance.sqrt();
-        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        eprintln!(
-            "[DEBUG] ✓ {}: shape={:?}, mean={:.4}, std={:.4}, min={:.4}, max={:.4}",
-            name,
-            tensor.dims(),
-            mean,
-            std,
-            min,
-            max
-        );
-        Ok(true)
-    }
-
     /// Forward pass with vision embeddings, returning hidden states for diffusion.
     ///
     /// This is used by Qwen-Image Edit and Layered pipelines for encoding prompts

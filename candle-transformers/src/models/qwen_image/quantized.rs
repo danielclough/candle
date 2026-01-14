@@ -199,7 +199,8 @@ impl QwenImageTransformer2DModelQuantized {
                 // DEBUG: Print shape and dequantized values for key tensors
                 if weight_name == "transformer_blocks.0.attn.to_q.weight"
                     || weight_name == "img_in.weight"
-                    || weight_name == "transformer_blocks.0.img_mod.1.weight" {
+                    || weight_name == "transformer_blocks.0.img_mod.1.weight"
+                    || weight_name.contains("time_text_embed") {
                     eprintln!("[DEBUG] Loading {}: shape {:?}, dtype {:?}", weight_name, qt.shape(), qt.dtype());
                     // Debug: Dequantize and check first few values (with error handling)
                     match qt.dequantize(device) {
@@ -224,10 +225,11 @@ impl QwenImageTransformer2DModelQuantized {
                         Err(e) => eprintln!("[DEBUG] dequantize failed: {}", e),
                     }
                 }
-                // Use regular loading - city96/ComfyUI-GGUF just reverses the shape (which Candle
-                // already does), no actual transpose needed. The data layout matches PyTorch after
-                // the shape reversal.
-                let weight = QMatMul::from_weights(Arc::new(qt))?;
+                // Use transposed data loading for diffusion model GGUFs (city96/stable-diffusion.cpp).
+                // These store weights in [in_features, out_features] row-major order, but Candle
+                // expects [out_features, in_features] row-major. The shape is reversed but data
+                // layout needs fixing via transpose + contiguous.
+                let weight = QMatMul::from_weights_with_transposed_data(Arc::new(qt))?;
                 let bias = if ct.tensor_infos.contains_key(bias_name) {
                     let bt = ct.tensor(reader, bias_name, device)?;
                     Some(bt.dequantize(device)?.to_dtype($dtype)?)

@@ -29,9 +29,6 @@ pub const VAE_SCALE_FACTOR: usize = 8;
 /// Patch size for latent packing (2x2 patches).
 pub const PATCH_SIZE: usize = 2;
 
-/// Default HuggingFace model IDs (FP16 safetensors).
-pub const DEFAULT_TEXT_ENCODER_ID: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
-
 // =============================================================================
 // GGUF Model Sources
 // =============================================================================
@@ -344,7 +341,7 @@ pub fn load_tokenizer(
     let path = match tokenizer_path {
         Some(p) => std::path::PathBuf::from(p),
         None => {
-            let repo = api.repo(hf_hub::Repo::model(DEFAULT_TEXT_ENCODER_ID.to_string()));
+            let repo = api.repo(hf_hub::Repo::model("Qwen/Qwen2.5-VL-7B-Instruct".to_string()));
             repo.get("tokenizer.json")?
         }
     };
@@ -367,7 +364,7 @@ pub fn load_text_encoder(
             candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
         }
         None => {
-            let repo = api.repo(hf_hub::Repo::model(DEFAULT_TEXT_ENCODER_ID.to_string()));
+            let repo = api.repo(hf_hub::Repo::model("Qwen/Qwen2.5-VL-7B-Instruct".to_string()));
             candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
         }
     };
@@ -596,7 +593,6 @@ pub fn load_transformer_variant(
     if let Some(gguf_value) = gguf_path {
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
         let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TRANSFORMER, api)?;
-        println!("Loading quantized transformer from {:?}...", resolved_path);
         let model = load_transformer_quantized(
             resolved_path.to_str().unwrap(),
             device,
@@ -771,7 +767,7 @@ pub fn load_vision_encoder(
             candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
         }
         None => {
-            let repo = api.repo(hf_hub::Repo::model(DEFAULT_TEXT_ENCODER_ID.to_string()));
+            let repo = api.repo(hf_hub::Repo::model("Qwen/Qwen2.5-VL-7B-Instruct".to_string()));
             candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
         }
     };
