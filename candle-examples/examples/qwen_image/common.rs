@@ -30,36 +30,6 @@ pub const VAE_SCALE_FACTOR: usize = 8;
 /// Patch size for latent packing (2x2 patches).
 pub const PATCH_SIZE: usize = 2;
 
-// =============================================================================
-// GGUF Model Sources
-// =============================================================================
-// Qwen-Image architecture uses components from DIFFERENT repos:
-//
-//   1. Text encoder (unsloth): Qwen2.5-VL-7B encodes text prompts
-//      - The diffusion model reuses Qwen2.5-VL's text understanding
-//
-//   2. Diffusion transformer (city96): The actual image generation model
-//      - This is the 20B parameter MMDiT that generates images
-//
-//   3. Vision encoder (unsloth): mmproj for edit mode with reference images
-//      - Must match the text encoder version
-//
-// This split is intentional - see: https://huggingface.co/city96/Qwen-Image-gguf
-// =============================================================================
-
-/// Text encoder: Qwen2.5-VL-7B (encodes prompts for the diffusion model)
-pub const DEFAULT_GGUF_TEXT_ENCODER: &str =
-    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf";
-
-/// Vision encoder (mmproj) for edit mode - must match text encoder version
-pub const DEFAULT_GGUF_VISION_ENCODER_F32: &str =
-    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F32.gguf";
-pub const DEFAULT_GGUF_VISION_ENCODER_F16: &str =
-    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F16.gguf";
-pub const DEFAULT_GGUF_VISION_ENCODER_BF16: &str =
-    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-BF16.gguf";
-pub const DEFAULT_GGUF_TRANSFORMER: &str = "unsloth/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf";
-
 // ============================================================================
 // GGUF Path Resolution
 // ============================================================================
@@ -576,45 +546,6 @@ impl TransformerVariant {
     pub fn supports_text_cache(&self) -> bool {
         matches!(self, Self::FP16(_))
     }
-
-    /// Returns true if this is a streaming model.
-    pub fn is_streaming(&self) -> bool {
-        matches!(self, Self::Streaming(_))
-    }
-}
-
-/// Load the transformer model, choosing FP16, quantized, or streaming based on arguments.
-///
-/// If `streaming` is true and `gguf_path` is provided, loads a streaming GGUF model
-/// that loads transformer blocks on-demand to reduce GPU memory.
-/// If `gguf_path` is provided without streaming, loads a standard quantized GGUF model.
-/// Otherwise, loads the FP16 safetensors model.
-///
-/// # Arguments
-/// * `inference_config` - Runtime inference configuration (attention behavior, etc.)
-/// * `streaming` - If true and using GGUF, use streaming mode for reduced memory
-#[allow(clippy::too_many_arguments)]
-pub fn load_transformer_variant(
-    transformer_path: Option<&str>,
-    gguf_path: Option<&str>,
-    model_id: &str,
-    config: &TransformerConfig,
-    api: &hf_hub::api::sync::Api,
-    device: &Device,
-    dtype: DType,
-    inference_config: &InferenceConfig,
-) -> Result<TransformerVariant> {
-    load_transformer_variant_with_streaming(
-        transformer_path,
-        gguf_path,
-        model_id,
-        config,
-        api,
-        device,
-        dtype,
-        inference_config,
-        false, // default: no streaming
-    )
 }
 
 /// Load the transformer model with optional streaming mode.
@@ -635,7 +566,7 @@ pub fn load_transformer_variant_with_streaming(
 ) -> Result<TransformerVariant> {
     if let Some(gguf_value) = gguf_path {
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
-        let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TRANSFORMER, api)?;
+        let resolved_path = resolve_gguf_path(gguf_value, "unsloth/Qwen-Image-gguf/qwen-image-Q4_K_M.gguf", api)?;
 
         if streaming {
             // Streaming mode: load blocks on-demand to reduce GPU memory
@@ -749,7 +680,7 @@ pub fn load_text_encoder_variant(
 ) -> Result<TextEncoderVariant> {
     if let Some(gguf_value) = gguf_path {
         // Resolve GGUF path (handles "auto", local paths, and HF paths)
-        let resolved_path = resolve_gguf_path(gguf_value, DEFAULT_GGUF_TEXT_ENCODER, api)?;
+        let resolved_path = resolve_gguf_path(gguf_value, "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", api)?;
         println!("Loading quantized text encoder from {:?}...", resolved_path);
 
         let mut file = std::fs::File::open(&resolved_path)?;
@@ -768,11 +699,10 @@ pub fn load_text_encoder_variant(
 /// Matches the mmproj precision to the working dtype for optimal compatibility.
 fn default_mmproj_for_dtype(dtype: DType) -> &'static str {
     match dtype {
-        DType::F32 => DEFAULT_GGUF_VISION_ENCODER_F32,
-        DType::F16 => DEFAULT_GGUF_VISION_ENCODER_F16,
-        DType::BF16 => DEFAULT_GGUF_VISION_ENCODER_BF16,
+        DType::F32 => "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F32.gguf",
+        DType::F16 => "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-F16.gguf",
         // For other dtypes (quantized, etc.), default to F16 as a good balance
-        _ => DEFAULT_GGUF_VISION_ENCODER_BF16,
+        _ => "unsloth/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-BF16.gguf",
     }
 }
 

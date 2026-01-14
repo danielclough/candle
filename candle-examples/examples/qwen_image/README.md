@@ -92,7 +92,7 @@ Options:
 
 ### Text Caching for CFG
 
-Cache text Q/K/V projections during Classifier-Free Guidance (CFG), skipping ~33% of transformer compute on the negative prompt pass:
+Cache text Q/K/V projections during Classifier-Free Guidance (CFG), reduce transformer compute on the negative prompt pass:
 
 ```bash
 cargo run --release --example qwen_image -- --enable-text-cache generate \

@@ -24,7 +24,7 @@
 //! ```
 
 use candle::{quantized::gguf_file, DType, Device, Result, Tensor};
-use candle_nn::{Module, RmsNorm};
+use candle_nn::RmsNorm;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use super::blocks::{
 use super::config::InferenceConfig;
 use super::model::{AdaLayerNormContinuous, QwenTimestepProjEmbeddings};
 use super::quantized::QLinear;
-use super::rope::{timestep_embedding, QwenEmbedRope};
+use super::rope::QwenEmbedRope;
 
 // ============================================================================
 // Streaming Block Loader
