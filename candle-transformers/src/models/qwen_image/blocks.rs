@@ -477,6 +477,20 @@ impl<L: Module> QwenDoubleStreamAttention<L> {
         let txt_k = txt_k.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
         let txt_v = txt_v.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
 
+        // When upcast_attention is true, cast Q/K to F32 BEFORE QK norm
+        // so that the norm weights (stored as F32) stay in F32 rather than
+        // being cast down to BF16 to match the input dtype.
+        let (img_q, img_k, txt_q, txt_k) = if self.upcast_attention {
+            (
+                img_q.to_dtype(DType::F32)?,
+                img_k.to_dtype(DType::F32)?,
+                txt_q.to_dtype(DType::F32)?,
+                txt_k.to_dtype(DType::F32)?,
+            )
+        } else {
+            (img_q, img_k, txt_q, txt_k)
+        };
+
         // Apply QK normalization
         let img_q = self.img_norm.forward_q(&img_q)?;
         let img_k = self.img_norm.forward_k(&img_k)?;
@@ -563,6 +577,13 @@ impl<L: Module> QwenDoubleStreamAttention<L> {
         let img_k = img_k.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
         let img_v = img_v.reshape((b_sz, img_seq, self.num_heads, self.head_dim))?;
 
+        // When upcast_attention is true, cast Q/K to F32 BEFORE QK norm
+        let (img_q, img_k) = if self.upcast_attention {
+            (img_q.to_dtype(DType::F32)?, img_k.to_dtype(DType::F32)?)
+        } else {
+            (img_q, img_k)
+        };
+
         // Apply QK normalization for image
         let img_q = self.img_norm.forward_q(&img_q)?;
         let img_k = self.img_norm.forward_k(&img_k)?;
@@ -596,6 +617,13 @@ impl<L: Module> QwenDoubleStreamAttention<L> {
                 let txt_k = txt_k.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
                 let txt_v = txt_v.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
 
+                // When upcast_attention is true, cast Q/K to F32 BEFORE QK norm
+                let (txt_q, txt_k) = if self.upcast_attention {
+                    (txt_q.to_dtype(DType::F32)?, txt_k.to_dtype(DType::F32)?)
+                } else {
+                    (txt_q, txt_k)
+                };
+
                 // Apply QK normalization
                 let txt_q = self.txt_norm.forward_q(&txt_q)?;
                 let txt_k = self.txt_norm.forward_k(&txt_k)?;
@@ -623,6 +651,13 @@ impl<L: Module> QwenDoubleStreamAttention<L> {
             let txt_q = txt_q.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
             let txt_k = txt_k.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
             let txt_v = txt_v.reshape((b_sz, txt_seq, self.num_heads, self.head_dim))?;
+
+            // When upcast_attention is true, cast Q/K to F32 BEFORE QK norm
+            let (txt_q, txt_k) = if self.upcast_attention {
+                (txt_q.to_dtype(DType::F32)?, txt_k.to_dtype(DType::F32)?)
+            } else {
+                (txt_q, txt_k)
+            };
 
             let txt_q = self.txt_norm.forward_q(&txt_q)?;
             let txt_k = self.txt_norm.forward_k(&txt_k)?;
