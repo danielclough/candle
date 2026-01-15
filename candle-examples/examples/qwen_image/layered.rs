@@ -24,6 +24,7 @@ pub struct LayeredArgs {
     pub true_cfg_scale: f64,
     pub output_dir: String,
     pub model_id: String,
+    pub upcast_attention: bool,
 }
 
 /// Model paths for the layered pipeline.
@@ -182,7 +183,10 @@ pub fn run(
 
     // Load transformer with layered config
     let config = Config::qwen_image_layered();
-    let inference_config = InferenceConfig::default();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
         &args.model_id,

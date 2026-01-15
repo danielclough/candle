@@ -25,6 +25,7 @@ pub struct ControlnetArgs {
     pub controlnet_scale: f64,
     pub output: String,
     pub model_id: String,
+    pub upcast_attention: bool,
 }
 
 /// Model paths for the controlnet pipeline.
@@ -153,7 +154,10 @@ pub fn run(
 
     let vb_controlnet =
         unsafe { VarBuilder::from_mmaped_safetensors(&controlnet_files, dtype, device)? };
-    let inference_config = InferenceConfig::default();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
     let controlnet =
         QwenImageControlNetModel::new(&controlnet_config, vb_controlnet, &inference_config)?;
     let attn_dtype = common::format_attention_dtype(&inference_config, dtype);

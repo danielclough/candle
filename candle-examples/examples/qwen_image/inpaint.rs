@@ -22,6 +22,7 @@ pub struct InpaintArgs {
     pub true_cfg_scale: f64,
     pub output: String,
     pub model_id: String,
+    pub upcast_attention: bool,
 }
 
 /// Model paths for the inpaint pipeline.
@@ -154,7 +155,10 @@ pub fn run(
     println!("\n[4/5] Loading transformer and inpainting...");
 
     let config = Config::qwen_image();
-    let inference_config = InferenceConfig::default();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
     let transformer = common::load_transformer(
         paths.transformer_path.as_deref(),
         &args.model_id,

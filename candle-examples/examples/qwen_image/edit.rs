@@ -44,6 +44,7 @@ pub struct EditArgs {
     pub output: String,
     pub seed: Option<u64>,
     pub streaming: bool,
+    pub upcast_attention: bool,
 }
 
 /// Model paths for the edit pipeline.
@@ -255,7 +256,10 @@ pub fn run(args: EditArgs, paths: EditModelPaths, device: &Device, dtype: DType)
     } else {
         Config::qwen_image_edit()
     };
-    let inference_config = InferenceConfig::default();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
     let transformer = common::load_transformer_variant_with_streaming(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),

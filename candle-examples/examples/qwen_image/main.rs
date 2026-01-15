@@ -155,6 +155,12 @@ struct Cli {
     /// Only effective when using --gguf-transformer.
     #[arg(long, global = true)]
     streaming: bool,
+
+    /// Upcast attention to F32 for numerical stability.
+    /// When enabled, Q/K/V are converted to F32 for attention computation,
+    /// then cast back to the model dtype. Slower but more stable for long sequences.
+    #[arg(long, global = true)]
+    upcast_attention: bool,
 }
 
 #[derive(Subcommand)]
@@ -422,6 +428,7 @@ fn main() -> Result<()> {
                 vae_tile_stride: cli.vae_tile_stride,
                 enable_text_cache: cli.enable_text_cache,
                 streaming: cli.streaming,
+                upcast_attention: cli.upcast_attention,
             };
             let paths = generate::ModelPaths {
                 transformer_path: cli.transformer_path,
@@ -464,6 +471,7 @@ fn main() -> Result<()> {
                 output,
                 seed: cli.seed,
                 streaming: cli.streaming,
+                upcast_attention: cli.upcast_attention,
             };
             let paths = edit::EditModelPaths {
                 transformer_path: cli.transformer_path,
@@ -498,6 +506,7 @@ fn main() -> Result<()> {
                 true_cfg_scale,
                 output,
                 model_id,
+                upcast_attention: cli.upcast_attention,
             };
             let paths = inpaint::InpaintModelPaths {
                 transformer_path: cli.transformer_path,
@@ -529,6 +538,7 @@ fn main() -> Result<()> {
                 true_cfg_scale,
                 output_dir,
                 model_id,
+                upcast_attention: cli.upcast_attention,
             };
             let paths = layered::LayeredModelPaths {
                 transformer_path: cli.transformer_path,
@@ -563,6 +573,7 @@ fn main() -> Result<()> {
                 controlnet_scale,
                 output,
                 model_id,
+                upcast_attention: cli.upcast_attention,
             };
             let paths = controlnet::ControlnetModelPaths {
                 transformer_path: cli.transformer_path,

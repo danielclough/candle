@@ -31,6 +31,7 @@ pub struct GenerateArgs {
     pub vae_tile_stride: usize,
     pub enable_text_cache: bool,
     pub streaming: bool,
+    pub upcast_attention: bool,
 }
 
 /// Shared model path arguments.
@@ -185,7 +186,10 @@ pub fn run(args: GenerateArgs, paths: ModelPaths, device: &Device, dtype: DType)
     println!("\n[4/5] Loading transformer and denoising...");
 
     let config = Config::qwen_image();
-    let inference_config = InferenceConfig::default();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
     let transformer = common::load_transformer_variant_with_streaming(
         paths.transformer_path.as_deref(),
         paths.gguf_transformer_path.as_deref(),
