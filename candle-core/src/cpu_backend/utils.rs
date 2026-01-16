@@ -23,6 +23,8 @@ pub trait Map1 {
             C::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
             C::F4(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
             C::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
+            // Block-quantized types don't support element-wise Map1 operations
+            C::Q8_1(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
         }
     }
 }
@@ -47,6 +49,8 @@ pub trait Map1Any {
             C::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
             C::F4(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
             C::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
+            // Block-quantized types don't support element-wise Map1Any operations
+            C::Q8_1(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
         }
     }
 }

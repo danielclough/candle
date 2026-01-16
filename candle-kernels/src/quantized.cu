@@ -6280,6 +6280,349 @@ extern "C" __global__ void batched_matmul_q8_1_q8_1_f32out(
     c[b * M * N + m * N + n] = sum;
 }
 
+// Batched Q8_1 × Q8_1 matmul with Q8_1 output
+// A: [batch, M, K] Q8_1, B: [batch, N, K] Q8_1 (transposed), C: [batch, M, N] Q8_1
+// Each warp (32 threads) computes one Q8_1 output block (32 elements)
+extern "C" __global__ void batched_matmul_q8_1_q8_1_q8out(
+    const void * __restrict__ va,   // Q8_1 [batch, M, K]
+    const void * __restrict__ vb,   // Q8_1 [batch, N, K] (transposed)
+    void * __restrict__ vc,         // Q8_1 [batch, M, N]
+    const int batch,
+    const int M,
+    const int K,
+    const int N
+) {
+    // Grid: (N/32, M, batch) - each block handles one output row
+    // Block: 32 threads (one warp), each computes one output element
+    const int b = blockIdx.z;           // batch index
+    const int m = blockIdx.y;           // row index
+    const int n_block = blockIdx.x;     // which block of 32 in the N dimension
+    const int lane = threadIdx.x;       // 0-31, computes output column n_block*32 + lane
+
+    const int n = n_block * 32 + lane;
+
+    const int blocks_k = K / QK8_1;
+    const int blocks_per_matrix_a = M * blocks_k;
+    const int blocks_per_matrix_b = N * blocks_k;
+    const int blocks_per_row_c = (N + 31) / 32;
+
+    // Compute dot product if within bounds
+    float sum = 0.0f;
+    if (n < N) {
+        // Offset to this batch
+        const block_q8_1 * a_batch = (const block_q8_1 *)va + b * blocks_per_matrix_a;
+        const block_q8_1 * b_batch = (const block_q8_1 *)vb + b * blocks_per_matrix_b;
+
+        // A[m, :] dot B[n, :]
+        for (int kb = 0; kb < blocks_k; kb++) {
+            const block_q8_1 * ab = a_batch + m * blocks_k + kb;
+            const block_q8_1 * bb = b_batch + n * blocks_k + kb;
+
+            const float da = __low2float(ab->ds);
+            const float db = __low2float(bb->ds);
+
+            int sumi = 0;
+            #pragma unroll
+            for (int i = 0; i < QK8_1 / 4; i++) {
+                const int32_t * a_qs = (const int32_t *)ab->qs;
+                const int32_t * b_qs = (const int32_t *)bb->qs;
+                sumi = __dp4a(a_qs[i], b_qs[i], sumi);
+            }
+
+            sum += da * db * (float)sumi;
+        }
+    }
+
+    // Warp reduction to find max absolute value for quantization
+    float amax = fabsf(sum);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+    }
+    amax = __shfl_sync(0xffffffff, amax, 0);  // Broadcast to all lanes
+
+    // Compute scale and quantize
+    const float d = amax / 127.0f;
+    const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+    const int8_t q = (int8_t)roundf(sum * id);
+
+    // Compute sum for the Q8_1 block (used in some operations)
+    float block_sum = sum;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+    }
+
+    // Write output Q8_1 block
+    block_q8_1 * c_batch = (block_q8_1 *)vc + b * M * blocks_per_row_c;
+    block_q8_1 * out_block = c_batch + m * blocks_per_row_c + n_block;
+
+    out_block->qs[lane] = q;
+    if (lane == 0) {
+        out_block->ds = make_half2(__float2half(d), __float2half(block_sum));
+    }
+}
+
+// =====================================================================
+// ATTENTION OPERATIONS FOR Q8_1
+// transpose, scale, and causal mask for fully quantized attention
+// =====================================================================
+
+// Transpose Q8_1 tensor from [batch, seq, heads, head_dim] to [batch, heads, seq, head_dim]
+// This reorders Q8 blocks for multi-head attention layout
+// Grid: (blocks_per_head_dim, heads, batch * seq)
+// Block: 32 threads (one warp copies one Q8 block)
+extern "C" __global__ void transpose_0213_q8_1(
+    const void * __restrict__ src,    // Q8_1 [batch, seq, heads, head_dim]
+    void * __restrict__ dst,          // Q8_1 [batch, heads, seq, head_dim]
+    const int batch,
+    const int seq,
+    const int heads,
+    const int head_dim
+) {
+    const int blocks_per_head_dim = head_dim / QK8_1;
+    const int block_d = blockIdx.x;  // which block in head_dim
+    const int h = blockIdx.y;        // which head
+    const int bs = blockIdx.z;       // batch * seq combined
+    const int b = bs / seq;
+    const int s = bs % seq;
+
+    if (block_d >= blocks_per_head_dim || h >= heads || b >= batch || s >= seq) return;
+
+    // Source layout: [batch, seq, heads, head_dim] = [...][s][h][d]
+    // Source index: b * (seq * heads * blocks_per_head_dim) + s * (heads * blocks_per_head_dim) + h * blocks_per_head_dim + block_d
+    const int src_idx = b * (seq * heads * blocks_per_head_dim) +
+                        s * (heads * blocks_per_head_dim) +
+                        h * blocks_per_head_dim +
+                        block_d;
+
+    // Dest layout: [batch, heads, seq, head_dim] = [...][h][s][d]
+    // Dest index: b * (heads * seq * blocks_per_head_dim) + h * (seq * blocks_per_head_dim) + s * blocks_per_head_dim + block_d
+    const int dst_idx = b * (heads * seq * blocks_per_head_dim) +
+                        h * (seq * blocks_per_head_dim) +
+                        s * blocks_per_head_dim +
+                        block_d;
+
+    const block_q8_1 * src_block = (const block_q8_1 *)src + src_idx;
+    block_q8_1 * dst_block = (block_q8_1 *)dst + dst_idx;
+
+    // Copy the entire Q8_1 block
+    *dst_block = *src_block;
+}
+
+// Transpose Q8_1 tensor from [batch, heads, seq, head_dim] back to [batch, seq, heads, head_dim]
+// Inverse of transpose_0213_q8_1
+extern "C" __global__ void transpose_0231_q8_1(
+    const void * __restrict__ src,    // Q8_1 [batch, heads, seq, head_dim]
+    void * __restrict__ dst,          // Q8_1 [batch, seq, heads, head_dim]
+    const int batch,
+    const int heads,
+    const int seq,
+    const int head_dim
+) {
+    const int blocks_per_head_dim = head_dim / QK8_1;
+    const int block_d = blockIdx.x;  // which block in head_dim
+    const int s = blockIdx.y;        // which seq position
+    const int bh = blockIdx.z;       // batch * heads combined
+    const int b = bh / heads;
+    const int h = bh % heads;
+
+    if (block_d >= blocks_per_head_dim || s >= seq || b >= batch || h >= heads) return;
+
+    // Source layout: [batch, heads, seq, head_dim]
+    const int src_idx = b * (heads * seq * blocks_per_head_dim) +
+                        h * (seq * blocks_per_head_dim) +
+                        s * blocks_per_head_dim +
+                        block_d;
+
+    // Dest layout: [batch, seq, heads, head_dim]
+    const int dst_idx = b * (seq * heads * blocks_per_head_dim) +
+                        s * (heads * blocks_per_head_dim) +
+                        h * blocks_per_head_dim +
+                        block_d;
+
+    const block_q8_1 * src_block = (const block_q8_1 *)src + src_idx;
+    block_q8_1 * dst_block = (block_q8_1 *)dst + dst_idx;
+
+    *dst_block = *src_block;
+}
+
+// Scale Q8_1 tensor by a scalar value
+// Used for attention: scores = scores * scale (where scale = 1/sqrt(head_dim))
+// Each thread handles one element, each warp handles one Q8 block
+extern "C" __global__ void scale_q8_1(
+    const void * __restrict__ src,
+    void * __restrict__ dst,
+    const float scale,
+    const int num_blocks
+) {
+    const int block_idx = blockIdx.x * blockDim.x / 32 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    if (block_idx >= num_blocks) return;
+
+    const block_q8_1 * src_block = (const block_q8_1 *)src + block_idx;
+    block_q8_1 * dst_block = (block_q8_1 *)dst + block_idx;
+
+    // Dequantize, scale, requantize
+    const float d = __low2float(src_block->ds);
+    const int8_t q = src_block->qs[lane];
+    float val = d * (float)q * scale;
+
+    // Warp reduction to find max absolute value
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+    }
+    amax = __shfl_sync(0xffffffff, amax, 0);
+
+    // Quantize
+    const float new_d = amax / 127.0f;
+    const float id = (new_d != 0.0f) ? 1.0f / new_d : 0.0f;
+    const int8_t new_q = (int8_t)roundf(val * id);
+
+    // Compute sum for Q8_1 format
+    float block_sum = val;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+    }
+
+    dst_block->qs[lane] = new_q;
+    if (lane == 0) {
+        dst_block->ds = make_half2(__float2half(new_d), __float2half(block_sum));
+    }
+}
+
+// Causal mask + softmax for Q8_1 attention scores
+// Input: [batch_heads, seq_q, seq_kv] Q8_1 attention scores
+// Output: [batch_heads, seq_q, seq_kv] Q8_1 softmax probabilities
+// Applies causal mask (upper triangular = -inf) before softmax
+// seq_offset: for KV cache, the starting position (0 for prefill, seq_kv - 1 for decode)
+extern "C" __global__ void causal_mask_softmax_q8_1(
+    const void * __restrict__ src,
+    void * __restrict__ dst,
+    const int batch_heads,
+    const int seq_q,
+    const int seq_kv,
+    const int seq_offset       // For causal mask: position offset
+) {
+    // Each block handles one row (one query position across all KV positions)
+    const int bh = blockIdx.x;
+    const int q_pos = blockIdx.y;
+
+    if (bh >= batch_heads || q_pos >= seq_q) return;
+
+    const int blocks_per_row = (seq_kv + QK8_1 - 1) / QK8_1;
+    const int row_start = bh * seq_q * blocks_per_row + q_pos * blocks_per_row;
+
+    extern __shared__ float shared[];  // [seq_kv] for dequantized values
+
+    // Step 1: Dequantize and apply causal mask
+    const block_q8_1 * src_blocks = (const block_q8_1 *)src + row_start;
+    const int query_pos = seq_offset + q_pos;  // Actual position in sequence
+
+    // Each thread handles multiple elements
+    for (int i = threadIdx.x; i < seq_kv; i += blockDim.x) {
+        int block_idx = i / QK8_1;
+        int elem_idx = i % QK8_1;
+
+        float val;
+        if (block_idx < blocks_per_row) {
+            const block_q8_1 * blk = src_blocks + block_idx;
+            float d = __low2float(blk->ds);
+            val = d * (float)blk->qs[elem_idx];
+        } else {
+            val = -INFINITY;
+        }
+
+        // Apply causal mask: mask out positions where kv_pos > query_pos
+        if (i > query_pos) {
+            val = -INFINITY;
+        }
+
+        shared[i] = val;
+    }
+    __syncthreads();
+
+    // Step 2: Find max for numerical stability
+    float max_val = -INFINITY;
+    for (int i = threadIdx.x; i < seq_kv; i += blockDim.x) {
+        max_val = fmaxf(max_val, shared[i]);
+    }
+    // Warp reduction for max
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    }
+    __shared__ float s_max;
+    if (threadIdx.x == 0) s_max = max_val;
+    __syncthreads();
+    max_val = s_max;
+
+    // Step 3: Compute exp(x - max) and sum
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < seq_kv; i += blockDim.x) {
+        float val = shared[i];
+        if (val > -INFINITY) {
+            val = expf(val - max_val);
+        } else {
+            val = 0.0f;
+        }
+        shared[i] = val;
+        sum += val;
+    }
+    // Warp reduction for sum
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    __shared__ float s_sum;
+    if (threadIdx.x == 0) s_sum = sum;
+    __syncthreads();
+    sum = s_sum;
+
+    // Step 4: Normalize and quantize back to Q8_1
+    block_q8_1 * dst_blocks = (block_q8_1 *)dst + row_start;
+
+    for (int block_idx = threadIdx.x / 32; block_idx < blocks_per_row; block_idx += blockDim.x / 32) {
+        int lane = threadIdx.x % 32;
+        int elem_idx = block_idx * QK8_1 + lane;
+
+        float val = 0.0f;
+        if (elem_idx < seq_kv) {
+            val = shared[elem_idx] / sum;
+        }
+
+        // Warp reduction for max absolute value
+        float amax = fabsf(val);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+        }
+        amax = __shfl_sync(0xffffffff, amax, 0);
+
+        // Quantize
+        const float d = amax / 127.0f;
+        const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+        const int8_t q = (int8_t)roundf(val * id);
+
+        // Compute block sum
+        float block_sum = val;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+        }
+
+        block_q8_1 * out_block = dst_blocks + block_idx;
+        out_block->qs[lane] = q;
+        if (lane == 0) {
+            out_block->ds = make_half2(__float2half(d), __float2half(block_sum));
+        }
+    }
+}
+
 // =====================================================================
 // EMBEDDING LOOKUP (Token IDs → Q8_1)
 // Entry point for quantized inference pipeline.

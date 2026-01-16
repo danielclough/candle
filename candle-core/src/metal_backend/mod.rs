@@ -112,7 +112,7 @@ impl BackendStorage for MetalStorage {
             DType::F32 => Ok(CpuStorage::F32(self.to_cpu()?)),
             DType::F64 => Ok(CpuStorage::F64(self.to_cpu()?)),
             DType::F8E4M3 => Ok(CpuStorage::F8E4M3(self.to_cpu()?)),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
                 Err(crate::Error::UnsupportedDTypeForOp(self.dtype, "to_cpu_storage").bt())
             }
         }
@@ -467,6 +467,7 @@ impl BackendStorage for MetalStorage {
                     | DType::F6E2M3
                     | DType::F6E3M2
                     | DType::F8E8M0
+                    | DType::Q8_1
                     | DType::I16
                     | DType::I32 => {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
@@ -498,6 +499,7 @@ impl BackendStorage for MetalStorage {
                     | DType::F6E2M3
                     | DType::F6E3M2
                     | DType::F8E8M0
+                    | DType::Q8_1
                     | DType::I16
                     | DType::I32 => {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
@@ -2156,7 +2158,8 @@ impl BackendDevice for MetalDevice {
             CpuStorageRef::F6E2M3(_)
             | CpuStorageRef::F6E3M2(_)
             | CpuStorageRef::F4(_)
-            | CpuStorageRef::F8E8M0(_) => {
+            | CpuStorageRef::F8E8M0(_)
+            | CpuStorageRef::Q8_1(_) => {
                 return Err(Error::UnsupportedDTypeForOp(T::DTYPE, "to_dtype").bt())
             }
         };
@@ -2178,7 +2181,8 @@ impl BackendDevice for MetalDevice {
             CpuStorage::F6E2M3(_)
             | CpuStorage::F6E3M2(_)
             | CpuStorage::F4(_)
-            | CpuStorage::F8E8M0(_) => {
+            | CpuStorage::F8E8M0(_)
+            | CpuStorage::Q8_1(_) => {
                 return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
             }
         };

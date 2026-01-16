@@ -95,6 +95,7 @@ impl Header {
             DType::F6E3M2 => Err(Error::Npy("f6e3m2 is not supported".into()))?,
             DType::F4 => Err(Error::Npy("f4 is not supported".into()))?,
             DType::F8E8M0 => Err(Error::Npy("f8e8m0 is not supported".into()))?,
+            DType::Q8_1 => Err(Error::Npy("q8_1 is not supported".into()))?,
         };
         if !shape.is_empty() {
             shape.push(',')
@@ -263,7 +264,7 @@ impl Tensor {
                     data_t.into_iter().map(float8::F8E4M3::from_bits).collect();
                 Tensor::from_vec(data_f8, shape, &Device::Cpu)
             }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
                 Err(Error::UnsupportedDTypeForOp(dtype, "from_reader").bt())
             }
         }

@@ -34,6 +34,9 @@ pub enum DType {
     F4,
     /// 8-bit float with 8 exponent bits and 0 mantissa bits
     F8E8M0,
+    /// Block-quantized 8-bit with scale and sum (GGML Q8_1 format).
+    /// Each block contains 32 int8 values + f16 scale + f16 sum = 36 bytes.
+    Q8_1,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,6 +68,7 @@ impl std::str::FromStr for DType {
             "f6e3m2" => Ok(Self::F6E3M2),
             "f4" => Ok(Self::F4),
             "f8e8m0" => Ok(Self::F8E8M0),
+            "q8_1" => Ok(Self::Q8_1),
             _ => Err(DTypeParseError(s.to_string())),
         }
     }
@@ -88,10 +92,12 @@ impl DType {
             Self::F6E3M2 => "f6e3m2",
             Self::F4 => "f4",
             Self::F8E8M0 => "f8e8m0",
+            Self::Q8_1 => "q8_1",
         }
     }
 
     /// The size used by each element in bytes, i.e. 1 for `U8`, 4 for `F32`.
+    /// For block-quantized types like Q8_1, returns 0 (use `block_size_in_bytes` instead).
     pub fn size_in_bytes(&self) -> usize {
         match self {
             Self::U8 => 1,
@@ -108,7 +114,31 @@ impl DType {
             Self::F6E3M2 => 0, // 6 bits
             Self::F4 => 0,     // 4 bits
             Self::F8E8M0 => 1,
+            Self::Q8_1 => 0,   // Block-quantized, use block_size methods
         }
+    }
+
+    /// For block-quantized types, returns the number of elements per block.
+    /// Returns 1 for non-block types.
+    pub fn block_size(&self) -> usize {
+        match self {
+            Self::Q8_1 => 32,
+            _ => 1,
+        }
+    }
+
+    /// For block-quantized types, returns the size in bytes of one block.
+    /// For non-block types, equivalent to size_in_bytes.
+    pub fn block_size_in_bytes(&self) -> usize {
+        match self {
+            Self::Q8_1 => 36, // 32 int8 + f16 scale + f16 sum
+            _ => self.size_in_bytes(),
+        }
+    }
+
+    /// Returns true if this is a block-quantized type.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Q8_1)
     }
 
     pub fn is_int(&self) -> bool {
@@ -122,13 +152,14 @@ impl DType {
             | Self::F6E2M3
             | Self::F6E3M2
             | Self::F4
-            | Self::F8E8M0 => false,
+            | Self::F8E8M0
+            | Self::Q8_1 => false,
         }
     }
 
     pub fn is_float(&self) -> bool {
         match self {
-            Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => false,
+            Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 | Self::Q8_1 => false,
             Self::BF16
             | Self::F16
             | Self::F32

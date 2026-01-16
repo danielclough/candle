@@ -157,7 +157,7 @@ impl Tensor {
                     f.write_u8(v.to_bits())?
                 }
             }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
                 return Err(crate::Error::UnsupportedDTypeForOp(self.dtype(), "write_bytes").bt())
             }
         }

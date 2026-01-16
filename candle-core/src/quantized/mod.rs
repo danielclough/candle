@@ -32,7 +32,7 @@ pub mod simd128;
 pub mod utils;
 use half::{bf16, f16};
 
-pub use k_quants::GgmlType;
+pub use k_quants::{BlockQ8_1, GgmlType};
 
 fn as_t_slice<T>(data: Cow<'_, [u8]>) -> &[T] {
     let size = std::mem::size_of::<T>();
@@ -621,6 +621,42 @@ impl QTensor {
         &self.shape
     }
 
+    /// Reshape the QTensor to a new shape.
+    /// This is a zero-copy operation that only changes the logical shape.
+    /// The total element count must remain the same, and the last dimension
+    /// must be a multiple of the block size (32 for Q8_1).
+    pub fn reshape<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
+        let new_shape = shape.into();
+        let old_elem_count = self.shape.elem_count();
+        let new_elem_count = new_shape.elem_count();
+
+        if old_elem_count != new_elem_count {
+            crate::bail!(
+                "reshape: element count mismatch, old={}, new={}",
+                old_elem_count,
+                new_elem_count
+            );
+        }
+
+        let block_size = self.storage.block_size();
+        let new_dims = new_shape.dims();
+        if !new_dims.is_empty() {
+            let last_dim = new_dims[new_dims.len() - 1];
+            if last_dim % block_size != 0 {
+                crate::bail!(
+                    "reshape: last dimension {} must be multiple of block size {}",
+                    last_dim,
+                    block_size
+                );
+            }
+        }
+
+        Ok(Self {
+            storage: self.storage.clone(),
+            shape: new_shape,
+        })
+    }
+
     pub fn dequantize(&self, device: &Device) -> Result<Tensor> {
         let storage = self.storage.dequantize(self.shape.elem_count())?;
         let none = crate::op::BackpropOp::none();
@@ -1075,6 +1111,314 @@ impl QTensor {
             }
         }
     }
+
+    /// Batched Q8_1 × Q8_1 matrix multiplication with Q8_1 output.
+    /// Computes C = A @ B^T for each batch independently.
+    /// A: [batch, M, K], B: [batch, N, K] (transposed), C: [batch, M, N] Q8_1
+    ///
+    /// For attention: Q @ K^T and softmax(scores) @ V
+    pub fn batched_matmul_q8_1_q8out(
+        &self,
+        other: &QTensor,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "batched_matmul_q8_1_q8out requires Q8_1 self, got {:?}",
+                self.dtype()
+            );
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "batched_matmul_q8_1_q8out requires Q8_1 other, got {:?}",
+                other.dtype()
+            );
+        }
+
+        match (&self.storage, &other.storage) {
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(self_storage), QStorage::Cuda(other_storage)) => {
+                let output_storage =
+                    self_storage.batched_matmul_q8_1_q8out(other_storage, batch, m, k, n)?;
+                let shape = crate::Shape::from((batch, m, n));
+                QTensor::new(QStorage::Cuda(output_storage), shape)
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_self_storage), QStorage::Metal(_other_storage)) => {
+                crate::bail!("batched_matmul_q8_1_q8out not yet implemented for Metal")
+            }
+            _ => {
+                crate::bail!("batched_matmul_q8_1_q8out requires both tensors on same GPU backend");
+            }
+        }
+    }
+
+    /// Append new K or V data to a Q8_1 KV cache at the given position.
+    ///
+    /// # Arguments
+    /// * `new_kv` - New K or V data to append, shape [batch_size, num_heads, head_dim]
+    /// * `seq_pos` - Sequence position to write at (0-indexed)
+    /// * `batch_size` - Number of new tokens being appended
+    /// * `num_heads` - Number of heads in the cache
+    /// * `head_dim` - Dimension per head
+    /// * `max_seq_len` - Maximum sequence length of the cache
+    ///
+    /// # Note
+    /// This mutates self in-place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_append(
+        &mut self,
+        new_kv: &QTensor,
+        seq_pos: usize,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_append requires Q8_1 cache, got {:?}",
+                self.dtype()
+            );
+        }
+        if new_kv.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_append requires Q8_1 new_kv, got {:?}",
+                new_kv.dtype()
+            );
+        }
+
+        match (&mut self.storage, &new_kv.storage) {
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(cache_storage), QStorage::Cuda(new_storage)) => {
+                cache_storage.kv_cache_append(
+                    new_storage,
+                    seq_pos,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    max_seq_len,
+                )
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_), QStorage::Metal(_)) => {
+                crate::bail!("kv_cache_append not yet implemented for Metal")
+            }
+            _ => {
+                crate::bail!("kv_cache_append requires both tensors on same GPU backend");
+            }
+        }
+    }
+
+    /// Extract a contiguous slice from the Q8_1 KV cache.
+    ///
+    /// # Arguments
+    /// * `start_pos` - Starting sequence position (0-indexed)
+    /// * `slice_len` - Number of positions to extract
+    /// * `num_heads` - Number of heads in the cache
+    /// * `head_dim` - Dimension per head
+    /// * `max_seq_len` - Maximum sequence length of the cache
+    ///
+    /// # Returns
+    /// New QTensor with shape [slice_len, num_heads, head_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_slice(
+        &self,
+        start_pos: usize,
+        slice_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_slice requires Q8_1 cache, got {:?}",
+                self.dtype()
+            );
+        }
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cache_storage) => {
+                let output_storage = cache_storage.kv_cache_slice(
+                    start_pos,
+                    slice_len,
+                    num_heads,
+                    head_dim,
+                    max_seq_len,
+                )?;
+                let output_shape = Shape::from((slice_len, num_heads, head_dim));
+                QTensor::new(QStorage::Cuda(output_storage), output_shape)
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(_) => {
+                crate::bail!("kv_cache_slice not yet implemented for Metal")
+            }
+            _ => {
+                crate::bail!("kv_cache_slice requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+}
+
+/// Q8_1 KV Cache for fully quantized attention.
+///
+/// Stores K and V tensors in Q8_1 format, providing ~4x memory reduction
+/// compared to F16 KV cache.
+///
+/// # Layout
+/// Cache is stored as [max_seq_len, num_heads, head_dim] in Q8_1 format.
+/// Each position can be written to independently, allowing efficient
+/// autoregressive generation.
+#[derive(Debug)]
+pub struct Q8KvCache {
+    k_cache: QTensor,
+    v_cache: QTensor,
+    num_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    current_len: usize,
+}
+
+impl Q8KvCache {
+    /// Create a new Q8_1 KV cache.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length
+    /// * `num_heads` - Number of K/V heads
+    /// * `head_dim` - Dimension per head (must be multiple of 32)
+    /// * `device` - Device to allocate on
+    pub fn new(
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let cache_shape = Shape::from((max_seq_len, num_heads, head_dim));
+        let elem_count = cache_shape.elem_count();
+
+        // Allocate uninitialized Q8_1 storage
+        let k_storage = device.qzeros(elem_count, GgmlDType::Q8_1)?;
+        let v_storage = device.qzeros(elem_count, GgmlDType::Q8_1)?;
+
+        let k_cache = QTensor::new(k_storage, cache_shape.clone())?;
+        let v_cache = QTensor::new(v_storage, cache_shape)?;
+
+        Ok(Self {
+            k_cache,
+            v_cache,
+            num_heads,
+            head_dim,
+            max_seq_len,
+            current_len: 0,
+        })
+    }
+
+    /// Append new K and V tensors to the cache.
+    ///
+    /// # Arguments
+    /// * `k` - New K tensor, shape [batch_size, num_heads, head_dim]
+    /// * `v` - New V tensor, shape [batch_size, num_heads, head_dim]
+    ///
+    /// # Returns
+    /// The sequence position where the data was written
+    pub fn append(&mut self, k: &QTensor, v: &QTensor) -> Result<usize> {
+        let k_dims = k.shape().dims();
+        let batch_size = match k_dims.len() {
+            2 => k_dims[0] / self.num_heads,
+            3 => k_dims[0],
+            _ => crate::bail!("Expected 2D or 3D K tensor, got {:?}", k_dims),
+        };
+
+        if self.current_len + batch_size > self.max_seq_len {
+            crate::bail!(
+                "KV cache overflow: current_len={}, batch_size={}, max_seq_len={}",
+                self.current_len,
+                batch_size,
+                self.max_seq_len
+            );
+        }
+
+        let seq_pos = self.current_len;
+
+        self.k_cache.kv_cache_append(
+            k,
+            seq_pos,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.max_seq_len,
+        )?;
+
+        self.v_cache.kv_cache_append(
+            v,
+            seq_pos,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.max_seq_len,
+        )?;
+
+        self.current_len += batch_size;
+        Ok(seq_pos)
+    }
+
+    /// Get the full K cache up to current_len.
+    ///
+    /// # Returns
+    /// QTensor of shape [current_len, num_heads, head_dim]
+    pub fn k(&self) -> Result<QTensor> {
+        if self.current_len == 0 {
+            crate::bail!("KV cache is empty");
+        }
+        self.k_cache.kv_cache_slice(
+            0,
+            self.current_len,
+            self.num_heads,
+            self.head_dim,
+            self.max_seq_len,
+        )
+    }
+
+    /// Get the full V cache up to current_len.
+    ///
+    /// # Returns
+    /// QTensor of shape [current_len, num_heads, head_dim]
+    pub fn v(&self) -> Result<QTensor> {
+        if self.current_len == 0 {
+            crate::bail!("KV cache is empty");
+        }
+        self.v_cache.kv_cache_slice(
+            0,
+            self.current_len,
+            self.num_heads,
+            self.head_dim,
+            self.max_seq_len,
+        )
+    }
+
+    /// Get the current sequence length in the cache.
+    pub fn len(&self) -> usize {
+        self.current_len
+    }
+
+    /// Check if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.current_len == 0
+    }
+
+    /// Reset the cache to empty state.
+    pub fn reset(&mut self) {
+        self.current_len = 0;
+    }
+
+    /// Get cache configuration.
+    pub fn config(&self) -> (usize, usize, usize) {
+        (self.max_seq_len, self.num_heads, self.head_dim)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1196,6 +1540,29 @@ impl QMatMul {
                 let _ = w; // silence unused warning
                 let result = <Self as Module>::forward(self, xs)?;
                 QTensor::quantize(&result, GgmlDType::Q8_1)
+            }
+        }
+    }
+
+    /// Forward pass with Q8_1 input and Q8_1 output (true fully quantized pipeline).
+    ///
+    /// This is the most memory-efficient path: Q8_1 activations go in,
+    /// Q8_1 activations come out. No dequantization needed.
+    ///
+    /// # Arguments
+    /// * `xs` - Q8_1 quantized input tensor
+    ///
+    /// # Returns
+    /// * `QTensor` with Q8_1 dtype containing the matmul result
+    ///
+    /// # Errors
+    /// - Returns error if weights are dequantized (Tensor/TensorF16 variants)
+    /// - Returns error if input is not Q8_1
+    pub fn fwd_q8_q8(&self, xs: &QTensor) -> Result<QTensor> {
+        match self {
+            Self::QTensor(t) => t.as_ref().fwd_q8out(xs),
+            Self::Tensor(_) | Self::TensorF16(_) => {
+                crate::bail!("fwd_q8_q8 requires quantized weights, but weights are dequantized")
             }
         }
     }

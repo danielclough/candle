@@ -135,3 +135,37 @@ impl Module for RmsNorm {
         candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
     }
 }
+
+/// RmsNorm for fully quantized pipelines: Q8 in, Q8 out.
+#[derive(Debug, Clone)]
+pub struct QRmsNorm {
+    weight: std::sync::Arc<QTensor>,
+    eps: f32,
+    span: tracing::Span,
+}
+
+impl QRmsNorm {
+    pub fn new(weight: QTensor, eps: f64) -> Self {
+        let span = tracing::span!(tracing::Level::TRACE, "q-rms-norm");
+        Self {
+            weight: std::sync::Arc::new(weight),
+            eps: eps as f32,
+            span,
+        }
+    }
+
+    pub fn weight(&self) -> &QTensor {
+        &self.weight
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    /// Q8 in, Q8 out forward pass.
+    pub fn forward(&self, x: &QTensor) -> Result<QTensor> {
+        let _enter = self.span.enter();
+        let weight_f32 = self.weight.dequantize(&self.weight.device())?;
+        x.rms_norm_q8_1(&weight_f32, self.eps)
+    }
+}

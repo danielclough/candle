@@ -1381,6 +1381,94 @@ fn batched_matmul_q8_1_q8_1_f32out_impl(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Batched Q8_1 × Q8_1 matrix multiplication with Q8_1 output
+/// For attention: computes batch independent A @ B^T operations with quantized output
+/// A: [batch, M, K], B: [batch, N, K] (transposed), C: [batch, M, N] Q8_1
+#[allow(clippy::too_many_arguments)]
+fn batched_matmul_q8_1_q8_1_q8out_impl(
+    a: &PaddedCudaSlice,
+    b: &PaddedCudaSlice,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if k % block_size != 0 {
+        crate::bail!(
+            "batched_matmul_q8_1_q8out: K={} must be multiple of block_size {}",
+            k,
+            block_size
+        )
+    }
+    if n % block_size != 0 {
+        crate::bail!(
+            "batched_matmul_q8_1_q8out: N={} must be multiple of block_size {} for Q8 output",
+            n,
+            block_size
+        )
+    }
+
+    let blocks_k = k / block_size;
+    let blocks_n = n / block_size;
+    let a_total_blocks = batch * m * blocks_k;
+    let b_total_blocks = batch * n * blocks_k;
+
+    let a_blocks = a.len / type_size;
+    let b_blocks = b.len / type_size;
+    if a_blocks < a_total_blocks {
+        crate::bail!(
+            "batched_matmul_q8_1_q8out: A size mismatch, need {} blocks, got {}",
+            a_total_blocks,
+            a_blocks
+        )
+    }
+    if b_blocks < b_total_blocks {
+        crate::bail!(
+            "batched_matmul_q8_1_q8out: B size mismatch, need {} blocks, got {}",
+            b_total_blocks,
+            b_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("batched_matmul_q8_1_q8_1_q8out", &candle_kernels::QUANTIZED)?;
+
+    // Grid: (N/32, M, batch) - each block handles one output row's blocks
+    // Block: 32 threads (one warp), each computes one output element
+    let grid_dim = (blocks_n as u32, m as u32, batch as u32);
+    let block_dim = (32u32, 1u32, 1u32);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim,
+        block_dim,
+        shared_mem_bytes: 0,
+    };
+
+    // Output: [batch, M, N] as Q8_1 blocks
+    let output_blocks = batch * m * blocks_n;
+    let output_size_bytes = output_blocks * type_size;
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&a.inner);
+    builder.arg(&b.inner);
+    builder.arg(&dst);
+    barg!(builder, batch as i32, m as i32, k as i32, n as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
 /// Embedding lookup from Q8_1 embedding table
 /// weight: [vocab_size, hidden_size] as Q8_1
 /// input_ids: [batch_size] as i32
@@ -2435,6 +2523,39 @@ impl QCudaStorage {
         batched_matmul_q8_1_q8_1_f32out_impl(&self.data, &other.data, batch, m, k, n, &self.device)
     }
 
+    /// Batched Q8_1 × Q8_1 matrix multiplication with Q8_1 output
+    /// Computes C = A @ B^T for each batch independently, keeping output quantized
+    /// A: [batch, M, K], B: [batch, N, K] (transposed), C: [batch, M, N] Q8_1
+    ///
+    /// For attention output: attention_weights @ V
+    ///
+    /// # Arguments
+    /// * `other` - Q8_1 tensor B of shape [batch, N, K]
+    /// * `batch` - Batch size (e.g., num_heads)
+    /// * `m` - Number of rows in A per batch
+    /// * `k` - Shared dimension (must be multiple of 32)
+    /// * `n` - Number of rows in B per batch (must be multiple of 32 for Q8 output)
+    ///
+    /// # Returns
+    /// Q8_1 QCudaStorage of shape [batch, M, N]
+    pub fn batched_matmul_q8_1_q8out(
+        &self,
+        other: &QCudaStorage,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("batched_matmul_q8_1_q8out requires Q8_1 self, got {:?}", self.dtype())
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("batched_matmul_q8_1_q8out requires Q8_1 other, got {:?}", other.dtype())
+        }
+
+        batched_matmul_q8_1_q8_1_q8out_impl(&self.data, &other.data, batch, m, k, n, &self.device)
+    }
+
     /// Embedding lookup from Q8_1 embedding table
     /// Looks up token embeddings and returns Q8_1 activations.
     ///
@@ -2513,6 +2634,139 @@ impl QCudaStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         use cudarc::driver::DevicePtr;
         Ok(self.data.inner.device_ptr(self.data.inner.stream()).0 as *const u8)
+    }
+
+    /// Allocate an empty Q8_1 KV cache buffer.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length the cache can hold
+    /// * `num_heads` - Number of attention heads (K or V heads)
+    /// * `head_dim` - Dimension per head (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Uninitialized Q8_1 storage sized for [max_seq_len, num_heads, head_dim]
+    pub fn alloc_kv_cache(
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        dev: &CudaDevice,
+    ) -> Result<Self> {
+        let block_size = GgmlDType::Q8_1.block_size();
+        let type_size = GgmlDType::Q8_1.type_size();
+
+        if head_dim % block_size != 0 {
+            crate::bail!(
+                "alloc_kv_cache: head_dim {} must be multiple of block_size {}",
+                head_dim,
+                block_size
+            )
+        }
+
+        let blocks_per_head = head_dim / block_size;
+        let total_blocks = max_seq_len * num_heads * blocks_per_head;
+        let size_bytes = total_blocks * type_size;
+
+        let buffer = unsafe { dev.alloc::<u8>(size_bytes)? };
+
+        Ok(Self {
+            data: PaddedCudaSlice {
+                inner: buffer,
+                len: size_bytes,
+            },
+            dtype: GgmlDType::Q8_1,
+            device: dev.clone(),
+        })
+    }
+
+    /// Append new K or V data to the KV cache at the given position.
+    ///
+    /// # Arguments
+    /// * `new_kv` - New K or V data to append, shape [batch_size, num_heads, head_dim]
+    /// * `seq_pos` - Sequence position to write at (0-indexed)
+    /// * `batch_size` - Number of new tokens being appended
+    /// * `num_heads` - Number of heads in the cache
+    /// * `head_dim` - Dimension per head
+    /// * `max_seq_len` - Maximum sequence length of the cache
+    ///
+    /// # Note
+    /// This mutates self in-place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_append(
+        &mut self,
+        new_kv: &QCudaStorage,
+        seq_pos: usize,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_append requires Q8_1 cache, got {:?}",
+                self.dtype()
+            )
+        }
+        if new_kv.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_append requires Q8_1 new_kv, got {:?}",
+                new_kv.dtype()
+            )
+        }
+
+        // Get mutable reference to inner buffer
+        let cache_mut = unsafe {
+            // Safety: We own this buffer and no other references exist
+            &mut *(&self.data.inner as *const CudaSlice<u8> as *mut CudaSlice<u8>)
+        };
+
+        kv_cache_append_q8_1_impl(
+            cache_mut,
+            &new_kv.data,
+            seq_pos,
+            batch_size,
+            num_heads,
+            head_dim,
+            max_seq_len,
+            &self.device,
+        )
+    }
+
+    /// Extract a contiguous slice from the KV cache.
+    ///
+    /// # Arguments
+    /// * `start_pos` - Starting sequence position (0-indexed)
+    /// * `slice_len` - Number of positions to extract
+    /// * `num_heads` - Number of heads in the cache
+    /// * `head_dim` - Dimension per head
+    /// * `max_seq_len` - Maximum sequence length of the cache
+    ///
+    /// # Returns
+    /// New QCudaStorage with shape [slice_len, num_heads, head_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_slice(
+        &self,
+        start_pos: usize,
+        slice_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "kv_cache_slice requires Q8_1 cache, got {:?}",
+                self.dtype()
+            )
+        }
+
+        kv_cache_slice_q8_1_impl(
+            &self.data.inner,
+            start_pos,
+            slice_len,
+            num_heads,
+            head_dim,
+            max_seq_len,
+            &self.device,
+        )
     }
 }
 

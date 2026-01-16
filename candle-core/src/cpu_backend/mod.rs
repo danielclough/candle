@@ -1,6 +1,7 @@
 //! Implementation of Backend Fns for CPU
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+use crate::quantized::BlockQ8_1;
 use crate::{DType, Error, IntDType, Layout, Result, Shape, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16};
@@ -37,6 +38,8 @@ pub enum CpuStorage {
     F6E3M2(Vec<u8>),
     F4(Vec<u8>),
     F8E8M0(Vec<u8>),
+    // Block-quantized Q8_1 storage
+    Q8_1(Vec<BlockQ8_1>),
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,8 @@ pub enum CpuStorageRef<'a> {
     F6E3M2(&'a [u8]),
     F4(&'a [u8]),
     F8E8M0(&'a [u8]),
+    // Block-quantized Q8_1 storage
+    Q8_1(&'a [BlockQ8_1]),
 }
 
 #[derive(Debug, Clone)]
@@ -1819,6 +1824,17 @@ impl CpuStorage {
                     .concat();
                 Self::F8E8M0(storages)
             }
+            Self::Q8_1(_) => {
+                let storages = storages
+                    .iter()
+                    .map(|s| match s {
+                        Self::Q8_1(s) => Ok(s.as_slice()),
+                        _ => crate::bail!("dtype mismatch"),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .concat();
+                Self::Q8_1(storages)
+            }
         };
         Ok(s)
     }
@@ -1843,6 +1859,7 @@ impl BackendStorage for CpuStorage {
             Self::F6E3M2(_) => DType::F6E3M2,
             Self::F4(_) => DType::F4,
             Self::F8E8M0(_) => DType::F8E8M0,
+            Self::Q8_1(_) => DType::Q8_1,
         }
     }
 
@@ -2265,6 +2282,10 @@ impl BackendStorage for CpuStorage {
             | (Self::F8E8M0(_), _) => {
                 Err(Error::UnsupportedDTypeForOp(self.dtype(), "to_dtype").bt())
             }
+            // Q8_1 type conversions - use quantize/dequantize methods instead
+            (_, DType::Q8_1) | (Self::Q8_1(_), _) => {
+                Err(Error::UnsupportedDTypeForOp(DType::Q8_1, "to_dtype (use quantize/dequantize)").bt())
+            }
         }
     }
 
@@ -2410,6 +2431,7 @@ impl BackendStorage for CpuStorage {
             Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "powf").bt()),
             Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "powf").bt()),
             Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "powf").bt()),
+            Self::Q8_1(_) => Err(Error::UnsupportedDTypeForOp(DType::Q8_1, "powf").bt()),
         }
     }
 
@@ -2445,6 +2467,7 @@ impl BackendStorage for CpuStorage {
             Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "elu").bt()),
             Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "elu").bt()),
             Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "elu").bt()),
+            Self::Q8_1(_) => Err(Error::UnsupportedDTypeForOp(DType::Q8_1, "elu").bt()),
         }
     }
 
@@ -2514,6 +2537,7 @@ impl BackendStorage for CpuStorage {
             Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "unary").bt()),
             Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "unary").bt()),
             Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "unary").bt()),
+            Self::Q8_1(_) => Err(Error::UnsupportedDTypeForOp(DType::Q8_1, "unary").bt()),
         }
     }
 
@@ -3094,7 +3118,8 @@ impl BackendDevice for CpuDevice {
             | DType::F6E2M3
             | DType::F6E3M2
             | DType::F4
-            | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt()),
+            | DType::F8E8M0
+            | DType::Q8_1 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt()),
             DType::BF16 => {
                 let mut data = Vec::with_capacity(elem_count);
                 let uniform = rand::distr::Uniform::new(bf16::from_f64(min), bf16::from_f64(max))
@@ -3157,7 +3182,8 @@ impl BackendDevice for CpuDevice {
             | DType::F6E2M3
             | DType::F6E3M2
             | DType::F4
-            | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt()),
+            | DType::F8E8M0
+            | DType::Q8_1 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt()),
             DType::BF16 => {
                 let mut data = Vec::with_capacity(elem_count);
                 let normal = rand_distr::Normal::new(bf16::from_f64(mean), bf16::from_f64(std))
@@ -3263,7 +3289,7 @@ impl BackendDevice for CpuDevice {
                 v.set_len(elem_count);
                 CpuStorage::F8E4M3(v)
             }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
                 return Err(Error::UnsupportedDTypeForOp(dtype, "alloc_uninit").bt())
             }
         };
@@ -3283,7 +3309,7 @@ impl BackendDevice for CpuDevice {
             DType::F32 => CpuStorage::F32(vec![0f32; elem_count]),
             DType::F64 => CpuStorage::F64(vec![0f64; elem_count]),
             DType::F8E4M3 => CpuStorage::F8E4M3(vec![F8E4M3::ZERO; elem_count]),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
                 return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt())
             }
         };

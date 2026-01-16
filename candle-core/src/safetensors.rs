@@ -36,6 +36,7 @@ impl From<DType> for st::Dtype {
             DType::F6E3M2 => st::Dtype::F6_E3M2,
             DType::F4 => st::Dtype::F4,
             DType::F8E8M0 => st::Dtype::F8_E8M0,
+            DType::Q8_1 => panic!("Q8_1 tensors cannot be saved to safetensors, dequantize first"),
         }
     }
 }
@@ -223,6 +224,9 @@ impl Tensor {
             DType::F32 => convert_slice::<f32>(data, shape, device),
             DType::F64 => convert_slice::<f64>(data, shape, device),
             DType::F8E4M3 => convert_slice::<float8::F8E4M3>(data, shape, device),
+            DType::Q8_1 => {
+                Err(Error::Msg("Q8_1 tensors cannot be loaded from safetensors".to_string()).bt())
+            }
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 // For dummy types, create storage with raw bytes
                 let storage = match device {
@@ -391,7 +395,7 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
         DType::F32 => Ok(convert_back_::<f32>(tensor.to_vec1()?)),
         DType::F64 => Ok(convert_back_::<f64>(tensor.to_vec1()?)),
         DType::F8E4M3 => Ok(convert_back_::<float8::F8E4M3>(tensor.to_vec1()?)),
-        DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+        DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 | DType::Q8_1 => {
             Err(Error::Msg("Internal error: dtype mismatch in storage".to_string()).bt())
         }
     }

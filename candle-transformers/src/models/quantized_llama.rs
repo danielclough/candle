@@ -18,9 +18,8 @@
 
 use std::collections::HashMap;
 
-use crate::quantized_nn::RmsNorm;
-use candle::quantized::QTensor;
-use candle::quantized::{ggml_file, gguf_file};
+use crate::quantized_nn::{QRmsNorm, RmsNorm};
+use candle::quantized::{ggml_file, gguf_file, QKVCache, QTensor};
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 
@@ -44,6 +43,13 @@ impl QMatMul {
         let _enter = self.span.enter();
         self.inner.forward(xs)
     }
+
+    /// Forward pass with Q8_1 output (for fully quantized pipeline).
+    /// Returns QTensor instead of Tensor, keeping activations quantized.
+    fn forward_q8out(&self, xs: &Tensor) -> Result<QTensor> {
+        let _enter = self.span.enter();
+        self.inner.forward_q8out(xs)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +65,29 @@ impl Module for Mlp {
         let w3 = self.feed_forward_w3.forward(xs)?;
         self.feed_forward_w2
             .forward(&(candle_nn::ops::silu(&w1)? * w3)?)
+    }
+}
+
+impl Mlp {
+    /// Forward pass with Q8_1 activations (fully quantized pipeline).
+    /// Implements SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
+    ///
+    /// Uses true Q8→Q8 path: no dequantization between matmuls.
+    fn forward_q8(&self, x: &QTensor) -> Result<QTensor> {
+        // gate = gate_proj(x) → Q8_1 (true Q8 in, Q8 out)
+        let gate = self.feed_forward_w1.inner.fwd_q8_q8(x)?;
+
+        // up = up_proj(x) → Q8_1 (true Q8 in, Q8 out)
+        let up = self.feed_forward_w3.inner.fwd_q8_q8(x)?;
+
+        // Apply SiLU to gate (Q8_1 → Q8_1)
+        let gate_silu = gate.silu_q8_1()?;
+
+        // gate_silu * up (Q8_1 × Q8_1 → Q8_1)
+        let hidden = gate_silu.mul_q8_1(&up)?;
+
+        // down_proj(hidden) → Q8_1 (true Q8 in, Q8 out)
+        self.feed_forward_w2.inner.fwd_q8_q8(&hidden)
     }
 }
 
@@ -143,6 +172,91 @@ impl Module for MlpOrMoe {
     }
 }
 
+impl MlpOrMoe {
+    /// Forward pass with Q8_1 activations (fully quantized pipeline).
+    /// For MOE: routing uses F32 (softmax needs precision), but experts use Q8.
+    fn forward_q8(&self, x: &QTensor) -> Result<QTensor> {
+        match self {
+            Self::Mlp(mlp) => mlp.forward_q8(x),
+            Self::MoE {
+                feed_forward_gate_inp,
+                experts,
+                n_expert_used,
+            } => {
+                // Dequantize for routing (softmax needs F32 precision)
+                let xs = x.dequantize(&x.device())?;
+                let dims = x.shape().dims();
+                let (b_size, seq_len, hidden_dim) = match dims.len() {
+                    2 => (1, dims[0], dims[1]),
+                    3 => (dims[0], dims[1], dims[2]),
+                    _ => candle::bail!("Expected 2D or 3D input for MoE"),
+                };
+                let xs = xs.reshape(((), hidden_dim))?;
+
+                // Router in F32 (small tensor, precision matters)
+                let router_logits = feed_forward_gate_inp.forward(&xs)?;
+                let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+                let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+
+                // Top-k selection (same as standard path)
+                let mut top_x = vec![vec![]; experts.len()];
+                let mut selected_rws = vec![vec![]; experts.len()];
+                for (row_idx, rw) in routing_weights.iter().enumerate() {
+                    let mut dst = (0..rw.len() as u32).collect::<Vec<u32>>();
+                    dst.sort_by(|&i, &j| rw[j as usize].total_cmp(&rw[i as usize]));
+                    let mut sum_routing_weights = 0f32;
+                    for &expert_idx in dst.iter().take(*n_expert_used) {
+                        let expert_idx = expert_idx as usize;
+                        let routing_weight = rw[expert_idx];
+                        sum_routing_weights += routing_weight;
+                        top_x[expert_idx].push(row_idx as u32);
+                    }
+                    for &expert_idx in dst.iter().take(*n_expert_used) {
+                        let expert_idx = expert_idx as usize;
+                        let routing_weight = rw[expert_idx];
+                        selected_rws[expert_idx].push(routing_weight / sum_routing_weights)
+                    }
+                }
+
+                // Process experts - each expert uses Q8 forward
+                let mut ys = xs.zeros_like()?;
+                for (expert_idx, expert_layer) in experts.iter().enumerate() {
+                    let top_x_indices = &top_x[expert_idx];
+                    if top_x_indices.is_empty() {
+                        continue;
+                    }
+                    let top_x_tensor = Tensor::new(top_x_indices.as_slice(), xs.device())?;
+                    let selected_rws_tensor =
+                        Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
+                            .reshape(((), 1))?
+                            .to_dtype(xs.dtype())?;
+
+                    // Get input for this expert
+                    let current_state =
+                        xs.index_select(&top_x_tensor, 0)?.reshape(((), hidden_dim))?;
+
+                    // Quantize input for Q8 expert forward
+                    let current_state_q8 =
+                        QTensor::quantize(&current_state, candle::quantized::GgmlDType::Q8_1)?;
+
+                    // Expert forward in Q8
+                    let expert_output_q8 = expert_layer.forward_q8(&current_state_q8)?;
+
+                    // Dequantize for weighted sum (routing weights are F32)
+                    let expert_output = expert_output_q8.dequantize(&xs.device())?;
+                    let weighted_output = expert_output.broadcast_mul(&selected_rws_tensor)?;
+
+                    ys = ys.index_add(&top_x_tensor, &weighted_output, 0)?;
+                }
+
+                // Requantize final output
+                let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
+                QTensor::quantize(&ys, candle::quantized::GgmlDType::Q8_1)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LayerWeights {
     attention_wq: QMatMul,
@@ -162,6 +276,11 @@ struct LayerWeights {
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
+    // Q8 pipeline norms (populated when full_quant=true)
+    q_attention_norm: Option<QRmsNorm>,
+    q_ffn_norm: Option<QRmsNorm>,
+    // Q8 KV cache (4x memory savings over F32)
+    q_kv_cache: Option<QKVCache>,
 }
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
@@ -180,6 +299,151 @@ impl LayerWeights {
         // The call to contiguous below is only necessary when processing the prompt.
         // When the seq_len is 1 in the inference loop, this is a no-op.
         candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+    }
+
+    /// Q8 attention forward pass with Q8 KV cache.
+    /// Input: QTensor (Q8_1), Output: QTensor (Q8_1)
+    ///
+    /// Uses Q8→Q8 matmuls for Q/K/V/O projections. RoPE is applied in Q8.
+    /// KV cache is stored in Q8 (4x memory savings). Attention scores
+    /// use Q8 batched matmul with Q8 softmax.
+    fn forward_attn_q8(&mut self, x: &QTensor, mask: Option<&Tensor>) -> Result<QTensor> {
+        let _enter = self.span_attn.enter();
+        let dims = x.shape().dims();
+        let (b_sz, seq_len, n_embd) = match dims.len() {
+            2 => (1, dims[0], dims[1]),
+            3 => (dims[0], dims[1], dims[2]),
+            _ => candle::bail!("Expected 2D or 3D input for attention"),
+        };
+
+        // Q/K/V projections using true Q8→Q8 matmuls
+        let q = self.attention_wq.inner.fwd_q8_q8(x)?;
+        let k = self.attention_wk.inner.fwd_q8_q8(x)?;
+        let v = self.attention_wv.inner.fwd_q8_q8(x)?;
+
+        // Apply RoPE in Q8 (no dequant-requant overhead)
+        let _enter_rot = self.span_rot.enter();
+        let cache_len = self
+            .q_kv_cache
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let cos = self.cos.narrow(0, cache_len, seq_len)?;
+        let sin = self.sin.narrow(0, cache_len, seq_len)?;
+
+        // rope_q8_1 expects shape [batch_heads, seq_len, head_dim] flattened
+        let batch_heads_q = b_sz * self.n_head;
+        let batch_heads_kv = b_sz * self.n_kv_head;
+        let q = q.rope_q8_1(&cos, &sin, batch_heads_q, seq_len, self.head_dim)?;
+        let k = k.rope_q8_1(&cos, &sin, batch_heads_kv, seq_len, self.head_dim)?;
+
+        // Initialize Q8 KV cache if needed
+        if self.q_kv_cache.is_none() {
+            self.q_kv_cache = Some(QKVCache::new(
+                MAX_SEQ_LEN,
+                self.n_kv_head,
+                self.head_dim,
+                &x.device(),
+            )?);
+        }
+
+        // Append to Q8 KV cache
+        let cache = self.q_kv_cache.as_mut().unwrap();
+        cache.append(&k, &v)?;
+
+        // Get full K/V from cache
+        let k_full = cache.k()?;
+        let v_full = cache.v()?;
+        let kv_seq_len = cache.len();
+
+        // Attention scores: Q @ K^T (Q8 batched matmul)
+        // Q: [batch * n_head, seq_len, head_dim]
+        // K: [kv_seq_len, n_kv_head, head_dim] from cache
+        // We need to handle GQA (grouped query attention)
+        let n_rep = self.n_head / self.n_kv_head;
+
+        // For attention computation, we need to handle the case where seq_len > 1
+        // which requires masking. For inference (seq_len=1), no mask needed.
+        if seq_len == 1 && mask.is_none() {
+            // Fast path: single token inference, full Q8 pipeline
+            // Q: [batch * n_head, 1, head_dim], K: [kv_seq_len, n_kv_head, head_dim]
+            // Need to compute Q @ K^T for each head
+
+            // Scale factor for attention
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+            // Use batched matmul: Q @ K^T → [batch * n_head, 1, kv_seq_len]
+            // For GQA, we need to replicate K/V for each query head group
+            let scores = q.batched_matmul_q8_1_q8out(
+                &k_full,
+                batch_heads_q, // batch = batch * n_head
+                seq_len,       // M = seq_len (1)
+                self.head_dim, // K = head_dim
+                kv_seq_len,    // N = kv_seq_len
+            )?;
+
+            // Apply scale (TODO: integrate into matmul kernel)
+            // For now, dequant → scale → requant
+            let device = x.device();
+            let scores = scores.dequantize(&device)?;
+            let scores = (scores * scale as f64)?;
+            let scores = QTensor::quantize(&scores, candle::quantized::GgmlDType::Q8_1)?;
+
+            // Softmax in Q8
+            let attn_weights = scores.softmax_q8_1()?;
+
+            // Attention output: attn_weights @ V
+            let attn_out = attn_weights.batched_matmul_q8_1_q8out(
+                &v_full,
+                batch_heads_q,
+                seq_len,
+                kv_seq_len,
+                self.head_dim,
+            )?;
+
+            // Output projection (Q8 → Q8)
+            self.attention_wo.inner.fwd_q8_q8(&attn_out)
+        } else {
+            // Slow path: prompt processing with masking
+            // Fall back to F32 for masking, then requantize
+            let device = x.device();
+            let q = q.dequantize(&device)?;
+            let k_full = k_full.dequantize(&device)?;
+            let v_full = v_full.dequantize(&device)?;
+
+            // Reshape for attention
+            let q = q
+                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let k_full = k_full
+                .reshape((b_sz, kv_seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v_full = v_full
+                .reshape((b_sz, kv_seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+
+            // Replicate K/V for GQA
+            let k_full = crate::utils::repeat_kv(k_full, n_rep)?;
+            let v_full = crate::utils::repeat_kv(v_full, n_rep)?;
+
+            // Attention with masking
+            let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+            let att = match mask {
+                None => att,
+                Some(mask) => {
+                    let mask = mask.broadcast_as(att.shape())?;
+                    masked_fill(&att, &mask, &self.neg_inf)?
+                }
+            };
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            let y = att.matmul(&v_full.contiguous()?)?;
+
+            // Reshape and requantize for output projection
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+            let y_q8 = QTensor::quantize(&y, candle::quantized::GgmlDType::Q8_1)?;
+            self.attention_wo.inner.fwd_q8_q8(&y_q8)
+        }
     }
 
     fn forward_attn(
@@ -347,6 +611,9 @@ impl ModelWeights {
                 span_attn,
                 span_rot,
                 span_mlp,
+                q_attention_norm: None,
+                q_ffn_norm: None,
+                q_kv_cache: None,
             })
         }
         let span = tracing::span!(tracing::Level::TRACE, "model");
@@ -454,9 +721,14 @@ impl ModelWeights {
                     experts,
                 }
             };
-            let attention_norm =
+            let attention_norm_q =
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
-            let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+            let ffn_norm_q = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+
+            // Create Q8 norms (keep QTensor as-is for Q8 pipeline)
+            let q_attention_norm = QRmsNorm::new(attention_norm_q.clone(), rms_norm_eps);
+            let q_ffn_norm = QRmsNorm::new(ffn_norm_q.clone(), rms_norm_eps);
+
             let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
             let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
@@ -465,14 +737,14 @@ impl ModelWeights {
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
-                // Use dtype-converted RmsNorm weights to avoid runtime conversion overhead
+                // Use dtype-converted RmsNorm weights for F32 pipeline
                 attention_norm: RmsNorm::from_qtensor_with_dtype(
-                    attention_norm,
+                    attention_norm_q,
                     rms_norm_eps,
                     dtype,
                 )?,
                 mlp_or_moe,
-                ffn_norm: RmsNorm::from_qtensor_with_dtype(ffn_norm, rms_norm_eps, dtype)?,
+                ffn_norm: RmsNorm::from_qtensor_with_dtype(ffn_norm_q, rms_norm_eps, dtype)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim: embedding_length / head_count,
@@ -483,6 +755,10 @@ impl ModelWeights {
                 span_attn,
                 span_rot,
                 span_mlp,
+                // Q8 pipeline norms
+                q_attention_norm: Some(q_attention_norm),
+                q_ffn_norm: Some(q_ffn_norm),
+                q_kv_cache: None,
             })
         }
         let span = tracing::span!(tracing::Level::TRACE, "model");
@@ -541,5 +817,116 @@ impl ModelWeights {
         let x = x.i((.., seq_len - 1, ..))?;
         let _enter = self.span_output.enter();
         self.output.forward(&x)
+    }
+
+    /// Full Q8 forward pass: QTensor in, QTensor out.
+    ///
+    /// Input `x` should be pre-quantized embeddings (text, vision, or merged).
+    /// This enables VLM pipelines where embeddings come from multiple sources:
+    /// ```ignore
+    /// let img_emb = vision_encoder.forward(image)?;    // ViT → F32
+    /// let txt_emb = tok_embeddings.forward(tokens)?;   // Lookup → F32
+    /// let merged = merge_vision_text(&img_emb, &txt_emb)?;
+    /// let x_q8 = QTensor::quantize(&merged, Q8_1)?;    // Single quantization point
+    /// let logits = model.forward_q8(&x_q8, mask)?;     // Pure Q8 pipeline
+    /// ```
+    ///
+    /// Returns Q8 logits - use `topk_q8_1()` or `argmax_q8_1()` for efficient sampling.
+    pub fn forward_q8(&mut self, x: &QTensor, mask: Option<&Tensor>) -> Result<QTensor> {
+        let dims = x.shape().dims();
+        let seq_len = match dims.len() {
+            2 => dims[0],
+            3 => dims[1],
+            _ => candle::bail!("Expected 2D or 3D input"),
+        };
+        let _enter = self.span.enter();
+
+        let mut layer_in = x.clone();
+
+        for layer in self.layers.iter_mut() {
+            // Attention block
+            let residual = layer_in.clone();
+
+            // Q8 attention norm
+            let x = match &layer.q_attention_norm {
+                Some(norm) => norm.forward(&layer_in)?,
+                None => {
+                    // Fallback: dequant → norm → requant
+                    let x = layer_in.dequantize(&layer_in.device())?;
+                    let x = layer.attention_norm.forward(&x)?;
+                    QTensor::quantize(&x, candle::quantized::GgmlDType::Q8_1)?
+                }
+            };
+
+            // Q8 attention
+            let attn = layer.forward_attn_q8(&x, mask)?;
+
+            // Q8 residual add
+            let x = attn.add_q8_1(&residual)?;
+
+            // MLP block
+            let _enter = layer.span_mlp.enter();
+            let residual = x.clone();
+
+            // Q8 FFN norm
+            let x = match &layer.q_ffn_norm {
+                Some(norm) => norm.forward(&x)?,
+                None => {
+                    // Fallback: dequant → norm → requant
+                    let x_f32 = x.dequantize(&x.device())?;
+                    let x_f32 = layer.ffn_norm.forward(&x_f32)?;
+                    QTensor::quantize(&x_f32, candle::quantized::GgmlDType::Q8_1)?
+                }
+            };
+
+            // Q8 MLP
+            let x = layer.mlp_or_moe.forward_q8(&x)?;
+
+            // Q8 residual add
+            layer_in = x.add_q8_1(&residual)?;
+        }
+
+        // Final norm and output projection
+        // TODO: Add Q8 narrow/slice to avoid dequantization here
+        let x = layer_in.dequantize(&layer_in.device())?;
+        let x = self.norm.forward(&x)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+
+        let _enter = self.span_output.enter();
+        self.output.forward_q8out(&x)
+    }
+
+    /// High-level Q8 forward: takes token IDs.
+    /// Use for text-only LLMs.
+    pub fn forward_q8_tokens(&mut self, tokens: &Tensor) -> Result<QTensor> {
+        let (_b_sz, seq_len) = tokens.dims2()?;
+        let mask = if seq_len > 1 {
+            Some(self.mask(seq_len, tokens.device())?)
+        } else {
+            None
+        };
+
+        // Embedding lookup → quantize
+        let emb = self.tok_embeddings.forward(tokens)?;
+        let x_q8 = QTensor::quantize(&emb, candle::quantized::GgmlDType::Q8_1)?;
+
+        // Delegate to low-level Q8 forward
+        self.forward_q8(&x_q8, mask.as_ref())
+    }
+
+    /// Expose embeddings for multimodal fusion.
+    /// Use this to get text embeddings before merging with vision embeddings.
+    pub fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
+    }
+
+    /// Reset all KV caches (both F32 and Q8).
+    pub fn reset_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.kv_cache = None;
+            if let Some(cache) = layer.q_kv_cache.as_mut() {
+                cache.reset();
+            }
+        }
     }
 }

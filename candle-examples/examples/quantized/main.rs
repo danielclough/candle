@@ -13,45 +13,29 @@ use candle::{DType, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_llama as model;
-use candle_transformers::models::quantized_llama_q8;
-use model::ModelWeights;
+use candle_transformers::models::quantized_llama::{self as model, ModelWeights};
 
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
 
 /// Unified model wrapper for standard and fully-quantized inference
-enum Model {
-    Standard(ModelWeights),
-    FullQuant(quantized_llama_q8::Q8LlamaModel),
+struct Model {
+    inner: ModelWeights,
+    full_quant: bool,
 }
 
 impl Model {
-    fn forward(&mut self, input: &Tensor, pos: usize) -> candle::Result<Tensor> {
-        match self {
-            Model::Standard(m) => m.forward(input, pos),
-            Model::FullQuant(m) => {
-                let (indices, values) = m.forward(input, pos)?;
-                let vocab_size = m.config().vocab_size;
-                Self::sparse_to_logits(&indices, &values, vocab_size, input.device())
-            }
-        }
+    fn new(inner: ModelWeights, full_quant: bool) -> Self {
+        Self { inner, full_quant }
     }
 
-    /// Convert sparse top-k (indices, values) to dense logits tensor
-    fn sparse_to_logits(
-        indices: &[i32],
-        values: &[f32],
-        vocab_size: usize,
-        device: &candle::Device,
-    ) -> candle::Result<Tensor> {
-        // Initialize with -inf so non-top-k tokens have zero probability after softmax
-        let mut logits = vec![f32::NEG_INFINITY; vocab_size];
-        for (&idx, &val) in indices.iter().zip(values.iter()) {
-            if (idx as usize) < vocab_size {
-                logits[idx as usize] = val;
-            }
+    fn forward(&mut self, input: &Tensor, pos: usize) -> candle::Result<Tensor> {
+        if self.full_quant {
+            // Q8 pipeline: returns Q8 logits, dequantize for sampling
+            let logits_q8 = self.inner.forward_q8_tokens(input)?;
+            logits_q8.dequantize(input.device())
+        } else {
+            self.inner.forward(input, pos)
         }
-        Tensor::new(logits, device)
     }
 }
 
@@ -542,10 +526,9 @@ fn main() -> anyhow::Result<()> {
 
             if args.full_quant {
                 println!("Using fully quantized Q8_1 pipeline");
-                Model::FullQuant(quantized_llama_q8::Q8LlamaModel::from_gguf(gguf, &mut file, &device)?)
-            } else {
-                Model::Standard(ModelWeights::from_gguf(gguf, &mut file, &device, dtype)?)
             }
+            let weights = ModelWeights::from_gguf(gguf, &mut file, &device, dtype)?;
+            Model::new(weights, args.full_quant)
         }
         Some("ggml" | "bin") | Some(_) | None => {
             if args.full_quant {
@@ -593,7 +576,8 @@ fn main() -> anyhow::Result<()> {
                 | Which::OpenChat35
                 | Which::Starling7bAlpha => 8,
             };
-            Model::Standard(ModelWeights::from_ggml(ggml, args.gqa.unwrap_or(default_gqa), dtype)?)
+            let weights = ModelWeights::from_ggml(ggml, args.gqa.unwrap_or(default_gqa), dtype)?;
+            Model::new(weights, false) // GGML doesn't support full_quant
         }
     };
     println!("model built");

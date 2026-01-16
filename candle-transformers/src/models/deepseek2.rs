@@ -72,6 +72,11 @@ impl CustomOp1 for NonZero {
                     candle::Error::UnsupportedDTypeForOp(candle::DType::F8E8M0, "nonzero").bt(),
                 )
             }
+            candle::CpuStorage::Q8_1(_) => {
+                return Err(
+                    candle::Error::UnsupportedDTypeForOp(candle::DType::Q8_1, "nonzero").bt(),
+                )
+            }
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;
