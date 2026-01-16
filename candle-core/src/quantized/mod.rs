@@ -688,6 +688,111 @@ impl QTensor {
             }
         }
     }
+
+    /// Forward pass that outputs Q8_1 quantized data instead of float.
+    /// This is key for the fully quantized inference pipeline where activations
+    /// stay quantized between layers, avoiding unnecessary dequantization.
+    ///
+    /// # Arguments
+    /// * `input` - Q8_1 quantized input tensor
+    ///
+    /// # Returns
+    /// Q8_1 quantized output as a new QTensor
+    ///
+    /// # Errors
+    /// - Returns error if input is not Q8_1 quantized
+    /// - Returns error if not on CUDA (only CUDA implementation exists)
+    /// - Returns error if batch size > 8
+    #[cfg(feature = "cuda")]
+    pub fn fwd_q8out(&self, input: &QTensor) -> Result<QTensor> {
+        // Validate input is Q8_1
+        if input.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "fwd_q8out requires Q8_1 input, got {:?}",
+                input.dtype()
+            );
+        }
+
+        match (&self.storage, &input.storage) {
+            (QStorage::Cuda(weight_storage), QStorage::Cuda(input_storage)) => {
+                let (output_storage, output_shape) = weight_storage.fwd_q8out(
+                    self.shape(),
+                    input_storage,
+                    input.shape(),
+                )?;
+                QTensor::new(QStorage::Cuda(output_storage), output_shape)
+            }
+            _ => {
+                crate::bail!("fwd_q8out is only implemented for CUDA");
+            }
+        }
+    }
+
+    /// Element-wise addition of two Q8_1 tensors: self + other
+    /// Used for residual connections in transformer blocks.
+    ///
+    /// Both tensors must be Q8_1 quantized with the same shape.
+    #[cfg(feature = "cuda")]
+    pub fn add_q8_1(&self, other: &QTensor) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("add_q8_1 requires Q8_1 self, got {:?}", self.dtype());
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("add_q8_1 requires Q8_1 other, got {:?}", other.dtype());
+        }
+        if self.shape() != other.shape() {
+            crate::bail!(
+                "add_q8_1 shape mismatch: self={:?}, other={:?}",
+                self.shape(),
+                other.shape()
+            );
+        }
+
+        let elem_count = self.shape().elem_count();
+
+        match (&self.storage, &other.storage) {
+            (QStorage::Cuda(a_storage), QStorage::Cuda(b_storage)) => {
+                let output_storage = a_storage.add_q8_1(b_storage, elem_count)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("add_q8_1 is only implemented for CUDA");
+            }
+        }
+    }
+
+    /// Element-wise multiplication of two Q8_1 tensors: self * other
+    /// Used for gate * up in SwiGLU MLP blocks.
+    ///
+    /// Both tensors must be Q8_1 quantized with the same shape.
+    #[cfg(feature = "cuda")]
+    pub fn mul_q8_1(&self, other: &QTensor) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("mul_q8_1 requires Q8_1 self, got {:?}", self.dtype());
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("mul_q8_1 requires Q8_1 other, got {:?}", other.dtype());
+        }
+        if self.shape() != other.shape() {
+            crate::bail!(
+                "mul_q8_1 shape mismatch: self={:?}, other={:?}",
+                self.shape(),
+                other.shape()
+            );
+        }
+
+        let elem_count = self.shape().elem_count();
+
+        match (&self.storage, &other.storage) {
+            (QStorage::Cuda(a_storage), QStorage::Cuda(b_storage)) => {
+                let output_storage = a_storage.mul_q8_1(b_storage, elem_count)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("mul_q8_1 is only implemented for CUDA");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

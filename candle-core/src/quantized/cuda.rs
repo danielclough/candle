@@ -509,6 +509,1113 @@ fn mul_mat_vec_via_q8_1(
     }
 }
 
+/// Matrix-vector multiplication with Q8_1 quantized output
+/// This is the key function for the fully quantized pipeline: Q_weight × Q8_1 → Q8_1
+/// Instead of dequantizing to float, the output stays quantized for the next layer.
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_vec_via_q8_1_q8out(
+    weight_data: &PaddedCudaSlice,
+    input_data: &PaddedCudaSlice,
+    weight_dtype: GgmlDType,
+    ncols: usize,      // weight columns = input dimension
+    nrows: usize,      // weight rows = output dimension
+    b_size: usize,     // batch size
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    // Validate input is Q8_1
+    // The input_data should be Q8_1 quantized already
+    let input_elems = input_data.len / GgmlDType::Q8_1.type_size() * GgmlDType::Q8_1.block_size();
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let expected_input = ncols_padded * b_size;
+    if input_elems < expected_input {
+        crate::bail!(
+            "unexpected q8_1 input size {}, expected at least {} (ncols_padded={} * b_size={})",
+            input_elems,
+            expected_input,
+            ncols_padded,
+            b_size
+        )
+    }
+
+    if b_size == 0 || b_size > 8 {
+        crate::bail!("only batch sizes 1-8 supported for q8out kernels, got {b_size}")
+    }
+
+    // Build kernel name based on weight dtype
+    let kernel_base = match weight_dtype {
+        GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_q8out",
+        GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_q8out",
+        GgmlDType::Q5_0 => "mul_mat_vec_q5_0_q8_1_q8out",
+        GgmlDType::Q5_1 => "mul_mat_vec_q5_1_q8_1_q8out",
+        GgmlDType::Q8_0 => "mul_mat_vec_q8_0_q8_1_q8out",
+        GgmlDType::Q8_1 => "mul_mat_vec_q8_1_q8_1_q8out",
+        GgmlDType::Q2K => "mul_mat_vec_q2_K_q8_1_q8out",
+        GgmlDType::Q3K => "mul_mat_vec_q3_K_q8_1_q8out",
+        GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_q8out",
+        GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_q8out",
+        GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_q8out",
+        GgmlDType::Q8K => "mul_mat_vec_q8_K_q8_1_q8out",
+        _ => crate::bail!("unsupported dtype for q8out matmul {weight_dtype:?}"),
+    };
+
+    let kernel_name = format!("{kernel_base}{b_size}");
+    let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
+
+    // Q8out kernel uses different block configuration:
+    // Each CUDA block processes QK8_1 (32) output rows to produce one Q8_1 block
+    let num_output_blocks = ceil_div(nrows, 32); // QK8_1 = 32
+    let nwarps = if b_size <= 4 { 4 } else { 2 };
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_output_blocks as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Allocate Q8_1 output buffer
+    // Output shape: [b_size, nrows] but stored as Q8_1 blocks
+    let nrows_padded = pad(nrows, 32); // Q8_1 block size
+    let output_blocks = nrows_padded / 32 * b_size;
+    let output_size_bytes = output_blocks * GgmlDType::Q8_1.type_size();
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&weight_data.inner);
+    builder.arg(&input_data.inner);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        /* ncols_x */ ncols as i32,
+        /* nrows_x */ nrows as i32,
+        /* nrows_y */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Element-wise addition of two Q8_1 tensors: C = A + B
+/// Used for residual connections in transformer blocks.
+fn add_q8_1_impl(
+    a: &PaddedCudaSlice,
+    b: &PaddedCudaSlice,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if elem_count % block_size != 0 {
+        crate::bail!(
+            "add_q8_1: elem_count {} must be multiple of block_size {}",
+            elem_count,
+            block_size
+        )
+    }
+
+    let num_blocks = elem_count / block_size;
+    let output_size_bytes = num_blocks * type_size;
+
+    // Validate input sizes
+    let a_blocks = a.len / type_size;
+    let b_blocks = b.len / type_size;
+    if a_blocks < num_blocks || b_blocks < num_blocks {
+        crate::bail!(
+            "add_q8_1: input size mismatch, need {} blocks, got a={}, b={}",
+            num_blocks,
+            a_blocks,
+            b_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("add_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // Launch config: one thread per Q8_1 block
+    let threads_per_block = 256;
+    let num_cuda_blocks = num_blocks.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_cuda_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&a.inner);
+    builder.arg(&b.inner);
+    builder.arg(&dst);
+    barg!(builder, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Element-wise multiplication of two Q8_1 tensors: C = A * B
+/// Used for gate * up in SwiGLU MLP blocks.
+fn mul_q8_1_impl(
+    a: &PaddedCudaSlice,
+    b: &PaddedCudaSlice,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if elem_count % block_size != 0 {
+        crate::bail!(
+            "mul_q8_1: elem_count {} must be multiple of block_size {}",
+            elem_count,
+            block_size
+        )
+    }
+
+    let num_blocks = elem_count / block_size;
+    let output_size_bytes = num_blocks * type_size;
+
+    // Validate input sizes
+    let a_blocks = a.len / type_size;
+    let b_blocks = b.len / type_size;
+    if a_blocks < num_blocks || b_blocks < num_blocks {
+        crate::bail!(
+            "mul_q8_1: input size mismatch, need {} blocks, got a={}, b={}",
+            num_blocks,
+            a_blocks,
+            b_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("mul_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // Launch config: one thread per Q8_1 block
+    let threads_per_block = 256;
+    let num_cuda_blocks = num_blocks.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_cuda_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&a.inner);
+    builder.arg(&b.inner);
+    builder.arg(&dst);
+    barg!(builder, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// SiLU (Swish) activation on Q8_1 tensor: y = x * sigmoid(x)
+/// Used in LLaMA, Mistral MLP blocks.
+fn silu_q8_1_impl(
+    x: &PaddedCudaSlice,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if elem_count % block_size != 0 {
+        crate::bail!(
+            "silu_q8_1: elem_count {} must be multiple of block_size {}",
+            elem_count,
+            block_size
+        )
+    }
+
+    let num_blocks = elem_count / block_size;
+    let output_size_bytes = num_blocks * type_size;
+
+    // Validate input size
+    let x_blocks = x.len / type_size;
+    if x_blocks < num_blocks {
+        crate::bail!(
+            "silu_q8_1: input size mismatch, need {} blocks, got {}",
+            num_blocks,
+            x_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("silu_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 256;
+    let num_cuda_blocks = num_blocks.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_cuda_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(&dst);
+    barg!(builder, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// GELU activation on Q8_1 tensor (tanh approximation)
+/// Used in GPT-2, BERT style models.
+fn gelu_q8_1_impl(
+    x: &PaddedCudaSlice,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if elem_count % block_size != 0 {
+        crate::bail!(
+            "gelu_q8_1: elem_count {} must be multiple of block_size {}",
+            elem_count,
+            block_size
+        )
+    }
+
+    let num_blocks = elem_count / block_size;
+    let output_size_bytes = num_blocks * type_size;
+
+    // Validate input size
+    let x_blocks = x.len / type_size;
+    if x_blocks < num_blocks {
+        crate::bail!(
+            "gelu_q8_1: input size mismatch, need {} blocks, got {}",
+            num_blocks,
+            x_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("gelu_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 256;
+    let num_cuda_blocks = num_blocks.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_cuda_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(&dst);
+    barg!(builder, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// RMSNorm on Q8_1 tensor: y = x / sqrt(mean(x^2) + eps) * weight
+/// Used in LLaMA, Mistral for layer normalization.
+#[allow(clippy::too_many_arguments)]
+fn rms_norm_q8_1_impl(
+    x: &PaddedCudaSlice,
+    weight: &CudaSlice<f32>,
+    num_rows: usize,
+    hidden_size: usize,
+    eps: f32,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if hidden_size % block_size != 0 {
+        crate::bail!(
+            "rms_norm_q8_1: hidden_size {} must be multiple of block_size {}",
+            hidden_size,
+            block_size
+        )
+    }
+
+    let num_blocks_per_row = hidden_size / block_size;
+    let total_blocks = num_rows * num_blocks_per_row;
+    let output_size_bytes = total_blocks * type_size;
+
+    // Validate input sizes
+    let x_blocks = x.len / type_size;
+    if x_blocks < total_blocks {
+        crate::bail!(
+            "rms_norm_q8_1: input size mismatch, need {} blocks, got {}",
+            total_blocks,
+            x_blocks
+        )
+    }
+    if weight.len() < hidden_size {
+        crate::bail!(
+            "rms_norm_q8_1: weight size mismatch, need {}, got {}",
+            hidden_size,
+            weight.len()
+        )
+    }
+
+    let func = dev.get_or_load_func("rms_norm_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // One CUDA block per row, 256 threads per block
+    let threads_per_block = 256;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_rows as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(weight);
+    builder.arg(&dst);
+    barg!(builder, eps, hidden_size as i32, num_blocks_per_row as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// LayerNorm on Q8_1 tensor: y = (x - mean) / sqrt(var + eps) * weight + bias
+/// Used in GPT-2, BERT style models.
+#[allow(clippy::too_many_arguments)]
+fn layer_norm_q8_1_impl(
+    x: &PaddedCudaSlice,
+    weight: &CudaSlice<f32>,
+    bias: Option<&CudaSlice<f32>>,
+    num_rows: usize,
+    hidden_size: usize,
+    eps: f32,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if hidden_size % block_size != 0 {
+        crate::bail!(
+            "layer_norm_q8_1: hidden_size {} must be multiple of block_size {}",
+            hidden_size,
+            block_size
+        )
+    }
+
+    let num_blocks_per_row = hidden_size / block_size;
+    let total_blocks = num_rows * num_blocks_per_row;
+    let output_size_bytes = total_blocks * type_size;
+
+    // Validate input sizes
+    let x_blocks = x.len / type_size;
+    if x_blocks < total_blocks {
+        crate::bail!(
+            "layer_norm_q8_1: input size mismatch, need {} blocks, got {}",
+            total_blocks,
+            x_blocks
+        )
+    }
+    if weight.len() < hidden_size {
+        crate::bail!(
+            "layer_norm_q8_1: weight size mismatch, need {}, got {}",
+            hidden_size,
+            weight.len()
+        )
+    }
+    if let Some(b) = bias {
+        if b.len() < hidden_size {
+            crate::bail!(
+                "layer_norm_q8_1: bias size mismatch, need {}, got {}",
+                hidden_size,
+                b.len()
+            )
+        }
+    }
+
+    let func = dev.get_or_load_func("layer_norm_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 256;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_rows as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(weight);
+
+    // Handle optional bias - pass null pointer if None
+    if let Some(b) = bias {
+        builder.arg(b);
+    } else {
+        let null_ptr: u64 = 0;
+        builder.arg(&null_ptr);
+    }
+
+    builder.arg(&dst);
+    barg!(builder, eps, hidden_size as i32, num_blocks_per_row as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Contiguous RoPE on Q8_1 tensor
+/// Pairs first half with second half: x[i] with x[i + d/2]
+#[allow(clippy::too_many_arguments)]
+fn rope_q8_1_impl(
+    x: &PaddedCudaSlice,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    batch_heads: usize,    // batch * num_heads
+    seq_len: usize,
+    head_dim: usize,       // must be multiple of 64
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if head_dim % 64 != 0 {
+        crate::bail!(
+            "rope_q8_1: head_dim {} must be multiple of 64 (2 Q8_1 blocks)",
+            head_dim
+        )
+    }
+
+    let num_blocks_per_head = head_dim / block_size;
+    let total_blocks = batch_heads * seq_len * num_blocks_per_head;
+    let output_size_bytes = total_blocks * type_size;
+
+    // Validate sizes
+    let x_blocks = x.len / type_size;
+    if x_blocks < total_blocks {
+        crate::bail!(
+            "rope_q8_1: input size mismatch, need {} blocks, got {}",
+            total_blocks,
+            x_blocks
+        )
+    }
+
+    let expected_cs_len = seq_len * head_dim / 2;
+    if cos.len() < expected_cs_len || sin.len() < expected_cs_len {
+        crate::bail!(
+            "rope_q8_1: cos/sin size mismatch, need {}, got cos={}, sin={}",
+            expected_cs_len,
+            cos.len(),
+            sin.len()
+        )
+    }
+
+    let func = dev.get_or_load_func("rope_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // Grid: (half_blocks, seq_len, batch_heads)
+    let half_blocks = num_blocks_per_head / 2;
+    let threads_per_block = 32.min(half_blocks);
+    let blocks_x = half_blocks.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (blocks_x as u32, seq_len as u32, batch_heads as u32),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(cos);
+    builder.arg(sin);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        0i32, // num_heads not used in kernel (bh is flat)
+        seq_len as i32,
+        head_dim as i32,
+        num_blocks_per_head as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Interleaved RoPE on Q8_1 tensor
+/// Pairs adjacent elements: x[2i] with x[2i+1]
+#[allow(clippy::too_many_arguments)]
+fn rope_i_q8_1_impl(
+    x: &PaddedCudaSlice,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    batch_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if head_dim % block_size != 0 {
+        crate::bail!(
+            "rope_i_q8_1: head_dim {} must be multiple of block_size {}",
+            head_dim,
+            block_size
+        )
+    }
+
+    let num_blocks_per_head = head_dim / block_size;
+    let total_blocks = batch_heads * seq_len * num_blocks_per_head;
+    let output_size_bytes = total_blocks * type_size;
+
+    let x_blocks = x.len / type_size;
+    if x_blocks < total_blocks {
+        crate::bail!(
+            "rope_i_q8_1: input size mismatch, need {} blocks, got {}",
+            total_blocks,
+            x_blocks
+        )
+    }
+
+    let expected_cs_len = seq_len * head_dim / 2;
+    if cos.len() < expected_cs_len || sin.len() < expected_cs_len {
+        crate::bail!(
+            "rope_i_q8_1: cos/sin size mismatch, need {}, got cos={}, sin={}",
+            expected_cs_len,
+            cos.len(),
+            sin.len()
+        )
+    }
+
+    let func = dev.get_or_load_func("rope_i_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 32.min(num_blocks_per_head);
+    let blocks_x = num_blocks_per_head.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (blocks_x as u32, seq_len as u32, batch_heads as u32),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(cos);
+    builder.arg(sin);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        0i32,
+        seq_len as i32,
+        head_dim as i32,
+        num_blocks_per_head as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Softmax on Q8_1 tensor
+/// Each row is independently normalized
+fn softmax_q8_1_impl(
+    x: &PaddedCudaSlice,
+    num_rows: usize,
+    seq_len: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    // seq_len might not be multiple of 32, so we pad
+    let seq_len_padded = seq_len.div_ceil(block_size) * block_size;
+    let num_blocks_per_row = seq_len_padded / block_size;
+    let total_blocks = num_rows * num_blocks_per_row;
+    let output_size_bytes = total_blocks * type_size;
+
+    let x_blocks = x.len / type_size;
+    if x_blocks < total_blocks {
+        crate::bail!(
+            "softmax_q8_1: input size mismatch, need {} blocks, got {}",
+            total_blocks,
+            x_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("softmax_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // One CUDA block per row
+    let threads_per_block = 256;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_rows as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&x.inner);
+    builder.arg(&dst);
+    barg!(builder, seq_len as i32, num_blocks_per_row as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Q8_1 × Q8_1 matrix multiplication with F32 output
+/// Computes C = A @ B^T where A is [M, K] and B is [N, K] (B transposed)
+/// Output is F32 [M, N], can be quantized to Q8_1 separately if needed
+#[allow(clippy::too_many_arguments)]
+fn matmul_q8_1_q8_1_f32out_impl(
+    a: &PaddedCudaSlice,
+    b: &PaddedCudaSlice,
+    m: usize,
+    k: usize,
+    n: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if k % block_size != 0 {
+        crate::bail!(
+            "matmul_q8_1_q8_1: K={} must be multiple of block_size {}",
+            k,
+            block_size
+        )
+    }
+
+    let blocks_k = k / block_size;
+    let a_total_blocks = m * blocks_k;
+    let b_total_blocks = n * blocks_k;
+
+    // Validate input sizes
+    let a_blocks = a.len / type_size;
+    let b_blocks = b.len / type_size;
+    if a_blocks < a_total_blocks {
+        crate::bail!(
+            "matmul_q8_1_q8_1: A size mismatch, need {} blocks, got {}",
+            a_total_blocks,
+            a_blocks
+        )
+    }
+    if b_blocks < b_total_blocks {
+        crate::bail!(
+            "matmul_q8_1_q8_1: B size mismatch, need {} blocks, got {}",
+            b_total_blocks,
+            b_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("matmul_q8_1_q8_1_f32out", &candle_kernels::QUANTIZED)?;
+
+    // Grid configuration: each thread computes one output element
+    let block_dim = (16u32, 16u32, 1u32);
+    let grid_dim = (
+        n.div_ceil(16) as u32,
+        m.div_ceil(16) as u32,
+        1u32,
+    );
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim,
+        block_dim,
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(m * n)? };
+
+    let mut builder = func.builder();
+    builder.arg(&a.inner);
+    builder.arg(&b.inner);
+    builder.arg(&dst);
+    barg!(builder, m as i32, k as i32, n as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Batched Q8_1 × Q8_1 matrix multiplication with F32 output
+/// For attention: computes batch independent A @ B^T operations
+/// A: [batch, M, K], B: [batch, N, K] (transposed), C: [batch, M, N]
+#[allow(clippy::too_many_arguments)]
+fn batched_matmul_q8_1_q8_1_f32out_impl(
+    a: &PaddedCudaSlice,
+    b: &PaddedCudaSlice,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if k % block_size != 0 {
+        crate::bail!(
+            "batched_matmul_q8_1_q8_1: K={} must be multiple of block_size {}",
+            k,
+            block_size
+        )
+    }
+
+    let blocks_k = k / block_size;
+    let a_total_blocks = batch * m * blocks_k;
+    let b_total_blocks = batch * n * blocks_k;
+
+    let a_blocks = a.len / type_size;
+    let b_blocks = b.len / type_size;
+    if a_blocks < a_total_blocks {
+        crate::bail!(
+            "batched_matmul_q8_1_q8_1: A size mismatch, need {} blocks, got {}",
+            a_total_blocks,
+            a_blocks
+        )
+    }
+    if b_blocks < b_total_blocks {
+        crate::bail!(
+            "batched_matmul_q8_1_q8_1: B size mismatch, need {} blocks, got {}",
+            b_total_blocks,
+            b_blocks
+        )
+    }
+
+    let func = dev.get_or_load_func("batched_matmul_q8_1_q8_1_f32out", &candle_kernels::QUANTIZED)?;
+
+    let block_dim = (16u32, 16u32, 1u32);
+    let grid_dim = (
+        n.div_ceil(16) as u32,
+        m.div_ceil(16) as u32,
+        batch as u32,
+    );
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim,
+        block_dim,
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<f32>(batch * m * n)? };
+
+    let mut builder = func.builder();
+    builder.arg(&a.inner);
+    builder.arg(&b.inner);
+    builder.arg(&dst);
+    barg!(builder, batch as i32, m as i32, k as i32, n as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Embedding lookup from Q8_1 embedding table
+/// weight: [vocab_size, hidden_size] as Q8_1
+/// input_ids: [batch_size] as i32
+/// output: [batch_size, hidden_size] as Q8_1
+fn embedding_lookup_q8_1_impl(
+    weight: &PaddedCudaSlice,
+    input_ids: &CudaSlice<i32>,
+    batch_size: usize,
+    hidden_size: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size(); // 32
+    let type_size = GgmlDType::Q8_1.type_size();   // 36 bytes
+
+    if hidden_size % block_size != 0 {
+        crate::bail!(
+            "embedding_lookup_q8_1: hidden_size {} must be multiple of {}",
+            hidden_size,
+            block_size
+        )
+    }
+
+    let blocks_per_row = hidden_size / block_size;
+    let output_blocks = batch_size * blocks_per_row;
+    let output_size_bytes = output_blocks * type_size;
+
+    let func = dev.get_or_load_func("embedding_lookup_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // Grid: (batch_size, ceil(blocks_per_row / 256))
+    let threads_per_block = 256.min(blocks_per_row);
+    let blocks_y = blocks_per_row.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (batch_size as u32, blocks_y as u32, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(&weight.inner);
+    builder.arg(input_ids);
+    builder.arg(&dst);
+    barg!(builder, batch_size as i32, hidden_size as i32, blocks_per_row as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Append new K/V to quantized cache
+#[allow(clippy::too_many_arguments)]
+fn kv_cache_append_q8_1_impl(
+    cache: &mut CudaSlice<u8>,
+    new_kv: &PaddedCudaSlice,
+    seq_pos: usize,
+    batch_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let block_size = GgmlDType::Q8_1.block_size();
+    let type_size = GgmlDType::Q8_1.type_size();
+
+    if head_dim % block_size != 0 {
+        crate::bail!(
+            "kv_cache_append_q8_1: head_dim {} must be multiple of {}",
+            head_dim,
+            block_size
+        )
+    }
+
+    let blocks_per_head = head_dim / block_size;
+
+    let func = dev.get_or_load_func("kv_cache_append_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 32.min(blocks_per_head);
+    let blocks_z = blocks_per_head.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (batch_size as u32, num_heads as u32, blocks_z as u32),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(cache);
+    builder.arg(&new_kv.inner);
+    barg!(
+        builder,
+        seq_pos as i32,
+        batch_size as i32,
+        num_heads as i32,
+        head_dim as i32,
+        max_seq_len as i32,
+        blocks_per_head as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(())
+}
+
+/// Get slice of KV cache
+#[allow(clippy::too_many_arguments)]
+fn kv_cache_slice_q8_1_impl(
+    cache: &CudaSlice<u8>,
+    start_pos: usize,
+    slice_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    dev: &CudaDevice,
+) -> Result<QCudaStorage> {
+    let block_size = GgmlDType::Q8_1.block_size();
+    let type_size = GgmlDType::Q8_1.type_size();
+
+    let blocks_per_head = head_dim / block_size;
+    let output_blocks = slice_len * num_heads * blocks_per_head;
+    let output_size_bytes = output_blocks * type_size;
+
+    let func = dev.get_or_load_func("kv_cache_slice_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 32.min(blocks_per_head);
+    let blocks_z = blocks_per_head.div_ceil(threads_per_block);
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (slice_len as u32, num_heads as u32, blocks_z as u32),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let dst = unsafe { dev.alloc::<u8>(output_size_bytes)? };
+
+    let mut builder = func.builder();
+    builder.arg(cache);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        start_pos as i32,
+        slice_len as i32,
+        num_heads as i32,
+        blocks_per_head as i32,
+        max_seq_len as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner: dst,
+            len: output_size_bytes,
+        },
+        dtype: GgmlDType::Q8_1,
+        device: dev.clone(),
+    })
+}
+
+/// Top-k selection from Q8_1 logits
+/// Returns top k indices and their dequantized values
+fn topk_q8_1_impl(
+    logits: &PaddedCudaSlice,
+    vocab_size: usize,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<(CudaSlice<i32>, CudaSlice<f32>)> {
+    let block_size = GgmlDType::Q8_1.block_size();
+    let num_blocks = vocab_size.div_ceil(block_size);
+
+    let func = dev.get_or_load_func("topk_q8_1", &candle_kernels::QUANTIZED)?;
+
+    // Single block kernel with shared memory for top-k
+    let threads_per_block = 256;
+    let shared_mem = (k * std::mem::size_of::<f32>() + k * std::mem::size_of::<i32>()) as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: shared_mem,
+    };
+
+    let indices = unsafe { dev.alloc::<i32>(k)? };
+    let values = unsafe { dev.alloc::<f32>(k)? };
+
+    let mut builder = func.builder();
+    builder.arg(&logits.inner);
+    builder.arg(&indices);
+    builder.arg(&values);
+    barg!(builder, vocab_size as i32, k as i32, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok((indices, values))
+}
+
+/// Argmax from Q8_1 logits (greedy decoding)
+fn argmax_q8_1_impl(
+    logits: &PaddedCudaSlice,
+    vocab_size: usize,
+    dev: &CudaDevice,
+) -> Result<(i32, f32)> {
+    let block_size = GgmlDType::Q8_1.block_size();
+    let num_blocks = vocab_size.div_ceil(block_size);
+
+    let func = dev.get_or_load_func("argmax_q8_1", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 256;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let result_idx = unsafe { dev.alloc::<i32>(1)? };
+    let result_val = unsafe { dev.alloc::<f32>(1)? };
+
+    let mut builder = func.builder();
+    builder.arg(&logits.inner);
+    builder.arg(&result_idx);
+    builder.arg(&result_val);
+    barg!(builder, vocab_size as i32, num_blocks as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    // Copy results back to host
+    let idx = dev.clone_dtoh(&result_idx)?;
+    let val = dev.clone_dtoh(&result_val)?;
+
+    Ok((idx[0], val[0]))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mul_mat_via_q8_1(
     data: &PaddedCudaSlice,
@@ -983,6 +2090,417 @@ impl QCudaStorage {
         } else {
             self.dequantize_matmul(self_shape, storage, layout)
         }
+    }
+
+    /// Forward pass that outputs Q8_1 quantized data instead of float.
+    /// This is the key method for the fully quantized pipeline.
+    ///
+    /// # Arguments
+    /// * `self_shape` - Shape of the weight matrix (nrows, ncols)
+    /// * `input` - Q8_1 quantized input activations
+    /// * `input_shape` - Shape of input: [batch, ncols] or [batch, m, ncols]
+    ///
+    /// # Returns
+    /// Q8_1 quantized output and its shape [batch, nrows] or [batch, m, nrows]
+    pub fn fwd_q8out(
+        &self,
+        self_shape: &crate::Shape,
+        input: &QCudaStorage,
+        input_shape: &crate::Shape,
+    ) -> Result<(QCudaStorage, crate::Shape)> {
+        // Validate input is Q8_1
+        if input.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "fwd_q8out requires Q8_1 input, got {:?}",
+                input.dtype()
+            )
+        }
+
+        let (nrows, ncols) = self_shape.dims2()?;
+        let (b_size, k) = match input_shape.dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => crate::bail!("unexpected input shape in fwd_q8out {:?}", input_shape),
+        };
+
+        if ncols != k {
+            crate::bail!(
+                "mismatch on matmul dim {self_shape:?} vs input {:?}",
+                input_shape
+            )
+        }
+
+        if b_size > 8 {
+            crate::bail!(
+                "fwd_q8out only supports batch sizes 1-8, got {}",
+                b_size
+            )
+        }
+
+        let out = mul_mat_vec_via_q8_1_q8out(
+            &self.data,
+            &input.data,
+            self.dtype,
+            ncols,
+            nrows,
+            b_size,
+            self.device(),
+        )?;
+
+        // Build output shape: same as input but with nrows instead of ncols
+        let out_shape = match input_shape.dims() {
+            [b, _m, _k] => crate::Shape::from((*b, nrows)),
+            [b, _k] => crate::Shape::from((*b, nrows)),
+            _ => unreachable!(),
+        };
+
+        Ok((out, out_shape))
+    }
+
+    /// Element-wise addition of two Q8_1 tensors: self + other
+    /// Used for residual connections in transformer blocks.
+    ///
+    /// # Arguments
+    /// * `other` - Another Q8_1 tensor with the same element count
+    /// * `elem_count` - Total number of elements (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor containing element-wise sum
+    pub fn add_q8_1(&self, other: &QCudaStorage, elem_count: usize) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("add_q8_1 requires Q8_1 self, got {:?}", self.dtype())
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("add_q8_1 requires Q8_1 other, got {:?}", other.dtype())
+        }
+
+        add_q8_1_impl(&self.data, &other.data, elem_count, &self.device)
+    }
+
+    /// Element-wise multiplication of two Q8_1 tensors: self * other
+    /// Used for gate * up in SwiGLU MLP blocks.
+    ///
+    /// # Arguments
+    /// * `other` - Another Q8_1 tensor with the same element count
+    /// * `elem_count` - Total number of elements (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor containing element-wise product
+    pub fn mul_q8_1(&self, other: &QCudaStorage, elem_count: usize) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("mul_q8_1 requires Q8_1 self, got {:?}", self.dtype())
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("mul_q8_1 requires Q8_1 other, got {:?}", other.dtype())
+        }
+
+        mul_q8_1_impl(&self.data, &other.data, elem_count, &self.device)
+    }
+
+    /// SiLU (Swish) activation: y = x * sigmoid(x)
+    /// Used in LLaMA, Mistral MLP blocks to keep activations quantized.
+    ///
+    /// # Arguments
+    /// * `elem_count` - Total number of elements (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor with SiLU applied element-wise
+    pub fn silu_q8_1(&self, elem_count: usize) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("silu_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        silu_q8_1_impl(&self.data, elem_count, &self.device)
+    }
+
+    /// GELU activation (tanh approximation)
+    /// Used in GPT-2, BERT style models to keep activations quantized.
+    ///
+    /// # Arguments
+    /// * `elem_count` - Total number of elements (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor with GELU applied element-wise
+    pub fn gelu_q8_1(&self, elem_count: usize) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("gelu_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        gelu_q8_1_impl(&self.data, elem_count, &self.device)
+    }
+
+    /// RMSNorm: y = x / sqrt(mean(x^2) + eps) * weight
+    /// Used in LLaMA, Mistral for layer normalization while keeping activations quantized.
+    ///
+    /// # Arguments
+    /// * `weight` - F32 weight tensor of shape [hidden_size]
+    /// * `num_rows` - Number of rows (batch * seq_len)
+    /// * `hidden_size` - Hidden dimension (must be multiple of 32)
+    /// * `eps` - Epsilon for numerical stability
+    ///
+    /// # Returns
+    /// Q8_1 tensor with RMSNorm applied
+    pub fn rms_norm_q8_1(
+        &self,
+        weight: &CudaStorage,
+        num_rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("rms_norm_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        let weight_f32 = weight.as_cuda_slice::<f32>()?;
+        rms_norm_q8_1_impl(&self.data, weight_f32, num_rows, hidden_size, eps, &self.device)
+    }
+
+    /// LayerNorm: y = (x - mean) / sqrt(var + eps) * weight + bias
+    /// Used in GPT-2, BERT style models while keeping activations quantized.
+    ///
+    /// # Arguments
+    /// * `weight` - F32 weight tensor of shape [hidden_size]
+    /// * `bias` - Optional F32 bias tensor of shape [hidden_size]
+    /// * `num_rows` - Number of rows (batch * seq_len)
+    /// * `hidden_size` - Hidden dimension (must be multiple of 32)
+    /// * `eps` - Epsilon for numerical stability
+    ///
+    /// # Returns
+    /// Q8_1 tensor with LayerNorm applied
+    pub fn layer_norm_q8_1(
+        &self,
+        weight: &CudaStorage,
+        bias: Option<&CudaStorage>,
+        num_rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("layer_norm_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        let weight_f32 = weight.as_cuda_slice::<f32>()?;
+        let bias_f32 = match bias {
+            Some(b) => Some(b.as_cuda_slice::<f32>()?),
+            None => None,
+        };
+
+        layer_norm_q8_1_impl(
+            &self.data,
+            weight_f32,
+            bias_f32.as_ref(),
+            num_rows,
+            hidden_size,
+            eps,
+            &self.device,
+        )
+    }
+
+    /// Contiguous RoPE (Rotary Position Embeddings)
+    /// Pairs x[i] with x[i + head_dim/2]
+    ///
+    /// # Arguments
+    /// * `cos` - F32 cosine values [seq_len, head_dim/2]
+    /// * `sin` - F32 sine values [seq_len, head_dim/2]
+    /// * `batch_heads` - batch_size * num_heads
+    /// * `seq_len` - sequence length
+    /// * `head_dim` - head dimension (must be multiple of 64)
+    ///
+    /// # Returns
+    /// Q8_1 tensor with RoPE applied
+    pub fn rope_q8_1(
+        &self,
+        cos: &CudaStorage,
+        sin: &CudaStorage,
+        batch_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("rope_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        let cos_f32 = cos.as_cuda_slice::<f32>()?;
+        let sin_f32 = sin.as_cuda_slice::<f32>()?;
+        rope_q8_1_impl(&self.data, cos_f32, sin_f32, batch_heads, seq_len, head_dim, &self.device)
+    }
+
+    /// Interleaved RoPE (Rotary Position Embeddings)
+    /// Pairs x[2i] with x[2i+1]
+    ///
+    /// # Arguments
+    /// * `cos` - F32 cosine values [seq_len, head_dim/2]
+    /// * `sin` - F32 sine values [seq_len, head_dim/2]
+    /// * `batch_heads` - batch_size * num_heads
+    /// * `seq_len` - sequence length
+    /// * `head_dim` - head dimension (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor with interleaved RoPE applied
+    pub fn rope_i_q8_1(
+        &self,
+        cos: &CudaStorage,
+        sin: &CudaStorage,
+        batch_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("rope_i_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        let cos_f32 = cos.as_cuda_slice::<f32>()?;
+        let sin_f32 = sin.as_cuda_slice::<f32>()?;
+        rope_i_q8_1_impl(&self.data, cos_f32, sin_f32, batch_heads, seq_len, head_dim, &self.device)
+    }
+
+    /// Softmax on Q8_1 tensor
+    /// Each row is independently normalized: softmax(x) = exp(x - max) / sum(exp(x - max))
+    ///
+    /// # Arguments
+    /// * `num_rows` - Number of rows (each softmax is independent)
+    /// * `seq_len` - Sequence length (elements per row)
+    ///
+    /// # Returns
+    /// Q8_1 tensor with softmax applied per row
+    pub fn softmax_q8_1(&self, num_rows: usize, seq_len: usize) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("softmax_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        softmax_q8_1_impl(&self.data, num_rows, seq_len, &self.device)
+    }
+
+    /// Q8_1 × Q8_1 matrix multiplication with F32 output
+    /// Computes C = A @ B^T where A is [M, K] and B is [N, K] (B transposed)
+    ///
+    /// This is useful for attention where we compute Q @ K^T.
+    /// Output is F32, which can be scaled, masked, then quantized back to Q8_1.
+    ///
+    /// # Arguments
+    /// * `other` - Q8_1 tensor B of shape [N, K] (transposed)
+    /// * `m` - Number of rows in A (query sequence length)
+    /// * `k` - Shared dimension (head_dim, must be multiple of 32)
+    /// * `n` - Number of rows in B (key sequence length)
+    ///
+    /// # Returns
+    /// F32 CudaStorage of shape [M, N]
+    pub fn matmul_q8_1_f32out(
+        &self,
+        other: &QCudaStorage,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("matmul_q8_1_f32out requires Q8_1 self, got {:?}", self.dtype())
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("matmul_q8_1_f32out requires Q8_1 other, got {:?}", other.dtype())
+        }
+
+        matmul_q8_1_q8_1_f32out_impl(&self.data, &other.data, m, k, n, &self.device)
+    }
+
+    /// Batched Q8_1 × Q8_1 matrix multiplication with F32 output
+    /// Computes C = A @ B^T for each batch independently
+    /// A: [batch, M, K], B: [batch, N, K] (transposed), C: [batch, M, N]
+    ///
+    /// For multi-head attention: batch = num_heads (or batch_size * num_heads)
+    ///
+    /// # Arguments
+    /// * `other` - Q8_1 tensor B of shape [batch, N, K]
+    /// * `batch` - Batch size (e.g., num_heads)
+    /// * `m` - Number of rows in A per batch
+    /// * `k` - Shared dimension (must be multiple of 32)
+    /// * `n` - Number of rows in B per batch
+    ///
+    /// # Returns
+    /// F32 CudaStorage of shape [batch, M, N]
+    pub fn batched_matmul_q8_1_f32out(
+        &self,
+        other: &QCudaStorage,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("batched_matmul_q8_1_f32out requires Q8_1 self, got {:?}", self.dtype())
+        }
+        if other.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("batched_matmul_q8_1_f32out requires Q8_1 other, got {:?}", other.dtype())
+        }
+
+        batched_matmul_q8_1_q8_1_f32out_impl(&self.data, &other.data, batch, m, k, n, &self.device)
+    }
+
+    /// Embedding lookup from Q8_1 embedding table
+    /// Looks up token embeddings and returns Q8_1 activations.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs as i32 CudaStorage [batch_size]
+    /// * `batch_size` - Number of tokens to look up
+    /// * `vocab_size` - Size of vocabulary (for bounds checking)
+    /// * `hidden_size` - Embedding dimension (must be multiple of 32)
+    ///
+    /// # Returns
+    /// Q8_1 tensor of shape [batch_size, hidden_size]
+    pub fn embedding_lookup(
+        &self,
+        input_ids: &CudaStorage,
+        batch_size: usize,
+        hidden_size: usize,
+    ) -> Result<QCudaStorage> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!(
+                "embedding_lookup requires Q8_1 weights, got {:?}",
+                self.dtype()
+            )
+        }
+
+        let ids = input_ids.as_cuda_slice::<i32>()?;
+        embedding_lookup_q8_1_impl(&self.data, ids, batch_size, hidden_size, &self.device)
+    }
+
+    /// Top-k selection from Q8_1 logits
+    /// Finds the k largest values and returns their indices and dequantized values.
+    /// Only dequantizes k values instead of the entire vocab.
+    ///
+    /// # Arguments
+    /// * `vocab_size` - Total vocabulary size
+    /// * `k` - Number of top values to return
+    ///
+    /// # Returns
+    /// (indices: Vec<i32>, values: Vec<f32>) - Top k indices and their values, sorted descending
+    pub fn topk_q8_1(&self, vocab_size: usize, k: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("topk_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        let (indices_cuda, values_cuda) = topk_q8_1_impl(&self.data, vocab_size, k, &self.device)?;
+
+        // Copy back to host
+        let indices = self.device.clone_dtoh(&indices_cuda)?;
+        let values = self.device.clone_dtoh(&values_cuda)?;
+
+        Ok((indices, values))
+    }
+
+    /// Argmax from Q8_1 logits (greedy decoding)
+    /// Returns the index and value of the maximum element.
+    ///
+    /// # Arguments
+    /// * `vocab_size` - Total vocabulary size
+    ///
+    /// # Returns
+    /// (index: i32, value: f32) - Index and dequantized value of the maximum
+    pub fn argmax_q8_1(&self, vocab_size: usize) -> Result<(i32, f32)> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("argmax_q8_1 requires Q8_1 input, got {:?}", self.dtype())
+        }
+
+        argmax_q8_1_impl(&self.data, vocab_size, &self.device)
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
