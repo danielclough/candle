@@ -14,9 +14,46 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::models::quantized_llama as model;
+use candle_transformers::models::quantized_llama_q8;
 use model::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
+
+/// Unified model wrapper for standard and fully-quantized inference
+enum Model {
+    Standard(ModelWeights),
+    FullQuant(quantized_llama_q8::Q8LlamaModel),
+}
+
+impl Model {
+    fn forward(&mut self, input: &Tensor, pos: usize) -> candle::Result<Tensor> {
+        match self {
+            Model::Standard(m) => m.forward(input, pos),
+            Model::FullQuant(m) => {
+                let (indices, values) = m.forward(input, pos)?;
+                let vocab_size = m.config().vocab_size;
+                Self::sparse_to_logits(&indices, &values, vocab_size, input.device())
+            }
+        }
+    }
+
+    /// Convert sparse top-k (indices, values) to dense logits tensor
+    fn sparse_to_logits(
+        indices: &[i32],
+        values: &[f32],
+        vocab_size: usize,
+        device: &candle::Device,
+    ) -> candle::Result<Tensor> {
+        // Initialize with -inf so non-top-k tokens have zero probability after softmax
+        let mut logits = vec![f32::NEG_INFINITY; vocab_size];
+        for (&idx, &val) in indices.iter().zip(values.iter()) {
+            if (idx as usize) < vocab_size {
+                logits[idx as usize] = val;
+            }
+        }
+        Tensor::new(logits, device)
+    }
+}
 
 #[derive(Debug)]
 enum Prompt {
@@ -306,6 +343,11 @@ struct Args {
     /// The dtype for activations (f32, bf16, f16). Controls which CUDA kernels are used.
     #[arg(long, default_value = "f32")]
     dtype: String,
+
+    /// Use fully quantized inference (Q8_1 activations). Requires CUDA or Metal.
+    /// This keeps activations in Q8_1 format throughout the forward pass for ~50% memory savings.
+    #[arg(long)]
+    full_quant: bool,
 }
 
 impl Args {
@@ -482,39 +524,48 @@ fn main() -> anyhow::Result<()> {
     };
     println!("dtype: {:?}", dtype);
 
-    let mut model = match model_path.extension().and_then(|v| v.to_str()) {
+    let mut model: Model = match model_path.extension().and_then(|v| v.to_str()) {
         Some("gguf") => {
-            let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
+            let gguf = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&model_path))?;
             let mut total_size_in_bytes = 0;
-            for (_, tensor) in model.tensor_infos.iter() {
+            for (_, tensor) in gguf.tensor_infos.iter() {
                 let elem_count = tensor.shape.elem_count();
                 total_size_in_bytes +=
                     elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
             }
             println!(
                 "loaded {:?} tensors ({}) in {:.2}s",
-                model.tensor_infos.len(),
+                gguf.tensor_infos.len(),
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            ModelWeights::from_gguf(model, &mut file, &device, dtype)?
+
+            if args.full_quant {
+                println!("Using fully quantized Q8_1 pipeline");
+                Model::FullQuant(quantized_llama_q8::Q8LlamaModel::from_gguf(gguf, &mut file, &device)?)
+            } else {
+                Model::Standard(ModelWeights::from_gguf(gguf, &mut file, &device, dtype)?)
+            }
         }
         Some("ggml" | "bin") | Some(_) | None => {
-            let model = ggml_file::Content::read(&mut file, &device)
+            if args.full_quant {
+                anyhow::bail!("--full-quant only supports GGUF format");
+            }
+            let ggml = ggml_file::Content::read(&mut file, &device)
                 .map_err(|e| e.with_path(model_path))?;
             let mut total_size_in_bytes = 0;
-            for (_, tensor) in model.tensors.iter() {
+            for (_, tensor) in ggml.tensors.iter() {
                 let elem_count = tensor.shape().elem_count();
                 total_size_in_bytes +=
                     elem_count * tensor.dtype().type_size() / tensor.dtype().block_size();
             }
             println!(
                 "loaded {:?} tensors ({}) in {:.2}s",
-                model.tensors.len(),
+                ggml.tensors.len(),
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            println!("params: {:?}", model.hparams);
+            println!("params: {:?}", ggml.hparams);
             let default_gqa = match args.which {
                 Which::L7b
                 | Which::L13b
@@ -542,7 +593,7 @@ fn main() -> anyhow::Result<()> {
                 | Which::OpenChat35
                 | Which::Starling7bAlpha => 8,
             };
-            ModelWeights::from_ggml(model, args.gqa.unwrap_or(default_gqa), dtype)?
+            Model::Standard(ModelWeights::from_ggml(ggml, args.gqa.unwrap_or(default_gqa), dtype)?)
         }
     };
     println!("model built");

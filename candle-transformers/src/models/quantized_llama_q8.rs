@@ -24,14 +24,9 @@
 //!     → RMSNorm → Q8_1 → MLP (SiLU) → Q8_1 → Residual → Q8_1
 //! ```
 
-use candle::{Device, Result, Tensor, DType};
-use candle::quantized::gguf_file;
-use candle::quantized::{QTensor, GgmlDType};
-
-#[cfg(feature = "cuda")]
-use candle::quantized::cuda::QCudaStorage;
-#[cfg(feature = "cuda")]
-use candle::{CudaDevice, CudaStorage};
+use candle::{Device, Result, Tensor, DType, Shape};
+use candle::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
+use std::sync::Arc;
 
 /// Configuration for fully quantized LLaMA model
 #[derive(Debug, Clone)]
@@ -66,65 +61,20 @@ impl Default for Q8Config {
     }
 }
 
-/// Q8_1 KV Cache for a single layer
-/// Stores K and V as Q8_1 tensors for ~4x memory reduction vs F16
-#[cfg(feature = "cuda")]
-#[derive(Debug)]
-pub struct Q8KvCache {
-    k_cache: QCudaStorage,
-    v_cache: QCudaStorage,
-    max_seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-    current_len: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl Q8KvCache {
-    pub fn new(
-        max_seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        device: &CudaDevice,
-    ) -> Result<Self> {
-        let elem_count = max_seq_len * num_heads * head_dim;
-        let k_cache = QCudaStorage::zeros(device, elem_count, GgmlDType::Q8_1)?;
-        let v_cache = QCudaStorage::zeros(device, elem_count, GgmlDType::Q8_1)?;
-
-        Ok(Self {
-            k_cache,
-            v_cache,
-            max_seq_len,
-            num_heads,
-            head_dim,
-            current_len: 0,
-        })
-    }
-
-    pub fn current_len(&self) -> usize {
-        self.current_len
-    }
-
-    pub fn reset(&mut self) {
-        self.current_len = 0;
-    }
-}
-
-/// Fully quantized attention layer
-#[cfg(feature = "cuda")]
+/// Fully quantized attention layer using device-agnostic types
 #[derive(Debug)]
 pub struct Q8Attention {
-    wq: QTensor,
-    wk: QTensor,
-    wv: QTensor,
-    wo: QTensor,
+    wq: QMatMul,
+    wk: QMatMul,
+    wv: QMatMul,
+    wo: QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    #[allow(dead_code)]
     scale: f32,
 }
 
-#[cfg(feature = "cuda")]
 impl Q8Attention {
     pub fn new(
         wq: QTensor,
@@ -134,406 +84,172 @@ impl Q8Attention {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let scale = 1.0 / (head_dim as f32).sqrt();
-        Self {
-            wq,
-            wk,
-            wv,
-            wo,
+        Ok(Self {
+            wq: QMatMul::from_qtensor(wq)?,
+            wk: QMatMul::from_qtensor(wk)?,
+            wv: QMatMul::from_qtensor(wv)?,
+            wo: QMatMul::from_qtensor(wo)?,
             num_heads,
             num_kv_heads,
             head_dim,
             scale,
-        }
+        })
     }
 
     /// Forward pass with Q8_1 activations
     ///
     /// # Arguments
-    /// * `x` - Q8_1 input [batch, seq_len, hidden_size]
-    /// * `cos` - Precomputed cosine for RoPE [seq_len, head_dim/2]
-    /// * `sin` - Precomputed sine for RoPE [seq_len, head_dim/2]
-    /// * `kv_cache` - Optional KV cache for incremental decoding
-    /// * `start_pos` - Starting position for KV cache
-    ///
-    /// For the fully quantized pipeline, this method:
-    /// 1. Projects Q, K, V using quantized matmul with Q8_1 output
-    /// 2. Applies RoPE in Q8_1 format
-    /// 3. Updates KV cache (Q8_1)
-    /// 4. Computes attention scores (Q8_1 × Q8_1 → F32 for scaling)
-    /// 5. Applies softmax (Q8_1)
-    /// 6. Computes output (Q8_1)
+    /// * `x` - Q8_1 input tensor
+    /// * `cos` - Precomputed cosine for RoPE
+    /// * `sin` - Precomputed sine for RoPE
     pub fn forward_q8(
         &self,
-        x: &QCudaStorage,
-        x_shape: (usize, usize, usize), // (batch, seq_len, hidden)
-        cos: &CudaStorage,
-        sin: &CudaStorage,
-        kv_cache: Option<&mut Q8KvCache>,
-        start_pos: usize,
-    ) -> Result<(QCudaStorage, (usize, usize, usize))> {
-        let (batch, seq_len, hidden) = x_shape;
-        let device = x.device();
-
-        // Get underlying QCudaStorage from QTensor for Q8_1 output operations
-        let wq_storage = match self.wq.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Attention requires CUDA storage"),
-        };
-        let wk_storage = match self.wk.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Attention requires CUDA storage"),
-        };
-        let wv_storage = match self.wv.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Attention requires CUDA storage"),
-        };
-        let wo_storage = match self.wo.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Attention requires CUDA storage"),
+        x: &QTensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<QTensor> {
+        let dims = x.shape().dims();
+        let (batch, seq_len, _hidden) = match dims.len() {
+            3 => (dims[0], dims[1], dims[2]),
+            2 => (1, dims[0], dims[1]),
+            _ => candle::bail!("Expected 2D or 3D input, got {:?}", dims),
         };
 
-        // Project Q, K, V with Q8_1 output
-        // Shape: [batch * seq_len, hidden] → [batch * seq_len, num_heads * head_dim]
-        let input_shape = candle::Shape::from((batch * seq_len, hidden));
+        // Project Q, K, V with Q8_1 output using device-agnostic method
+        // Note: This requires converting QTensor to Tensor for now
+        let x_tensor = x.dequantize(&x.device())?;
 
-        let (q, _) = wq_storage.fwd_q8out(self.wq.shape(), x, &input_shape)?;
-        let (k, _) = wk_storage.fwd_q8out(self.wk.shape(), x, &input_shape)?;
-        let (v, _) = wv_storage.fwd_q8out(self.wv.shape(), x, &input_shape)?;
-
-        // Reshape for attention: [batch, seq, heads, head_dim]
-        // For Q8_1, we work with the flat storage and track shapes manually
-        let q_heads = self.num_heads;
-        let kv_heads = self.num_kv_heads;
+        let q = self.wq.forward_q8out(&x_tensor)?;
+        let k = self.wk.forward_q8out(&x_tensor)?;
+        let v = self.wv.forward_q8out(&x_tensor)?;
 
         // Apply RoPE (Q8_1 → Q8_1)
-        let batch_heads_q = batch * q_heads;
-        let batch_heads_kv = batch * kv_heads;
-
+        let batch_heads_q = batch * self.num_heads;
         let q_rope = q.rope_q8_1(cos, sin, batch_heads_q, seq_len, self.head_dim)?;
-        let k_rope = k.rope_q8_1(cos, sin, batch_heads_kv, seq_len, self.head_dim)?;
+        let k_rope = k.rope_q8_1(cos, sin, batch * self.num_kv_heads, seq_len, self.head_dim)?;
 
-        // For simplicity in this example, we'll compute attention with F32 intermediate
-        // Full Q8_1 attention would use the batched matmul kernels
+        // For simplicity, dequantize for attention computation
+        // A full implementation would use Q8_1 matmul
+        let q_f = q_rope.dequantize(&q_rope.device())?;
+        let k_f = k_rope.dequantize(&k_rope.device())?;
+        let v_f = v.dequantize(&v.device())?;
 
-        // Compute Q @ K^T → F32 (for scaling and masking)
-        let scores = q_rope.batched_matmul_q8_1_f32out(
-            &k_rope,
-            batch_heads_q,  // batch dimension
-            seq_len,        // M (query seq len)
-            self.head_dim,  // K (head dim)
-            seq_len,        // N (key seq len, same as query for self-attn)
-        )?;
+        // Reshape for attention
+        let q_f = q_f.reshape((batch, self.num_heads, seq_len, self.head_dim))?;
+        let k_f = k_f.reshape((batch, self.num_kv_heads, seq_len, self.head_dim))?;
+        let v_f = v_f.reshape((batch, self.num_kv_heads, seq_len, self.head_dim))?;
 
-        // Scale scores (in F32)
-        // scores = scores * scale
-        // Then apply causal mask and softmax
-        // For now, we'll dequantize and use standard operations
-        // A full implementation would have Q8_1 versions of these
+        // Compute attention
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let attn = (q_f.matmul(&k_f.t()?)? * scale)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v_f)?;
 
-        // Project output
-        let output_shape = candle::Shape::from((batch * seq_len, q_heads * self.head_dim));
-        let (output, _) = wo_storage.fwd_q8out(self.wo.shape(), &v, &output_shape)?;
-
-        Ok((output, (batch, seq_len, hidden)))
+        // Reshape and project output
+        let out = out.transpose(1, 2)?.reshape((batch, seq_len, ()))?;
+        self.wo.forward_q8out(&out)
     }
 }
 
-/// Fully quantized MLP (SwiGLU)
-#[cfg(feature = "cuda")]
+/// Fully quantized MLP (SwiGLU) using device-agnostic types
 #[derive(Debug)]
 pub struct Q8Mlp {
-    gate_proj: QTensor,  // W1
-    up_proj: QTensor,    // W3
-    down_proj: QTensor,  // W2
+    gate_proj: QMatMul,  // W1
+    up_proj: QMatMul,    // W3
+    down_proj: QMatMul,  // W2
 }
 
-#[cfg(feature = "cuda")]
 impl Q8Mlp {
-    pub fn new(gate_proj: QTensor, up_proj: QTensor, down_proj: QTensor) -> Self {
-        Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        }
+    pub fn new(gate_proj: QTensor, up_proj: QTensor, down_proj: QTensor) -> Result<Self> {
+        Ok(Self {
+            gate_proj: QMatMul::from_qtensor(gate_proj)?,
+            up_proj: QMatMul::from_qtensor(up_proj)?,
+            down_proj: QMatMul::from_qtensor(down_proj)?,
+        })
     }
 
     /// Forward pass with Q8_1 activations
     /// Implements SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
-    pub fn forward_q8(
-        &self,
-        x: &QCudaStorage,
-        x_shape: (usize, usize),  // (batch * seq_len, hidden)
-    ) -> Result<(QCudaStorage, (usize, usize))> {
-        let (tokens, hidden) = x_shape;
-
-        let gate_storage = match self.gate_proj.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Mlp requires CUDA storage"),
-        };
-        let up_storage = match self.up_proj.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Mlp requires CUDA storage"),
-        };
-        let down_storage = match self.down_proj.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Q8Mlp requires CUDA storage"),
-        };
-
-        let input_shape = candle::Shape::from((tokens, hidden));
+    pub fn forward_q8(&self, x: &QTensor) -> Result<QTensor> {
+        // Convert to tensor for projection
+        let x_tensor = x.dequantize(&x.device())?;
 
         // gate = gate_proj(x) → Q8_1
-        let (gate, gate_shape) = gate_storage.fwd_q8out(self.gate_proj.shape(), x, &input_shape)?;
+        let gate = self.gate_proj.forward_q8out(&x_tensor)?;
 
         // up = up_proj(x) → Q8_1
-        let (up, _) = up_storage.fwd_q8out(self.up_proj.shape(), x, &input_shape)?;
+        let up = self.up_proj.forward_q8out(&x_tensor)?;
 
         // Apply SiLU to gate (Q8_1 → Q8_1)
-        let intermediate_size = gate_shape.dims()[1];
-        let gate_silu = gate.silu_q8_1(tokens * intermediate_size)?;
+        let gate_silu = gate.silu_q8_1()?;
 
         // gate_silu * up (Q8_1 × Q8_1 → Q8_1)
-        let hidden_states = gate_silu.mul_q8_1(&up, tokens * intermediate_size)?;
+        let hidden = gate_silu.mul_q8_1(&up)?;
 
-        // down_proj(hidden_states) → Q8_1
-        let down_input_shape = candle::Shape::from((tokens, intermediate_size));
-        let (output, output_shape) = down_storage.fwd_q8out(
-            self.down_proj.shape(),
-            &hidden_states,
-            &down_input_shape,
-        )?;
-
-        Ok((output, (tokens, hidden)))
+        // down_proj(hidden) → Q8_1
+        let hidden_tensor = hidden.dequantize(&hidden.device())?;
+        self.down_proj.forward_q8out(&hidden_tensor)
     }
 }
 
-/// Fully quantized transformer layer
-#[cfg(feature = "cuda")]
+/// Fully quantized transformer layer using device-agnostic types
 #[derive(Debug)]
 pub struct Q8TransformerLayer {
     attention: Q8Attention,
     mlp: Q8Mlp,
-    input_layernorm_weight: Tensor,  // RMSNorm weights stay F32
+    input_layernorm_weight: Tensor,
     post_attention_layernorm_weight: Tensor,
     rms_norm_eps: f32,
 }
 
-#[cfg(feature = "cuda")]
 impl Q8TransformerLayer {
     /// Forward pass keeping everything in Q8_1
     pub fn forward_q8(
         &self,
-        x: &QCudaStorage,
-        x_shape: (usize, usize, usize),
-        cos: &CudaStorage,
-        sin: &CudaStorage,
-        kv_cache: Option<&mut Q8KvCache>,
-        start_pos: usize,
-    ) -> Result<(QCudaStorage, (usize, usize, usize))> {
-        let (batch, seq_len, hidden) = x_shape;
-        let device = x.device();
-
-        // Get F32 weight storage for RMSNorm
-        let ln1_weight = match self.input_layernorm_weight.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-        let ln2_weight = match self.post_attention_layernorm_weight.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-
+        x: &QTensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<QTensor> {
         // RMSNorm (Q8_1 → Q8_1)
-        let normed = x.rms_norm_q8_1(ln1_weight, batch * seq_len, hidden, self.rms_norm_eps)?;
+        let normed = x.rms_norm_q8_1(&self.input_layernorm_weight, self.rms_norm_eps)?;
 
         // Attention (Q8_1 → Q8_1)
-        let (attn_out, _) = self.attention.forward_q8(
-            &normed,
-            x_shape,
-            cos,
-            sin,
-            kv_cache,
-            start_pos,
-        )?;
+        let attn_out = self.attention.forward_q8(&normed, cos, sin)?;
 
         // Residual (Q8_1 + Q8_1 → Q8_1)
-        let x = x.add_q8_1(&attn_out, batch * seq_len * hidden)?;
+        let x = x.add_q8_1(&attn_out)?;
 
         // RMSNorm (Q8_1 → Q8_1)
-        let normed = x.rms_norm_q8_1(ln2_weight, batch * seq_len, hidden, self.rms_norm_eps)?;
+        let normed = x.rms_norm_q8_1(&self.post_attention_layernorm_weight, self.rms_norm_eps)?;
 
         // MLP (Q8_1 → Q8_1)
-        let (mlp_out, _) = self.mlp.forward_q8(&normed, (batch * seq_len, hidden))?;
+        let mlp_out = self.mlp.forward_q8(&normed)?;
 
         // Residual (Q8_1 + Q8_1 → Q8_1)
-        let output = x.add_q8_1(&mlp_out, batch * seq_len * hidden)?;
-
-        Ok((output, (batch, seq_len, hidden)))
+        x.add_q8_1(&mlp_out)
     }
 }
 
-/// Fully quantized LLaMA model
-#[cfg(feature = "cuda")]
+/// Fully quantized LLaMA model using device-agnostic types
 pub struct Q8LlamaModel {
     pub config: Q8Config,
-    embed_tokens: QTensor,  // Embeddings stored as Q8_1
+    embed_tokens: Arc<QTensor>,
     layers: Vec<Q8TransformerLayer>,
-    norm: Tensor,           // Final RMSNorm weight (F32)
-    lm_head: QTensor,       // Output projection
-    cos: Tensor,            // Precomputed RoPE cosines
-    sin: Tensor,            // Precomputed RoPE sines
+    norm_weight: Tensor,
+    lm_head: QMatMul,
+    cos: Tensor,
+    sin: Tensor,
 }
 
-#[cfg(feature = "cuda")]
 impl Q8LlamaModel {
-    /// Forward pass with fully quantized activations
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs [batch, seq_len]
-    /// * `start_pos` - Starting position for KV cache
-    ///
-    /// # Returns
-    /// * Top-k token indices and their probabilities
-    pub fn forward(
-        &mut self,
-        input_ids: &Tensor,
-        start_pos: usize,
-    ) -> Result<(Vec<i32>, Vec<f32>)> {
-        let (batch, seq_len) = input_ids.dims2()?;
-        let device = input_ids.device();
-
-        // Get CUDA device
-        let cuda_device = match device {
-            Device::Cuda(d) => d,
-            _ => candle::bail!("Q8LlamaModel requires CUDA device"),
-        };
-
-        // Get embedding storage
-        let embed_storage = match self.embed_tokens.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA storage"),
-        };
-
-        // Convert input_ids to i32 for embedding lookup
-        let input_ids_i32 = input_ids.to_dtype(DType::I64)?;
-        let input_ids_storage = match input_ids_i32.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-
-        // Embedding lookup → Q8_1
-        // This is the entry point to the quantized pipeline
-        let input_ids_i32_slice = input_ids_storage.as_cuda_slice::<i64>()?;
-
-        // For simplicity, convert to i32 on host
-        let ids: Vec<i64> = cuda_device.clone_dtoh(&input_ids_i32_slice)?;
-        let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_cuda = cuda_device.clone_htod(&ids_i32)?;
-        let ids_storage = CudaStorage::wrap_cuda_slice(ids_cuda, cuda_device.clone());
-
-        let hidden_states = embed_storage.embedding_lookup(
-            &ids_storage,
-            batch * seq_len,
-            self.config.hidden_size,
-        )?;
-
-        // Get cos/sin for RoPE
-        let cos_storage = match self.cos.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-        let sin_storage = match self.sin.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-
-        // Forward through layers (all Q8_1)
-        let mut x = hidden_states;
-        let mut shape = (batch, seq_len, self.config.hidden_size);
-
-        for layer in &mut self.layers {
-            let (new_x, new_shape) = layer.forward_q8(
-                &x,
-                shape,
-                cos_storage,
-                sin_storage,
-                None,  // KV cache handling simplified for example
-                start_pos,
-            )?;
-            x = new_x;
-            shape = new_shape;
-        }
-
-        // Final RMSNorm
-        let norm_weight = match self.norm.storage_and_layout().0 {
-            candle::Storage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA"),
-        };
-        let normed = x.rms_norm_q8_1(
-            norm_weight,
-            batch * seq_len,
-            self.config.hidden_size,
-            self.config.rms_norm_eps,
-        )?;
-
-        // LM head projection → Q8_1 logits
-        let lm_head_storage = match self.lm_head.storage() {
-            candle::quantized::QStorage::Cuda(s) => s,
-            _ => candle::bail!("Requires CUDA storage"),
-        };
-
-        // Only take the last token for next-token prediction
-        // In a full implementation, we'd slice the Q8_1 tensor
-        let input_shape = candle::Shape::from((batch, self.config.hidden_size));
-        let (logits, _) = lm_head_storage.fwd_q8out(
-            self.lm_head.shape(),
-            &normed,
-            &input_shape,
-        )?;
-
-        // Top-k selection (Q8_1 → indices + F32 values)
-        // Only dequantizes the top k values!
-        let k = 50;
-        let (indices, values) = logits.topk_q8_1(self.config.vocab_size, k)?;
-
-        Ok((indices, values))
-    }
-
-    /// Greedy decoding (faster than top-k for simple use cases)
-    pub fn forward_greedy(
-        &mut self,
-        input_ids: &Tensor,
-        start_pos: usize,
-    ) -> Result<i32> {
-        // Similar to forward() but uses argmax instead of top-k
-        let (indices, _) = self.forward(input_ids, start_pos)?;
-        Ok(indices[0])
-    }
-
     /// Load model from GGUF file
-    ///
-    /// # Arguments
-    /// * `ct` - GGUF content (parsed metadata)
-    /// * `reader` - File reader positioned at tensor data
-    /// * `device` - Target device (must be CUDA)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let mut file = std::fs::File::open("model.gguf")?;
-    /// let content = gguf_file::Content::read(&mut file)?;
-    /// let model = Q8LlamaModel::from_gguf(content, &mut file, &Device::Cuda(0))?;
-    /// ```
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let cuda_device = match device {
-            Device::Cuda(d) => d,
-            _ => candle::bail!("Q8LlamaModel requires CUDA device"),
-        };
-
         // Extract model configuration from GGUF metadata
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -568,7 +284,7 @@ impl Q8LlamaModel {
             num_attention_heads: head_count,
             num_key_value_heads: head_count_kv,
             head_dim,
-            max_seq_len: 4096,  // Default, can be overridden
+            max_seq_len: 4096,
             rms_norm_eps,
             rope_theta: rope_freq_base,
         };
@@ -582,18 +298,19 @@ impl Q8LlamaModel {
             DType::F32,
         )?;
 
-        // Load embeddings (keep as QTensor for Q8_1 lookup)
-        let embed_tokens = ct.tensor(reader, "token_embd.weight", device)?;
+        // Load embeddings
+        let embed_tokens = Arc::new(ct.tensor(reader, "token_embd.weight", device)?);
 
         // Load output norm (dequantize to F32 for RMSNorm weights)
         let norm_q = ct.tensor(reader, "output_norm.weight", device)?;
-        let norm = norm_q.dequantize(device)?;
+        let norm_weight = norm_q.dequantize(device)?;
 
-        // Load lm_head (or use tied embeddings)
-        let lm_head = match ct.tensor(reader, "output.weight", device) {
+        // Load lm_head
+        let lm_head_q = match ct.tensor(reader, "output.weight", device) {
             Ok(tensor) => tensor,
             Err(_) => ct.tensor(reader, "token_embd.weight", device)?,
         };
+        let lm_head = QMatMul::from_qtensor(lm_head_q)?;
 
         // Load transformer layers
         let mut layers = Vec::with_capacity(block_count);
@@ -606,22 +323,14 @@ impl Q8LlamaModel {
             let wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
             let wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
-            let attention = Q8Attention::new(
-                wq,
-                wk,
-                wv,
-                wo,
-                head_count,
-                head_count_kv,
-                head_dim,
-            );
+            let attention = Q8Attention::new(wq, wk, wv, wo, head_count, head_count_kv, head_dim)?;
 
             // MLP weights
             let gate_proj = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
             let up_proj = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
             let down_proj = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
 
-            let mlp = Q8Mlp::new(gate_proj, up_proj, down_proj);
+            let mlp = Q8Mlp::new(gate_proj, up_proj, down_proj)?;
 
             // Norm weights (dequantize to F32)
             let attn_norm_q = ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
@@ -643,25 +352,61 @@ impl Q8LlamaModel {
             config,
             embed_tokens,
             layers,
-            norm,
+            norm_weight,
             lm_head,
             cos,
             sin,
         })
     }
 
+    /// Forward pass with fully quantized activations
+    pub fn forward(&mut self, input_ids: &Tensor, _start_pos: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+        let seq_len = input_ids.dim(1)?;
+
+        // Get embeddings and quantize to Q8_1
+        // For now, dequantize embeddings then quantize - a full impl would use Q8_1 embedding lookup
+        let embeddings = self.embed_tokens.dequantize(&input_ids.device())?;
+        let input_ids_vec: Vec<u32> = input_ids.reshape(())?.to_vec1()?;
+
+        // Simple embedding lookup
+        let hidden = embeddings.index_select(&Tensor::new(input_ids_vec.as_slice(), &input_ids.device())?, 0)?;
+        let mut hidden_q = QTensor::quantize(&hidden, GgmlDType::Q8_1)?;
+
+        // Slice cos/sin for current sequence
+        let cos = self.cos.narrow(0, 0, seq_len)?;
+        let sin = self.sin.narrow(0, 0, seq_len)?;
+
+        // Forward through layers
+        for layer in &self.layers {
+            hidden_q = layer.forward_q8(&hidden_q, &cos, &sin)?;
+        }
+
+        // Final norm
+        let normed = hidden_q.rms_norm_q8_1(&self.norm_weight, self.config.rms_norm_eps)?;
+
+        // LM head projection
+        let normed_f = normed.dequantize(&normed.device())?;
+        // Take last token
+        let last_hidden = normed_f.narrow(0, seq_len - 1, 1)?;
+        let logits = self.lm_head.forward_q8out(&last_hidden)?;
+
+        // Top-k selection
+        logits.topk_q8_1(50)
+    }
+
+    /// Greedy decoding
+    pub fn forward_greedy(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<i32> {
+        let (indices, _) = self.forward(input_ids, start_pos)?;
+        Ok(indices[0])
+    }
+
     /// Get model configuration
     pub fn config(&self) -> &Q8Config {
         &self.config
     }
-
-    /// Reset KV caches for all layers
-    pub fn reset_kv_cache(&mut self) {
-        // KV cache reset would go here when fully implemented
-    }
 }
 
-// Helper function to precompute RoPE frequencies
+/// Helper function to precompute RoPE frequencies
 pub fn precompute_freqs_cis(
     head_dim: usize,
     max_seq_len: usize,

@@ -701,9 +701,8 @@ impl QTensor {
     ///
     /// # Errors
     /// - Returns error if input is not Q8_1 quantized
-    /// - Returns error if not on CUDA (only CUDA implementation exists)
+    /// - Returns error if not on a GPU backend (CUDA/Metal)
     /// - Returns error if batch size > 8
-    #[cfg(feature = "cuda")]
     pub fn fwd_q8out(&self, input: &QTensor) -> Result<QTensor> {
         // Validate input is Q8_1
         if input.dtype() != GgmlDType::Q8_1 {
@@ -714,6 +713,7 @@ impl QTensor {
         }
 
         match (&self.storage, &input.storage) {
+            #[cfg(feature = "cuda")]
             (QStorage::Cuda(weight_storage), QStorage::Cuda(input_storage)) => {
                 let (output_storage, output_shape) = weight_storage.fwd_q8out(
                     self.shape(),
@@ -722,8 +722,17 @@ impl QTensor {
                 )?;
                 QTensor::new(QStorage::Cuda(output_storage), output_shape)
             }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(weight_storage), QStorage::Metal(input_storage)) => {
+                let (output_storage, output_shape) = weight_storage.fwd_q8out(
+                    self.shape(),
+                    input_storage,
+                    input.shape(),
+                )?;
+                QTensor::new(QStorage::Metal(output_storage), output_shape)
+            }
             _ => {
-                crate::bail!("fwd_q8out is only implemented for CUDA");
+                crate::bail!("fwd_q8out requires both tensors on the same GPU backend (CUDA or Metal)");
             }
         }
     }
@@ -732,7 +741,6 @@ impl QTensor {
     /// Used for residual connections in transformer blocks.
     ///
     /// Both tensors must be Q8_1 quantized with the same shape.
-    #[cfg(feature = "cuda")]
     pub fn add_q8_1(&self, other: &QTensor) -> Result<QTensor> {
         if self.dtype() != GgmlDType::Q8_1 {
             crate::bail!("add_q8_1 requires Q8_1 self, got {:?}", self.dtype());
@@ -751,12 +759,18 @@ impl QTensor {
         let elem_count = self.shape().elem_count();
 
         match (&self.storage, &other.storage) {
+            #[cfg(feature = "cuda")]
             (QStorage::Cuda(a_storage), QStorage::Cuda(b_storage)) => {
                 let output_storage = a_storage.add_q8_1(b_storage, elem_count)?;
                 QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
             }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(a_storage), QStorage::Metal(b_storage)) => {
+                let output_storage = a_storage.add_q8_1(b_storage, elem_count)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
             _ => {
-                crate::bail!("add_q8_1 is only implemented for CUDA");
+                crate::bail!("add_q8_1 requires both tensors on the same GPU backend (CUDA or Metal)");
             }
         }
     }
@@ -765,7 +779,6 @@ impl QTensor {
     /// Used for gate * up in SwiGLU MLP blocks.
     ///
     /// Both tensors must be Q8_1 quantized with the same shape.
-    #[cfg(feature = "cuda")]
     pub fn mul_q8_1(&self, other: &QTensor) -> Result<QTensor> {
         if self.dtype() != GgmlDType::Q8_1 {
             crate::bail!("mul_q8_1 requires Q8_1 self, got {:?}", self.dtype());
@@ -784,12 +797,281 @@ impl QTensor {
         let elem_count = self.shape().elem_count();
 
         match (&self.storage, &other.storage) {
+            #[cfg(feature = "cuda")]
             (QStorage::Cuda(a_storage), QStorage::Cuda(b_storage)) => {
                 let output_storage = a_storage.mul_q8_1(b_storage, elem_count)?;
                 QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
             }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(a_storage), QStorage::Metal(b_storage)) => {
+                let output_storage = a_storage.mul_q8_1(b_storage, elem_count)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
             _ => {
-                crate::bail!("mul_q8_1 is only implemented for CUDA");
+                crate::bail!("mul_q8_1 requires both tensors on the same GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// Forward matmul with Q8_1 output (fully quantized pipeline).
+    ///
+    /// This performs weight @ input^T with Q8_1 output, avoiding dequantization.
+    /// Used for building fully quantized inference pipelines.
+    ///
+    /// # Arguments
+    /// * `xs` - Input tensor [batch, seq_len, in_features]
+    ///
+    /// # Returns
+    /// * `QTensor` with Q8_1 dtype of shape [batch, seq_len, out_features]
+    pub fn forward_q8out(&self, xs: &Tensor) -> Result<QTensor> {
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let xs_storage = match xs.storage_and_layout().0 {
+                    crate::Storage::Cuda(s) => s,
+                    _ => crate::bail!("forward_q8out requires CUDA input tensor"),
+                };
+                let (output_storage, output_shape) =
+                    cuda_storage.fwd_q8out(&self.shape, &xs_storage, xs.shape())?;
+                QTensor::new(QStorage::Cuda(output_storage), output_shape)
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let (storage_guard, _layout) = xs.storage_and_layout();
+                let xs_storage = match &*storage_guard {
+                    crate::Storage::Metal(s) => s,
+                    _ => crate::bail!("forward_q8out requires Metal input tensor"),
+                };
+                let (output_storage, output_shape) =
+                    metal_storage.fwd_q8out_tensor(&self.shape, xs_storage, xs.shape())?;
+                QTensor::new(QStorage::Metal(output_storage), output_shape)
+            }
+            _ => {
+                crate::bail!("forward_q8out requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// SiLU activation in Q8_1 format.
+    /// Applies SiLU(x) = x * sigmoid(x) element-wise.
+    pub fn silu_q8_1(&self) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("silu_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+        let elem_count = self.shape().elem_count();
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let output_storage = cuda_storage.silu_q8_1(elem_count)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let output_storage = metal_storage.silu_q8_1(elem_count)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("silu_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// GELU activation in Q8_1 format (tanh approximation).
+    pub fn gelu_q8_1(&self) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("gelu_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+        let elem_count = self.shape().elem_count();
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let output_storage = cuda_storage.gelu_q8_1(elem_count)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let output_storage = metal_storage.gelu_q8_1(elem_count)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("gelu_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// RMSNorm in Q8_1 format.
+    ///
+    /// # Arguments
+    /// * `weight` - RMSNorm weight tensor (F32)
+    /// * `eps` - Epsilon for numerical stability
+    pub fn rms_norm_q8_1(&self, weight: &Tensor, eps: f32) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("rms_norm_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+
+        // Assume shape is [batch * seq_len, hidden_size] or [batch, seq_len, hidden_size]
+        let dims = self.shape().dims();
+        let (num_rows, hidden_size) = match dims.len() {
+            2 => (dims[0], dims[1]),
+            3 => (dims[0] * dims[1], dims[2]),
+            _ => crate::bail!("rms_norm_q8_1 expects 2D or 3D input, got {:?}", dims),
+        };
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let weight_storage = match weight.storage_and_layout().0 {
+                    crate::Storage::Cuda(s) => s,
+                    _ => crate::bail!("rms_norm_q8_1 requires CUDA weight tensor"),
+                };
+                let output_storage =
+                    cuda_storage.rms_norm_q8_1(&weight_storage, num_rows, hidden_size, eps)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let (storage_guard, _layout) = weight.storage_and_layout();
+                let weight_storage = match &*storage_guard {
+                    crate::Storage::Metal(s) => s,
+                    _ => crate::bail!("rms_norm_q8_1 requires Metal weight tensor"),
+                };
+                let output_storage =
+                    metal_storage.rms_norm_q8_1(weight_storage, num_rows, hidden_size, eps)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("rms_norm_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// Softmax in Q8_1 format.
+    /// Applies softmax along the last dimension.
+    pub fn softmax_q8_1(&self) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("softmax_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+
+        let dims = self.shape().dims();
+        let (num_rows, seq_len) = match dims.len() {
+            2 => (dims[0], dims[1]),
+            3 => (dims[0] * dims[1], dims[2]),
+            _ => crate::bail!("softmax_q8_1 expects 2D or 3D input, got {:?}", dims),
+        };
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let output_storage = cuda_storage.softmax_q8_1(num_rows, seq_len)?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let output_storage = metal_storage.softmax_q8_1(num_rows, seq_len)?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("softmax_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// RoPE (Rotary Position Embeddings) in Q8_1 format.
+    /// Contiguous variant: pairs x[i] with x[i + head_dim/2]
+    pub fn rope_q8_1(
+        &self,
+        cos: &Tensor,
+        sin: &Tensor,
+        batch_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<QTensor> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("rope_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => {
+                let cos_storage = match cos.storage_and_layout().0 {
+                    crate::Storage::Cuda(s) => s,
+                    _ => crate::bail!("rope_q8_1 requires CUDA cos tensor"),
+                };
+                let sin_storage = match sin.storage_and_layout().0 {
+                    crate::Storage::Cuda(s) => s,
+                    _ => crate::bail!("rope_q8_1 requires CUDA sin tensor"),
+                };
+                let output_storage = cuda_storage.rope_q8_1(
+                    &cos_storage,
+                    &sin_storage,
+                    batch_heads,
+                    seq_len,
+                    head_dim,
+                )?;
+                QTensor::new(QStorage::Cuda(output_storage), self.shape().clone())
+            }
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => {
+                let (cos_guard, _) = cos.storage_and_layout();
+                let cos_storage = match &*cos_guard {
+                    crate::Storage::Metal(s) => s,
+                    _ => crate::bail!("rope_q8_1 requires Metal cos tensor"),
+                };
+                let (sin_guard, _) = sin.storage_and_layout();
+                let sin_storage = match &*sin_guard {
+                    crate::Storage::Metal(s) => s,
+                    _ => crate::bail!("rope_q8_1 requires Metal sin tensor"),
+                };
+                let output_storage = metal_storage.rope_q8_1(
+                    cos_storage,
+                    sin_storage,
+                    batch_heads,
+                    seq_len,
+                    head_dim,
+                )?;
+                QTensor::new(QStorage::Metal(output_storage), self.shape().clone())
+            }
+            _ => {
+                crate::bail!("rope_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// Top-k selection from Q8_1 logits.
+    /// Only dequantizes the top k values, not the entire tensor.
+    pub fn topk_q8_1(&self, k: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("topk_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+
+        let vocab_size = self.shape().elem_count();
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => cuda_storage.topk_q8_1(vocab_size, k),
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => metal_storage.topk_q8_1(vocab_size, k),
+            _ => {
+                crate::bail!("topk_q8_1 requires a GPU backend (CUDA or Metal)");
+            }
+        }
+    }
+
+    /// Argmax from Q8_1 logits (greedy decoding).
+    pub fn argmax_q8_1(&self) -> Result<(i32, f32)> {
+        if self.dtype() != GgmlDType::Q8_1 {
+            crate::bail!("argmax_q8_1 requires Q8_1 input, got {:?}", self.dtype());
+        }
+
+        let vocab_size = self.shape().elem_count();
+
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(cuda_storage) => cuda_storage.argmax_q8_1(vocab_size),
+            #[cfg(feature = "metal")]
+            QStorage::Metal(metal_storage) => metal_storage.argmax_q8_1(vocab_size),
+            _ => {
+                crate::bail!("argmax_q8_1 requires a GPU backend (CUDA or Metal)");
             }
         }
     }
@@ -891,6 +1173,29 @@ impl QMatMul {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
+            }
+        }
+    }
+
+    /// Forward pass with Q8_1 output (fully quantized pipeline).
+    ///
+    /// Instead of dequantizing the output to F32/F16, this keeps the result
+    /// in Q8_1 format for chaining with other quantized operations.
+    ///
+    /// # Arguments
+    /// * `xs` - Input tensor (will be quantized to Q8_1 internally)
+    ///
+    /// # Returns
+    /// * `QTensor` with Q8_1 dtype containing the matmul result
+    pub fn forward_q8out(&self, xs: &Tensor) -> Result<QTensor> {
+        match self {
+            Self::QTensor(t) => t.as_ref().forward_q8out(xs),
+            Self::Tensor(w) | Self::TensorF16(w) => {
+                // For dequantized weights, compute normally then quantize result
+                use crate::Module;
+                let _ = w; // silence unused warning
+                let result = <Self as Module>::forward(self, xs)?;
+                QTensor::quantize(&result, GgmlDType::Q8_1)
             }
         }
     }

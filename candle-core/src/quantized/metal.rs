@@ -422,6 +422,89 @@ impl QMetalStorage {
         self.device.wait_until_completed()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
     }
+
+    // =========================================================================
+    // Q8_1 Operations - Stub implementations for fully quantized pipeline
+    // These will be implemented with Metal kernels in a future update.
+    // =========================================================================
+
+    /// Forward pass with Q8_1 quantized input and output (for QTensor → QTensor matmul)
+    pub fn fwd_q8out(
+        &self,
+        _self_shape: &Shape,
+        _input_storage: &QMetalStorage,
+        _input_shape: &Shape,
+    ) -> Result<(QMetalStorage, Shape)> {
+        crate::bail!("Q8_1 fwd_q8out not yet implemented for Metal - coming soon!")
+    }
+
+    /// Forward pass with regular Tensor input and Q8_1 output
+    pub fn fwd_q8out_tensor(
+        &self,
+        _self_shape: &Shape,
+        _input_storage: &MetalStorage,
+        _input_shape: &Shape,
+    ) -> Result<(QMetalStorage, Shape)> {
+        crate::bail!("Q8_1 fwd_q8out_tensor not yet implemented for Metal - coming soon!")
+    }
+
+    /// Element-wise addition of two Q8_1 tensors
+    pub fn add_q8_1(&self, _other: &QMetalStorage, _elem_count: usize) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 add not yet implemented for Metal - coming soon!")
+    }
+
+    /// Element-wise multiplication of two Q8_1 tensors
+    pub fn mul_q8_1(&self, _other: &QMetalStorage, _elem_count: usize) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 mul not yet implemented for Metal - coming soon!")
+    }
+
+    /// SiLU activation in Q8_1 format
+    pub fn silu_q8_1(&self, _elem_count: usize) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 silu not yet implemented for Metal - coming soon!")
+    }
+
+    /// GELU activation in Q8_1 format
+    pub fn gelu_q8_1(&self, _elem_count: usize) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 gelu not yet implemented for Metal - coming soon!")
+    }
+
+    /// RMSNorm in Q8_1 format
+    pub fn rms_norm_q8_1(
+        &self,
+        _weight_storage: &MetalStorage,
+        _num_rows: usize,
+        _hidden_size: usize,
+        _eps: f32,
+    ) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 rms_norm not yet implemented for Metal - coming soon!")
+    }
+
+    /// Softmax in Q8_1 format
+    pub fn softmax_q8_1(&self, _num_rows: usize, _seq_len: usize) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 softmax not yet implemented for Metal - coming soon!")
+    }
+
+    /// RoPE in Q8_1 format
+    pub fn rope_q8_1(
+        &self,
+        _cos_storage: &MetalStorage,
+        _sin_storage: &MetalStorage,
+        _batch_heads: usize,
+        _seq_len: usize,
+        _head_dim: usize,
+    ) -> Result<QMetalStorage> {
+        crate::bail!("Q8_1 rope not yet implemented for Metal - coming soon!")
+    }
+
+    /// Top-k selection from Q8_1 logits
+    pub fn topk_q8_1(&self, _vocab_size: usize, _k: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+        crate::bail!("Q8_1 topk not yet implemented for Metal - coming soon!")
+    }
+
+    /// Argmax from Q8_1 logits
+    pub fn argmax_q8_1(&self, _vocab_size: usize) -> Result<(i32, f32)> {
+        crate::bail!("Q8_1 argmax not yet implemented for Metal - coming soon!")
+    }
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
