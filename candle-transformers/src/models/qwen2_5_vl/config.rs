@@ -1,0 +1,346 @@
+//! Configuration for Qwen2.5-VL Vision-Language Model.
+//!
+//! Qwen2.5-VL is a multimodal model that combines a vision encoder (ViT with 2D RoPE)
+//! with a Qwen2.5 text decoder using Multimodal RoPE (M-RoPE) for position encoding.
+//!
+//! Available model sizes: 3B, 7B, 72B (no 2B variant exists).
+
+use candle_nn::Activation;
+use serde::Deserialize;
+
+// ============================================================================
+// Vision Configuration
+// ============================================================================
+
+/// Vision encoder configuration for Qwen2.5-VL.
+///
+/// These values are mostly consistent across all model sizes (3B, 7B, 72B),
+/// except for `out_hidden_size` which must match the text model's hidden_size.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    /// Number of transformer blocks in the vision encoder.
+    pub depth: usize,
+
+    /// Hidden dimension of the vision encoder.
+    pub hidden_size: usize,
+
+    /// Intermediate dimension in the MLP.
+    pub intermediate_size: usize,
+
+    /// Number of attention heads.
+    pub num_heads: usize,
+
+    /// Number of input image channels.
+    pub in_chans: usize,
+
+    /// Output hidden size - must match text model's hidden_size.
+    /// 2048 (3B) / 3584 (7B) / 8192 (72B)
+    pub out_hidden_size: usize,
+
+    /// Patch size for the vision encoder.
+    pub patch_size: usize,
+
+    /// Spatial merge size (2x2 pooling in the merger).
+    pub spatial_merge_size: usize,
+
+    /// Temporal patch size for video frames.
+    pub temporal_patch_size: usize,
+
+    /// Block indices that use full attention (others use window attention).
+    pub fullatt_block_indexes: Vec<usize>,
+
+    /// Window size for windowed attention layers.
+    pub window_size: usize,
+
+    /// Tokens per second for video temporal position encoding.
+    pub tokens_per_second: usize,
+
+    /// Activation function (SiLU for Qwen2.5-VL).
+    pub hidden_act: Activation,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            depth: 32,
+            hidden_size: 1280,
+            intermediate_size: 3420,
+            num_heads: 16,
+            in_chans: 3,
+            out_hidden_size: 3584,
+            patch_size: 14,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            fullatt_block_indexes: vec![7, 15, 23, 31],
+            window_size: 112,
+            tokens_per_second: 4,
+            hidden_act: Activation::Silu,
+        }
+    }
+}
+
+impl VisionConfig {
+    /// Head dimension for attention.
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_heads
+    }
+}
+
+// ============================================================================
+// RoPE Scaling Configuration
+// ============================================================================
+
+/// RoPE scaling configuration for multimodal position embeddings.
+///
+/// M-RoPE (Multimodal RoPE) splits the head_dim into sections for
+/// temporal, height, and width position encoding.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RopeScaling {
+    /// Sections for multimodal RoPE: [temporal, height, width].
+    /// Total must equal head_dim/2 = 64 for head_dim=128.
+    /// Default: [16, 24, 24]
+    pub mrope_section: Vec<usize>,
+
+    /// RoPE type identifier.
+    pub rope_type: Option<String>,
+}
+
+impl Default for RopeScaling {
+    fn default() -> Self {
+        Self {
+            mrope_section: vec![16, 24, 24],
+            rope_type: Some("mrope".to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Main Configuration
+// ============================================================================
+
+/// Combined configuration for Qwen2.5-VL model.
+///
+/// The text model parameters are at the top level (not nested in `text_config`),
+/// following the HuggingFace format.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Vision encoder configuration.
+    pub vision_config: VisionConfig,
+
+    /// Vocabulary size for the text model.
+    pub vocab_size: usize,
+
+    /// Hidden size of the text model.
+    /// 2048 (3B) / 3584 (7B) / 8192 (72B)
+    pub hidden_size: usize,
+
+    /// Intermediate size in the MLP.
+    pub intermediate_size: usize,
+
+    /// Number of transformer layers.
+    pub num_hidden_layers: usize,
+
+    /// Number of attention heads.
+    pub num_attention_heads: usize,
+
+    /// Number of key-value heads for GQA.
+    pub num_key_value_heads: usize,
+
+    /// Head dimension for attention.
+    pub head_dim: usize,
+
+    /// RMS normalization epsilon.
+    pub rms_norm_eps: f64,
+
+    /// RoPE base frequency.
+    pub rope_theta: f64,
+
+    /// Maximum position embeddings (128K context).
+    pub max_position_embeddings: usize,
+
+    /// Activation function.
+    pub hidden_act: Activation,
+
+    /// Whether to tie word embeddings with lm_head.
+    pub tie_word_embeddings: bool,
+
+    /// Image placeholder token ID.
+    pub image_token_id: u32,
+
+    /// Video placeholder token ID.
+    pub video_token_id: u32,
+
+    /// Vision start token ID.
+    pub vision_start_token_id: u32,
+
+    /// Vision end token ID.
+    pub vision_end_token_id: u32,
+
+    /// RoPE scaling configuration with mrope_section.
+    pub rope_scaling: Option<RopeScaling>,
+
+    /// Whether to use sliding window attention.
+    pub use_sliding_window: bool,
+
+    /// Sliding window size (default: 4096).
+    /// Only used when use_sliding_window is true.
+    pub sliding_window: usize,
+
+    /// Layers >= this index use sliding window attention (default: 80).
+    /// For 7B model with 28 layers, this means no layers use sliding window by default.
+    pub max_window_layers: usize,
+
+    /// Whether to use flash attention (requires flash-attn feature and CUDA).
+    pub use_flash_attn: bool,
+
+    /// Chunk size for prefill to reduce peak memory usage.
+    /// When set, processes the input in chunks during prefill phase.
+    /// Recommended: 2048 for Metal, 4096 for CUDA.
+    /// None means disabled (process full sequence at once).
+    pub prefill_chunk_size: Option<usize>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            vision_config: VisionConfig::default(),
+            vocab_size: 152064,
+            hidden_size: 3584,
+            intermediate_size: 18944,
+            num_hidden_layers: 28,
+            num_attention_heads: 28,
+            num_key_value_heads: 4,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 128000,
+            hidden_act: Activation::Silu,
+            tie_word_embeddings: false,
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+            vision_end_token_id: 151653,
+            rope_scaling: Some(RopeScaling::default()),
+            use_sliding_window: false,
+            sliding_window: 4096,
+            max_window_layers: 80,
+            use_flash_attn: false,
+            prefill_chunk_size: None,
+        }
+    }
+}
+
+impl Config {
+    /// Get the mrope_section from rope_scaling, or use default.
+    pub fn mrope_section(&self) -> Vec<usize> {
+        self.rope_scaling
+            .as_ref()
+            .map(|rs| rs.mrope_section.clone())
+            .unwrap_or_else(|| vec![16, 24, 24])
+    }
+
+    /// Number of KV groups for grouped-query attention.
+    pub fn num_kv_groups(&self) -> usize {
+        self.num_attention_heads / self.num_key_value_heads
+    }
+
+    /// Check if a layer uses sliding window attention.
+    ///
+    /// Returns true if sliding window is enabled AND the layer index >= max_window_layers.
+    pub fn uses_sliding_window(&self, layer_idx: usize) -> bool {
+        self.use_sliding_window && layer_idx >= self.max_window_layers
+    }
+
+    /// Get the sliding window size for a layer, or None if full attention.
+    pub fn get_sliding_window(&self, layer_idx: usize) -> Option<usize> {
+        if self.uses_sliding_window(layer_idx) {
+            Some(self.sliding_window)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = Config::default();
+        assert_eq!(cfg.vocab_size, 152064);
+        assert_eq!(cfg.hidden_size, 3584);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.max_position_embeddings, 128000);
+        assert_eq!(cfg.image_token_id, 151655);
+    }
+
+    #[test]
+    fn test_mrope_section() {
+        let cfg = Config::default();
+        let section = cfg.mrope_section();
+        assert_eq!(section, vec![16, 24, 24]);
+        assert_eq!(section.iter().sum::<usize>(), 64); // head_dim / 2
+    }
+
+    #[test]
+    fn test_vision_config() {
+        let cfg = VisionConfig::default();
+        assert_eq!(cfg.depth, 32);
+        assert_eq!(cfg.hidden_size, 1280);
+        assert_eq!(cfg.head_dim(), 80); // 1280 / 16
+        assert_eq!(cfg.patch_size, 14);
+        assert_eq!(cfg.spatial_merge_size, 2);
+    }
+
+    #[test]
+    fn test_sliding_window_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.use_sliding_window);
+        assert_eq!(cfg.sliding_window, 4096);
+        assert_eq!(cfg.max_window_layers, 80);
+        assert!(!cfg.use_flash_attn);
+    }
+
+    #[test]
+    fn test_sliding_window_layer_detection() {
+        let cfg = Config {
+            use_sliding_window: true,
+            max_window_layers: 20,
+            num_hidden_layers: 28,
+            ..Default::default()
+        };
+
+        // Layers 0-19 should use full attention
+        assert!(!cfg.uses_sliding_window(0));
+        assert!(!cfg.uses_sliding_window(10));
+        assert!(!cfg.uses_sliding_window(19));
+
+        // Layers 20-27 should use sliding window
+        assert!(cfg.uses_sliding_window(20));
+        assert!(cfg.uses_sliding_window(25));
+        assert!(cfg.uses_sliding_window(27));
+
+        // Test get_sliding_window helper
+        assert_eq!(cfg.get_sliding_window(10), None);
+        assert_eq!(cfg.get_sliding_window(20), Some(4096));
+    }
+
+    #[test]
+    fn test_sliding_window_disabled() {
+        let cfg = Config {
+            use_sliding_window: false,
+            max_window_layers: 0, // Would enable all layers if use_sliding_window were true
+            ..Default::default()
+        };
+
+        // All layers should use full attention when sliding window is disabled
+        for layer_idx in 0..cfg.num_hidden_layers {
+            assert!(!cfg.uses_sliding_window(layer_idx));
+            assert_eq!(cfg.get_sliding_window(layer_idx), None);
+        }
+    }
+}

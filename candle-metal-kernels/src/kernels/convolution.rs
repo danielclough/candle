@@ -103,6 +103,87 @@ pub fn call_im2col_strided(
     Ok(())
 }
 
+/// Parameters for 3D im2col operation (depth, height, width for kernel, stride, padding, dilation)
+pub struct Im2Col3DParams {
+    pub d_k: usize,
+    pub h_k: usize,
+    pub w_k: usize,
+    pub stride_d: usize,
+    pub stride_h: usize,
+    pub stride_w: usize,
+    pub padding_d: usize,
+    pub padding_h: usize,
+    pub padding_w: usize,
+    pub dilation_d: usize,
+    pub dilation_h: usize,
+    pub dilation_w: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_im2col3d_strided(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    params: &Im2Col3DParams,
+    input: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+
+    let d = shape[2];
+    let h = shape[3];
+    let w = shape[4];
+    let d_out = (d + 2 * params.padding_d - params.dilation_d * (params.d_k - 1) - 1)
+        / params.stride_d
+        + 1;
+    let h_out = (h + 2 * params.padding_h - params.dilation_h * (params.h_k - 1) - 1)
+        / params.stride_h
+        + 1;
+    let w_out = (w + 2 * params.padding_w - params.dilation_w * (params.w_k - 1) - 1)
+        / params.stride_w
+        + 1;
+
+    let dst_el =
+        shape[0] * d_out * h_out * w_out * shape[1] * params.d_k * params.h_k * params.w_k;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            d_out,
+            h_out,
+            w_out,
+            params.d_k,
+            params.h_k,
+            params.w_k,
+            params.stride_d,
+            params.stride_h,
+            params.stride_w,
+            params.padding_d,
+            params.padding_h,
+            params.padding_w,
+            params.dilation_d,
+            params.dilation_h,
+            params.dilation_w,
+            shape,
+            strides,
+            &input,
+            output
+        )
+    );
+    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_upsample_nearest_2d(
     device: &Device,
@@ -310,6 +391,83 @@ pub fn call_conv_transpose2d(
             cfg.padding,
             cfg.output_padding,
             cfg.dilation,
+            cfg.input_dims,
+            cfg.input_stride,
+            cfg.kernel_dims,
+            cfg.kernel_stride,
+            (input, cfg.input_offset),
+            (kernel, cfg.kernel_offset),
+            output
+        )
+    );
+    encoder.use_resource(input, MTLResourceUsage::Read);
+    encoder.use_resource(kernel, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+pub struct CallConvTranspose3dCfg<'a> {
+    pub dilation_d: usize,
+    pub dilation_h: usize,
+    pub dilation_w: usize,
+    pub stride_d: usize,
+    pub stride_h: usize,
+    pub stride_w: usize,
+    pub padding_d: usize,
+    pub padding_h: usize,
+    pub padding_w: usize,
+    pub output_padding_d: usize,
+    pub output_padding_h: usize,
+    pub output_padding_w: usize,
+    pub c_out: usize,
+    pub out_d: usize,
+    pub out_h: usize,
+    pub out_w: usize,
+    pub b_size: usize,
+    pub input_dims: &'a [usize],
+    pub input_stride: &'a [usize],
+    pub kernel_dims: &'a [usize],
+    pub kernel_stride: &'a [usize],
+    pub input_offset: usize,
+    pub kernel_offset: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv_transpose3d(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    cfg: CallConvTranspose3dCfg,
+    input: &Buffer,
+    kernel: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let dst_el = cfg.c_out * cfg.out_d * cfg.out_h * cfg.out_w * cfg.b_size;
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            cfg.out_d,
+            cfg.out_h,
+            cfg.out_w,
+            cfg.stride_d,
+            cfg.stride_h,
+            cfg.stride_w,
+            cfg.padding_d,
+            cfg.padding_h,
+            cfg.padding_w,
+            cfg.output_padding_d,
+            cfg.output_padding_h,
+            cfg.output_padding_w,
+            cfg.dilation_d,
+            cfg.dilation_h,
+            cfg.dilation_w,
             cfg.input_dims,
             cfg.input_stride,
             cfg.kernel_dims,

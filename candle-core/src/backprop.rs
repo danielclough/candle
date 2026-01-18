@@ -85,6 +85,16 @@ impl Tensor {
                         kernel: rhs,
                         ..
                     }
+                    | Op::Conv3D {
+                        arg: lhs,
+                        kernel: rhs,
+                        ..
+                    }
+                    | Op::ConvTranspose3D {
+                        arg: lhs,
+                        kernel: rhs,
+                        ..
+                    }
                     | Op::CustomOp2(lhs, rhs, _)
                     | Op::Binary(lhs, rhs, _)
                     | Op::Gather(lhs, rhs, _)
@@ -335,6 +345,133 @@ impl Tensor {
                         let (_, _, g_k0, g_k1) = grad_kernel.dims4()?;
                         let grad_kernel = if g_k0 != k0 || g_k1 != k1 {
                             grad_kernel.narrow(2, 0, k0)?.narrow(3, 0, k1)?
+                        } else {
+                            grad_kernel
+                        };
+                        *sum_grad = sum_grad.add(&grad_kernel)?;
+                    }
+                    Op::Conv3D {
+                        arg,
+                        kernel,
+                        padding_d,
+                        padding_h,
+                        padding_w,
+                        stride_d,
+                        stride_h,
+                        stride_w,
+                        dilation_d,
+                        dilation_h,
+                        dilation_w,
+                    } => {
+                        // Compute output padding needed to reconstruct input shape
+                        let grad_d = grad.dim(2)?;
+                        let k_d = kernel.dim(2)?;
+                        let out_size_d =
+                            (grad_d - 1) * stride_d + dilation_d * (k_d - 1) + 1 - 2 * padding_d;
+                        let out_padding_d = arg.dim(2)? - out_size_d;
+
+                        let grad_h = grad.dim(3)?;
+                        let k_h = kernel.dim(3)?;
+                        let out_size_h =
+                            (grad_h - 1) * stride_h + dilation_h * (k_h - 1) + 1 - 2 * padding_h;
+                        let out_padding_h = arg.dim(3)? - out_size_h;
+
+                        let grad_w = grad.dim(4)?;
+                        let k_w = kernel.dim(4)?;
+                        let out_size_w =
+                            (grad_w - 1) * stride_w + dilation_w * (k_w - 1) + 1 - 2 * padding_w;
+                        let out_padding_w = arg.dim(4)? - out_size_w;
+
+                        // Gradient w.r.t. input: conv_transpose3d(grad, kernel)
+                        let grad_arg = grad.conv_transpose3d(
+                            kernel,
+                            (*padding_d, *padding_h, *padding_w),
+                            (out_padding_d, out_padding_h, out_padding_w),
+                            (*stride_d, *stride_h, *stride_w),
+                            (*dilation_d, *dilation_h, *dilation_w),
+                            1, // groups=1 for backward pass
+                        )?;
+                        let sum_grad = grads.or_insert(arg)?;
+                        *sum_grad = sum_grad.add(&grad_arg)?;
+
+                        // Gradient w.r.t. kernel: arg^T conv3d grad^T, then transpose back
+                        // arg: [b, c_in, d, h, w] -> [c_in, b, d, h, w]
+                        // grad: [b, c_out, d_out, h_out, w_out] -> [c_out, b, d_out, h_out, w_out]
+                        // Result needs to be [c_out, c_in, k_d, k_h, k_w]
+                        let grad_kernel = arg
+                            .transpose(0, 1)?
+                            .conv3d(
+                                &grad.transpose(0, 1)?,
+                                (*padding_d, *padding_h, *padding_w),
+                                (*dilation_d, *dilation_h, *dilation_w),
+                                (*stride_d, *stride_h, *stride_w),
+                                1,
+                            )?
+                            .transpose(0, 1)?;
+                        let sum_grad = grads.or_insert(kernel)?;
+                        let (_, _, k0, k1, k2) = kernel.dims5()?;
+                        let (_, _, g_k0, g_k1, g_k2) = grad_kernel.dims5()?;
+                        let grad_kernel = if g_k0 != k0 || g_k1 != k1 || g_k2 != k2 {
+                            grad_kernel
+                                .narrow(2, 0, k0)?
+                                .narrow(3, 0, k1)?
+                                .narrow(4, 0, k2)?
+                        } else {
+                            grad_kernel
+                        };
+                        *sum_grad = sum_grad.add(&grad_kernel)?;
+                    }
+                    Op::ConvTranspose3D {
+                        arg,
+                        kernel,
+                        padding_d,
+                        padding_h,
+                        padding_w,
+                        output_padding_d: _output_padding_d,
+                        output_padding_h: _output_padding_h,
+                        output_padding_w: _output_padding_w,
+                        stride_d,
+                        stride_h,
+                        stride_w,
+                        dilation_d,
+                        dilation_h,
+                        dilation_w,
+                        groups,
+                    } => {
+                        // Gradient w.r.t. input: conv3d(grad, kernel)
+                        // The backward of conv_transpose is regular conv
+                        let grad_arg = grad.conv3d(
+                            kernel,
+                            (*padding_d, *padding_h, *padding_w),
+                            (*stride_d, *stride_h, *stride_w),
+                            (*dilation_d, *dilation_h, *dilation_w),
+                            *groups,
+                        )?;
+                        let sum_grad = grads.or_insert(arg)?;
+                        *sum_grad = sum_grad.add(&grad_arg)?;
+
+                        // Gradient w.r.t. kernel:
+                        // grad: [b, c_out, d_out, h_out, w_out] -> [c_out, b, d_out, h_out, w_out]
+                        // arg: [b, c_in, d_in, h_in, w_in] -> [c_in, b, d_in, h_in, w_in]
+                        // Result needs to be [c_in, c_out, k_d, k_h, k_w]
+                        let grad_kernel = grad
+                            .transpose(0, 1)?
+                            .conv3d(
+                                &arg.transpose(0, 1)?,
+                                (*padding_d, *padding_h, *padding_w),
+                                (*dilation_d, *dilation_h, *dilation_w),
+                                (*stride_d, *stride_h, *stride_w),
+                                1,
+                            )?
+                            .transpose(0, 1)?;
+                        let sum_grad = grads.or_insert(kernel)?;
+                        let (_, _, k0, k1, k2) = kernel.dims5()?;
+                        let (_, _, g_k0, g_k1, g_k2) = grad_kernel.dims5()?;
+                        let grad_kernel = if g_k0 != k0 || g_k1 != k1 || g_k2 != k2 {
+                            grad_kernel
+                                .narrow(2, 0, k0)?
+                                .narrow(3, 0, k1)?
+                                .narrow(4, 0, k2)?
                         } else {
                             grad_kernel
                         };

@@ -892,3 +892,306 @@ test_device!(
     conv2d_grad_gpu,
     conv2_grad_metal
 );
+
+/* Conv3D Tests
+import torch
+torch.manual_seed(42)
+
+# Basic conv3d test
+t = torch.randn((1, 2, 4, 4, 4))
+w = torch.randn((3, 2, 2, 2, 2))
+res = torch.nn.functional.conv3d(t, w)
+print("input:", t.flatten().tolist()[:10])
+print("kernel:", w.flatten().tolist()[:10])
+print("output shape:", res.shape)
+print("output:", res.flatten().tolist()[:10])
+
+# With padding
+res_pad = torch.nn.functional.conv3d(t, w, padding=1)
+print("output with padding shape:", res_pad.shape)
+print("output with padding:", res_pad.flatten().tolist()[:10])
+
+# With stride
+res_stride = torch.nn.functional.conv3d(t, w, stride=2)
+print("output with stride shape:", res_stride.shape)
+
+# conv_transpose3d
+w_t = w.transpose(0, 1)
+res_t = torch.nn.functional.conv_transpose3d(res, w_t)
+print("transpose output shape:", res_t.shape)
+*/
+fn conv3d_basic(dev: &Device) -> Result<()> {
+    // Simple 3D convolution: batch=1, in_channels=2, depth=4, height=4, width=4
+    // kernel: out_channels=3, in_channels=2, k_d=2, k_h=2, k_w=2
+    let input = Tensor::arange(0f32, 128., dev)?.reshape((1, 2, 4, 4, 4))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((3, 2, 2, 2, 2))?;
+
+    // Basic conv3d, no padding, stride=1, dilation=1
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [1, 3, 3, 3, 3]);
+
+    // Verify output is non-zero and has correct shape
+    let out_sum = output.sum_all()?.to_scalar::<f32>()?;
+    assert!(out_sum.abs() > 0.);
+
+    Ok(())
+}
+
+fn conv3d_padding(dev: &Device) -> Result<()> {
+    let input = Tensor::arange(0f32, 128., dev)?.reshape((1, 2, 4, 4, 4))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((3, 2, 2, 2, 2))?;
+
+    // Conv3d with padding=1 on all dimensions
+    let output = input.conv3d(&kernel, (1, 1, 1), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [1, 3, 5, 5, 5]); // (4 + 2*1 - 2 + 1) = 5
+
+    // Asymmetric padding
+    let output2 = input.conv3d(&kernel, (0, 1, 2), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output2.dims(), [1, 3, 3, 5, 7]);
+
+    Ok(())
+}
+
+fn conv3d_stride(dev: &Device) -> Result<()> {
+    let input = Tensor::arange(0f32, 128., dev)?.reshape((1, 2, 4, 4, 4))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((3, 2, 2, 2, 2))?;
+
+    // Conv3d with stride=2 on all dimensions
+    let output = input.conv3d(&kernel, (0, 0, 0), (2, 2, 2), (1, 1, 1), 1)?;
+    // (4 - 2) / 2 + 1 = 2
+    assert_eq!(output.dims(), [1, 3, 2, 2, 2]);
+
+    Ok(())
+}
+
+fn conv3d_dilation(dev: &Device) -> Result<()> {
+    let input = Tensor::arange(0f32, 250., dev)?.reshape((1, 2, 5, 5, 5))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((3, 2, 2, 2, 2))?;
+
+    // Conv3d with dilation=2 on all dimensions
+    // Output formula: (in + 2*pad - dilation*(k-1) - 1) / stride + 1
+    // = (5 + 0 - 2*(2-1) - 1) / 1 + 1 = (5 - 2 - 1) + 1 = 3
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (2, 2, 2), 1)?;
+    assert_eq!(output.dims(), [1, 3, 3, 3, 3]);
+
+    Ok(())
+}
+
+fn conv3d_groups(dev: &Device) -> Result<()> {
+    let input = Tensor::arange(0f32, 256., dev)?.reshape((1, 4, 4, 4, 4))?;
+    // Grouped convolution: 4 input channels, 4 output channels, 2 groups
+    // Each group: 2 input channels -> 2 output channels
+    let kernel = Tensor::arange(0f32, 64., dev)?.reshape((4, 2, 2, 2, 2))?;
+
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 2)?;
+    assert_eq!(output.dims(), [1, 4, 3, 3, 3]);
+
+    Ok(())
+}
+
+fn conv_transpose3d_basic(dev: &Device) -> Result<()> {
+    // Input: [batch=1, channels=2, depth=2, height=2, width=2]
+    let input = Tensor::arange(0f32, 16., dev)?.reshape((1, 2, 2, 2, 2))?;
+    // Kernel: [in_channels=2, out_channels=3, k_d=2, k_h=2, k_w=2]
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((2, 3, 2, 2, 2))?;
+
+    // Basic conv_transpose3d
+    let output = input.conv_transpose3d(&kernel, (0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    // Output size: (2-1)*1 + 1*(2-1) + 0 + 1 - 2*0 = 3
+    assert_eq!(output.dims(), [1, 3, 3, 3, 3]);
+
+    // Verify output is non-zero
+    let out_sum = output.sum_all()?.to_scalar::<f32>()?;
+    assert!(out_sum.abs() > 0.);
+
+    Ok(())
+}
+
+fn conv_transpose3d_with_params(dev: &Device) -> Result<()> {
+    let input = Tensor::arange(0f32, 16., dev)?.reshape((1, 2, 2, 2, 2))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((2, 3, 2, 2, 2))?;
+
+    // With stride=2
+    let output = input.conv_transpose3d(&kernel, (0, 0, 0), (0, 0, 0), (2, 2, 2), (1, 1, 1), 1)?;
+    // (2-1)*2 + 1*(2-1) + 1 - 2*0 = 2 + 1 + 1 = 4
+    assert_eq!(output.dims(), [1, 3, 4, 4, 4]);
+
+    // With padding
+    let output2 = input.conv_transpose3d(&kernel, (1, 1, 1), (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    // (2-1)*1 + 1*(2-1) + 1 - 2*1 = 1 + 1 + 1 - 2 = 1
+    assert_eq!(output2.dims(), [1, 3, 1, 1, 1]);
+
+    Ok(())
+}
+
+fn conv_transpose3d_grad(dev: &Device) -> Result<()> {
+    // Test that gradients can be computed for ConvTranspose3D
+    let input =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 16., dev)?.reshape((1, 2, 2, 2, 2))?)?;
+    // Kernel: [in_channels=2, out_channels=3, k_d=2, k_h=2, k_w=2]
+    let kernel =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 48., dev)?.reshape((2, 3, 2, 2, 2))?)?;
+
+    let output = input.conv_transpose3d(&kernel, (0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [1, 3, 3, 3, 3]);
+
+    let loss = output.sqr()?.sum_all()?;
+    let grads = loss.backward()?;
+
+    let input_grad = grads.get(&input).unwrap();
+    let kernel_grad = grads.get(&kernel).unwrap();
+
+    assert_eq!(input_grad.dims(), input.dims());
+    assert_eq!(kernel_grad.dims(), kernel.dims());
+
+    // Verify gradients are non-zero
+    let input_grad_sum = input_grad.abs()?.sum_all()?.to_scalar::<f32>()?;
+    let kernel_grad_sum = kernel_grad.abs()?.sum_all()?.to_scalar::<f32>()?;
+    assert!(input_grad_sum > 0.);
+    assert!(kernel_grad_sum > 0.);
+
+    Ok(())
+}
+
+fn conv_transpose3d_groups(dev: &Device) -> Result<()> {
+    // Input: [batch=1, channels=4, depth=2, height=2, width=2]
+    let input = Tensor::arange(0f32, 32., dev)?.reshape((1, 4, 2, 2, 2))?;
+    // Kernel shape for conv_transpose3d with groups:
+    // [c_in, c_out/groups, k_d, k_h, k_w] = [4, 2, 2, 2, 2]
+    // The kernel is then chunked on dim 0, giving 2 chunks of [2, 2, 2, 2, 2]
+    let kernel = Tensor::arange(0f32, 64., dev)?.reshape((4, 2, 2, 2, 2))?;
+
+    // groups=2: split input channels into 2 groups of 2
+    let output = input.conv_transpose3d(&kernel, (0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1), 2)?;
+    // Output should have shape [1, 4, 3, 3, 3] (2 groups * 2 out_channels each)
+    assert_eq!(output.dims(), [1, 4, 3, 3, 3]);
+
+    // Verify output is non-zero
+    let out_sum = output.sum_all()?.to_scalar::<f32>()?;
+    assert!(out_sum.abs() > 0.);
+
+    Ok(())
+}
+
+fn conv3d_grad(dev: &Device) -> Result<()> {
+    // Test that gradients can be computed for Conv3D
+    let input =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 32., dev)?.reshape((1, 2, 2, 2, 4))?)?;
+    let kernel =
+        candle_core::Var::from_tensor(&Tensor::arange(0f32, 16., dev)?.reshape((2, 2, 2, 2, 1))?)?;
+
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [1, 2, 1, 1, 4]);
+
+    let loss = output.sqr()?.sum_all()?;
+    let grads = loss.backward()?;
+
+    let input_grad = grads.get(&input).unwrap();
+    let kernel_grad = grads.get(&kernel).unwrap();
+
+    assert_eq!(input_grad.dims(), input.dims());
+    assert_eq!(kernel_grad.dims(), kernel.dims());
+
+    // Verify gradients are non-zero
+    let input_grad_sum = input_grad.abs()?.sum_all()?.to_scalar::<f32>()?;
+    let kernel_grad_sum = kernel_grad.abs()?.sum_all()?.to_scalar::<f32>()?;
+    assert!(input_grad_sum > 0.);
+    assert!(kernel_grad_sum > 0.);
+
+    Ok(())
+}
+
+fn conv3d_1x1x1(dev: &Device) -> Result<()> {
+    // Test 1x1x1 convolution (should use fast path)
+    let input = Tensor::arange(0f32, 72., dev)?.reshape((1, 2, 6, 6, 1))?;
+    let kernel = Tensor::arange(0f32, 6., dev)?.reshape((3, 2, 1, 1, 1))?;
+
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [1, 3, 6, 6, 1]);
+
+    Ok(())
+}
+
+fn conv3d_batch(dev: &Device) -> Result<()> {
+    // Test with batch size > 1
+    let input = Tensor::arange(0f32, 512., dev)?.reshape((4, 2, 4, 4, 4))?;
+    let kernel = Tensor::arange(0f32, 48., dev)?.reshape((3, 2, 2, 2, 2))?;
+
+    let output = input.conv3d(&kernel, (0, 0, 0), (1, 1, 1), (1, 1, 1), 1)?;
+    assert_eq!(output.dims(), [4, 3, 3, 3, 3]);
+
+    Ok(())
+}
+
+test_device!(
+    conv3d_basic,
+    conv3d_basic_cpu,
+    conv3d_basic_gpu,
+    conv3d_basic_metal
+);
+test_device!(
+    conv3d_padding,
+    conv3d_padding_cpu,
+    conv3d_padding_gpu,
+    conv3d_padding_metal
+);
+test_device!(
+    conv3d_stride,
+    conv3d_stride_cpu,
+    conv3d_stride_gpu,
+    conv3d_stride_metal
+);
+test_device!(
+    conv3d_dilation,
+    conv3d_dilation_cpu,
+    conv3d_dilation_gpu,
+    conv3d_dilation_metal
+);
+test_device!(
+    conv3d_groups,
+    conv3d_groups_cpu,
+    conv3d_groups_gpu,
+    conv3d_groups_metal
+);
+test_device!(
+    conv_transpose3d_basic,
+    conv_transpose3d_basic_cpu,
+    conv_transpose3d_basic_gpu,
+    conv_transpose3d_basic_metal
+);
+test_device!(
+    conv_transpose3d_with_params,
+    conv_transpose3d_with_params_cpu,
+    conv_transpose3d_with_params_gpu,
+    conv_transpose3d_with_params_metal
+);
+test_device!(
+    conv_transpose3d_grad,
+    conv_transpose3d_grad_cpu,
+    conv_transpose3d_grad_gpu,
+    conv_transpose3d_grad_metal
+);
+test_device!(
+    conv_transpose3d_groups,
+    conv_transpose3d_groups_cpu,
+    conv_transpose3d_groups_gpu,
+    conv_transpose3d_groups_metal
+);
+test_device!(
+    conv3d_grad,
+    conv3d_grad_cpu,
+    conv3d_grad_gpu,
+    conv3d_grad_metal
+);
+test_device!(
+    conv3d_1x1x1,
+    conv3d_1x1x1_cpu,
+    conv3d_1x1x1_gpu,
+    conv3d_1x1x1_metal
+);
+test_device!(
+    conv3d_batch,
+    conv3d_batch_cpu,
+    conv3d_batch_gpu,
+    conv3d_batch_metal
+);
