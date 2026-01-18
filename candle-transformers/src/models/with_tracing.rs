@@ -122,6 +122,18 @@ impl QMatMul {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
+
+    /// Create from GGUF weights with transposed data layout (for diffusion models).
+    ///
+    /// Use this for GGUF files created by stable-diffusion.cpp or city96's tools,
+    /// which store data in `[in_features, out_features]` row-major order.
+    pub fn from_weights_with_transposed_data(
+        ws: std::sync::Arc<candle::quantized::QTensor>,
+    ) -> Result<Self> {
+        let inner = candle::quantized::QMatMul::from_arc_with_transposed_data(ws)?;
+        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+        Ok(Self { inner, span })
+    }
 }
 
 impl Module for QMatMul {

@@ -1,0 +1,244 @@
+//! Inpainting pipeline: fill in masked regions of an image.
+//!
+//! White regions in the mask are regenerated, black regions are preserved.
+//! During denoising, the latents are blended with the original image based
+//! on the mask and current noise level.
+
+use anyhow::Result;
+use candle::{DType, Device, Tensor};
+use candle_transformers::models::qwen_image::{
+    apply_true_cfg, pack_latents, unpack_latents, Config, InferenceConfig, PromptMode,
+};
+
+use crate::common;
+
+/// Arguments specific to the inpaint pipeline.
+pub struct InpaintArgs {
+    pub input_image: String,
+    pub mask: String,
+    pub prompt: String,
+    pub negative_prompt: String,
+    pub steps: usize,
+    pub true_cfg_scale: f64,
+    pub output: String,
+    pub model_id: String,
+    pub upcast_attention: bool,
+}
+
+/// Model paths for the inpaint pipeline.
+pub struct InpaintModelPaths {
+    pub transformer_path: Option<String>,
+    pub vae_path: Option<String>,
+    pub text_encoder_path: Option<String>,
+    pub tokenizer_path: Option<String>,
+}
+
+pub fn run(
+    args: InpaintArgs,
+    paths: InpaintModelPaths,
+    device: &Device,
+    dtype: DType,
+) -> Result<()> {
+    println!("Qwen-Image Inpainting");
+    println!("Device: {:?}, DType: {:?}", device, dtype);
+    println!("Input image: {}", args.input_image);
+    println!("Mask: {}", args.mask);
+    println!("Prompt: {}", args.prompt);
+
+    let api = hf_hub::api::sync::Api::new()?;
+
+    // =========================================================================
+    // Stage 1: Load VAE and encode input image
+    // =========================================================================
+    println!("\n[1/5] Loading VAE and encoding input image...");
+
+    let vae = common::load_vae(
+        paths.vae_path.as_deref(),
+        &api,
+        device,
+        dtype,
+        &args.model_id,
+    )?;
+    println!("  VAE loaded");
+
+    // Load input image and get dimensions
+    let input_img = image::ImageReader::open(&args.input_image)?
+        .decode()
+        .map_err(|e| anyhow::anyhow!("Failed to decode image: {}", e))?;
+    let (orig_width, orig_height) = (input_img.width() as usize, input_img.height() as usize);
+
+    // Round to nearest 16 for compatibility
+    let (target_height, target_width) = common::round_to_16(orig_height, orig_width);
+    println!(
+        "  Original size: {}x{}, Target size: {}x{}",
+        orig_width, orig_height, target_width, target_height
+    );
+
+    let dims = common::OutputDims::new(target_height, target_width);
+    println!(
+        "  Latent size: {}x{}",
+        dims.latent_height, dims.latent_width
+    );
+
+    // Encode input image
+    let input_image =
+        common::load_image_for_vae(&args.input_image, target_height, target_width, device)?;
+    let original_latents = common::encode_and_normalize_image(&vae, &input_image)?;
+    println!("  Encoded latents shape: {:?}", original_latents.dims());
+
+    // Load mask
+    let mask = common::load_mask_for_latents(
+        &args.mask,
+        dims.latent_height,
+        dims.latent_width,
+        device,
+        dtype,
+    )?;
+    let mask_coverage = mask.mean_all()?.to_scalar::<f32>()?;
+    println!("  Mask coverage: {:.1}% to inpaint", mask_coverage * 100.0);
+
+    // =========================================================================
+    // Stage 2: Load tokenizer and text encoder
+    // =========================================================================
+    println!("\n[2/5] Loading text encoder...");
+
+    let tokenizer = common::load_tokenizer(paths.tokenizer_path.as_deref(), &api)?;
+    let mut text_model =
+        common::load_text_encoder(paths.text_encoder_path.as_deref(), &api, device)?;
+    println!("  Text encoder loaded");
+
+    // Encode prompts
+    let (pos_embeds, _) = common::encode_text_prompt(
+        &tokenizer,
+        &mut text_model,
+        &args.prompt,
+        PromptMode::TextOnly,
+        device,
+        dtype,
+    )?;
+
+    let neg_embeds = common::encode_negative_prompt(
+        &tokenizer,
+        &mut text_model,
+        &args.negative_prompt,
+        PromptMode::TextOnly,
+        device,
+        dtype,
+    )?;
+
+    drop(text_model);
+    println!("  Text encoder freed");
+
+    // =========================================================================
+    // Stage 3: Setup scheduler
+    // =========================================================================
+    println!("\n[3/5] Setting up scheduler...");
+
+    let mut scheduler = common::create_scheduler(args.steps, dims.image_seq_len);
+
+    // Create initial noise (F32 to avoid BF16 quantization error)
+    // Use PyTorch-compatible RNG for consistent noise distribution
+    let seed = common::get_seed_or_current_time(None);
+    let mut rng = crate::mt_box_muller_rng::MtBoxMullerRng::new(seed);
+    let noise = rng.randn(
+        &[1, 16, 1, dims.latent_height, dims.latent_width],
+        device,
+        DType::F32,
+    )?;
+
+    // Start with pure noise (we'll blend with original during denoising)
+    let mut latents = noise.clone();
+
+    // =========================================================================
+    // Stage 4: Load transformer and run inpainting loop
+    // =========================================================================
+    println!("\n[4/5] Loading transformer and inpainting...");
+
+    let config = Config::qwen_image();
+    let mut inference_config = InferenceConfig::default();
+    if args.upcast_attention {
+        inference_config.upcast_attention = true;
+    }
+    let transformer = common::load_transformer(
+        paths.transformer_path.as_deref(),
+        &args.model_id,
+        &config,
+        &api,
+        device,
+        dtype,
+        &inference_config,
+    )?;
+    common::log_transformer_loaded(config.num_layers, false, dtype, &inference_config);
+
+    let img_shapes = vec![(1, dims.packed_height, dims.packed_width)];
+    let timesteps = scheduler.timesteps().to_vec();
+    let sigmas = scheduler.sigmas().to_vec();
+
+    println!("  Running {} denoising steps...", args.steps);
+    for (step, &timestep) in timesteps.iter().take(args.steps).enumerate() {
+        common::log_denoising_step(step, args.steps, timestep);
+
+        // Get current sigma
+        let sigma = sigmas[step];
+
+        // Blend: in masked areas use denoising latents, in unmasked use noised original
+        latents = blend_latents(&latents, &original_latents, &noise, &mask, sigma)?;
+
+        // Pack latents for transformer
+        let packed = pack_latents(&latents, dims.latent_height, dims.latent_width)?;
+        // Convert F32 latents to BF16 for transformer (weights are BF16)
+        let packed = packed.to_dtype(dtype)?;
+        let t = Tensor::new(&[timestep as f32 / 1000.0], device)?.to_dtype(dtype)?;
+
+        let pos_pred = transformer.forward(&packed, &pos_embeds, &t, &img_shapes)?;
+        let neg_pred = transformer.forward(&packed, &neg_embeds, &t, &img_shapes)?;
+
+        let guided_pred = apply_true_cfg(&pos_pred, &neg_pred, args.true_cfg_scale)?;
+        let unpacked = unpack_latents(&guided_pred, dims.latent_height, dims.latent_width, 16)?;
+        // Convert back to F32 for scheduler arithmetic
+        let unpacked = unpacked.to_dtype(DType::F32)?;
+
+        latents = scheduler.step(&unpacked, &latents)?;
+    }
+
+    // Final blend: ensure unmasked regions are exactly the original
+    let inv_mask = (Tensor::ones_like(&mask)? - &mask)?;
+    latents = (mask.broadcast_mul(&latents)? + inv_mask.broadcast_mul(&original_latents)?)?;
+
+    drop(transformer);
+    println!("  Transformer freed");
+
+    // =========================================================================
+    // Stage 5: VAE decode and save
+    // =========================================================================
+    println!("\n[5/5] Decoding latents...");
+
+    // Note: Both latents and VAE are F32 for numerical precision
+    let image = common::denormalize_and_decode(&vae, &latents)?;
+
+    common::postprocess_and_save(&image, &args.output)?;
+    println!("\nInpainted image saved to: {}", args.output);
+
+    Ok(())
+}
+
+/// Blend noisy latents with the original latents based on the mask.
+///
+/// In masked regions (mask=1), use the noisy latents (being denoised).
+/// In unmasked regions (mask=0), use the original latents with added noise at current sigma.
+fn blend_latents(
+    noisy: &Tensor,
+    original: &Tensor,
+    noise: &Tensor,
+    mask: &Tensor,
+    sigma: f64,
+) -> Result<Tensor> {
+    // Add noise to original at current sigma level
+    let noised_original = ((original * (1.0 - sigma))? + (noise * sigma)?)?;
+
+    // Blend based on mask: mask * noisy + (1 - mask) * noised_original
+    let inv_mask = (Tensor::ones_like(mask)? - mask)?;
+    let result = (mask.broadcast_mul(noisy)? + inv_mask.broadcast_mul(&noised_original)?)?;
+
+    Ok(result)
+}

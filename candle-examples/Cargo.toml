@@ -51,6 +51,7 @@ clap = { workspace = true }
 imageproc = { workspace = true }
 memmap2 = { workspace = true }
 rand = { workspace = true }
+rand_mt = "5.0"
 ab_glyph = { workspace = true }
 tracing = { workspace = true }
 tracing-chrome = { workspace = true }
@@ -163,3 +164,4 @@ required-features = ["symphonia"]
 [[example]]
 name = "bert_single_file_binary"
 required-features = ["buildtime-download"]
+

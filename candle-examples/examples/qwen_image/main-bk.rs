@@ -1,0 +1,588 @@
+//! Qwen-Image: Unified CLI for all Qwen-Image generation pipelines.
+//!
+//! This example provides a single entry point for:
+//! - **generate**: Text-to-image generation (with optional img2img)
+//! - **edit**: Image editing with text instructions
+//! - **inpaint**: Fill in masked regions of an image
+//! - **layered**: Decompose an image into transparent layers
+//! - **controlnet**: ControlNet-guided generation
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Text-to-image
+//! cargo run --release --example qwen_image -- generate \
+//!     --prompt "A serene mountain landscape" \
+//!     --output landscape.png
+//!
+//! # Image editing
+//! cargo run --release --example qwen_image -- edit \
+//!     --input-image photo.jpg \
+//!     --prompt "Make the sky purple" \
+//!     --output edited.png
+//!
+//! # Inpainting
+//! cargo run --release --example qwen_image -- inpaint \
+//!     --input-image photo.jpg \
+//!     --mask mask.png \
+//!     --prompt "A beautiful sunset" \
+//!     --output inpainted.png
+//!
+//! # Layer decomposition
+//! cargo run --release --example qwen_image -- layered \
+//!     --input-image composite.png \
+//!     --layers 4 \
+//!     --output-dir ./layers/
+//!
+//! # ControlNet
+//! cargo run --release --example qwen_image -- controlnet \
+//!     --prompt "A beautiful landscape" \
+//!     --control-image edges.png \
+//!     --controlnet-path /path/to/controlnet \
+//!     --output controlled.png
+//! ```
+
+#[cfg(feature = "accelerate")]
+extern crate accelerate_src;
+
+#[cfg(feature = "mkl")]
+extern crate intel_mkl_src;
+
+mod common;
+mod controlnet;
+mod edit;
+mod generate;
+mod inpaint;
+mod layered;
+mod mt_box_muller_rng;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "qwen-image",
+    about = "Qwen-Image: Text-to-image and image editing with diffusion models",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// Run on CPU instead of GPU.
+    #[arg(long, global = true)]
+    cpu: bool,
+
+    /// Use F32 dtype instead of mixed precision (BF16/F16).
+    #[arg(long, global = true)]
+    use_f32: bool,
+
+    /// Use F16 dtype instead of BF16 for lower memory usage.
+    #[arg(long, global = true)]
+    use_f16: bool,
+
+    /// Enable Chrome tracing profiler.
+    #[arg(long, global = true)]
+    tracing: bool,
+
+    /// Random seed for reproducibility.
+    #[arg(long, global = true)]
+    seed: Option<u64>,
+
+    /// Local path to transformer weights.
+    #[arg(long, global = true)]
+    transformer_path: Option<String>,
+
+    /// Local path to VAE weights.
+    #[arg(long, global = true)]
+    vae_path: Option<String>,
+
+    /// Local path to text encoder weights.
+    #[arg(long, global = true)]
+    text_encoder_path: Option<String>,
+
+    /// Local path to tokenizer.
+    #[arg(long, global = true)]
+    tokenizer_path: Option<String>,
+
+    /// Quantized GGUF diffusion transformer. Accepts:
+    /// - --gguf-transformer → uses default from HuggingFace
+    /// - --gguf-transformer=/path/to/model.gguf → local file
+    /// - --gguf-transformer=owner/repo/file.gguf → downloads from HuggingFace
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_transformer: Option<String>,
+
+    /// Quantized GGUF text encoder. Same format as --gguf-transformer.
+    /// Default: Mungert/Qwen2.5-VL-7B-Instruct-GGUF/Q4_K_M
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_text_encoder: Option<String>,
+
+    /// GGUF vision encoder (mmproj F16). Same format as --gguf-transformer.
+    /// Default: Mungert/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    gguf_vision_encoder: Option<String>,
+
+    // =========================================================================
+    // Memory optimization flags
+    // =========================================================================
+    /// Enable VAE slicing to reduce memory usage for batch processing.
+    /// Processes batch dimension one sample at a time.
+    #[arg(long, global = true)]
+    enable_vae_slicing: bool,
+
+    /// Enable VAE tiling to process large images with less memory.
+    /// Splits images into overlapping tiles for encode/decode.
+    #[arg(long, global = true)]
+    enable_vae_tiling: bool,
+
+    /// Tile size for VAE tiling (pixels). Default: 256.
+    #[arg(long, global = true, default_value_t = 256)]
+    vae_tile_size: usize,
+
+    /// Tile stride for VAE tiling (pixels). Default: 192 (64px overlap with 256 tile).
+    #[arg(long, global = true, default_value_t = 192)]
+    vae_tile_stride: usize,
+
+    /// Enable text Q/K/V caching for CFG optimization.
+    /// Caches text projections to skip ~33% of compute on subsequent passes.
+    /// Only effective when using True CFG with negative prompts.
+    #[arg(long, global = true)]
+    enable_text_cache: bool,
+
+    /// Enable streaming mode for GGUF transformer to reduce GPU memory.
+    /// Loads transformer blocks on-demand during inference instead of all at once.
+    /// Reduces GPU memory from ~10-12GB to ~200-400MB at the cost of increased latency.
+    /// Only effective when using --gguf-transformer.
+    #[arg(long, global = true)]
+    streaming: bool,
+
+    /// Upcast attention to F32 for numerical stability.
+    /// When enabled, Q/K/V are converted to F32 for attention computation,
+    /// then cast back to the model dtype. Slower but more stable for long sequences.
+    #[arg(long, global = true)]
+    upcast_attention: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Text-to-image generation (with optional img2img).
+    Generate {
+        /// The prompt to generate an image from.
+        #[arg(long, default_value = "A serene mountain landscape at sunset")]
+        prompt: String,
+
+        /// Negative prompt describing what to avoid.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Height of the generated image (must be divisible by 16).
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        /// Width of the generated image (must be divisible by 16).
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        /// Number of denoising steps.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// True CFG guidance scale.
+        #[arg(long, default_value_t = 4.0)]
+        true_cfg_scale: f64,
+
+        /// Input image for img2img mode (optional).
+        #[arg(long)]
+        init_image: Option<String>,
+
+        /// Strength for img2img (0.0 = no change, 1.0 = full generation).
+        #[arg(long, default_value_t = 0.75)]
+        strength: f64,
+
+        /// Output filename.
+        #[arg(long, default_value = "qwen_image_output.png")]
+        output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-2512")]
+        model_id: String,
+    },
+
+    /// Image editing with text instructions.
+    Edit {
+        /// Input image to edit.
+        #[arg(long)]
+        input_image: String,
+
+        /// Editing instruction prompt.
+        #[arg(long, default_value = "Make the colors more vibrant")]
+        prompt: String,
+
+        /// Negative prompt.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Number of denoising steps.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// True CFG guidance scale.
+        #[arg(long, default_value_t = 4.0)]
+        true_cfg_scale: f64,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
+
+        /// Output height (overrides max_resolution if both height and width specified).
+        #[arg(long)]
+        height: Option<usize>,
+
+        /// Output width (overrides max_resolution if both height and width specified).
+        #[arg(long)]
+        width: Option<usize>,
+
+        /// Maximum output resolution (longest side). Use 0 to preserve input size.
+        /// Ignored if both --height and --width are specified.
+        #[arg(long, default_value_t = 512)]
+        max_resolution: usize,
+
+        /// Use tiled VAE decoding for memory efficiency.
+        #[arg(long)]
+        tiled_decode: Option<bool>,
+
+        /// Tile size for tiled decoding.
+        #[arg(long, default_value_t = 256)]
+        tile_size: usize,
+
+        /// Local path to vision encoder weights.
+        #[arg(long)]
+        vision_encoder_path: Option<String>,
+
+        /// Output filename.
+        #[arg(long, default_value = "edited_output.png")]
+        output: String,
+    },
+
+    /// Inpainting: fill in masked regions.
+    Inpaint {
+        /// Input image to inpaint.
+        #[arg(long)]
+        input_image: String,
+
+        /// Mask image (white = inpaint, black = keep).
+        #[arg(long)]
+        mask: String,
+
+        /// Prompt describing what to generate in the masked region.
+        #[arg(long, default_value = "A beautiful landscape")]
+        prompt: String,
+
+        /// Negative prompt.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Number of denoising steps.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// True CFG guidance scale.
+        #[arg(long, default_value_t = 4.0)]
+        true_cfg_scale: f64,
+
+        /// Output filename.
+        #[arg(long, default_value = "inpainted_output.png")]
+        output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
+    },
+
+    /// Layer decomposition: split image into transparent layers.
+    Layered {
+        /// Input image to decompose.
+        #[arg(long)]
+        input_image: String,
+
+        /// Description of the image content.
+        #[arg(long, default_value = "A scene with multiple objects")]
+        prompt: String,
+
+        /// Negative prompt.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Number of output layers.
+        #[arg(long, default_value_t = 4)]
+        layers: usize,
+
+        /// Resolution bucket (640 or 1024).
+        #[arg(long, default_value_t = 640)]
+        resolution: usize,
+
+        /// Number of denoising steps.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// True CFG guidance scale.
+        #[arg(long, default_value_t = 4.0)]
+        true_cfg_scale: f64,
+
+        /// Output directory for layer images.
+        #[arg(long, default_value = "./layers")]
+        output_dir: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
+    },
+
+    /// ControlNet-guided generation.
+    Controlnet {
+        /// The prompt to generate an image from.
+        #[arg(long, default_value = "A beautiful landscape")]
+        prompt: String,
+
+        /// Negative prompt.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Control image (edge map, depth map, etc.).
+        #[arg(long)]
+        control_image: String,
+
+        /// Height of the generated image (must be divisible by 16).
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+
+        /// Width of the generated image (must be divisible by 16).
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+
+        /// Number of denoising steps.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// True CFG guidance scale.
+        #[arg(long, default_value_t = 4.0)]
+        true_cfg_scale: f64,
+
+        /// ControlNet conditioning scale (0.0 = no control, 1.0 = full control).
+        #[arg(long, default_value_t = 0.8)]
+        controlnet_scale: f64,
+
+        /// Local path to ControlNet weights.
+        #[arg(long)]
+        controlnet_path: Option<String>,
+
+        /// Output filename.
+        #[arg(long, default_value = "controlnet_output.png")]
+        output: String,
+
+        /// HuggingFace model ID for the transformer.
+        #[arg(long, default_value = "Qwen/Qwen-Image-Edit-2511")]
+        model_id: String,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Setup tracing
+    let _guard = common::setup_tracing(cli.tracing);
+
+    // Setup device and dtype
+    let (device, dtype) =
+        common::setup_device_and_dtype(cli.cpu, cli.use_f32, cli.use_f16, cli.seed)?;
+
+    // Dispatch to the appropriate pipeline
+    match cli.command {
+        Command::Generate {
+            prompt,
+            negative_prompt,
+            height,
+            width,
+            steps,
+            true_cfg_scale,
+            init_image,
+            strength,
+            output,
+            model_id,
+        } => {
+            let args = generate::GenerateArgs {
+                prompt,
+                negative_prompt,
+                height,
+                width,
+                steps,
+                true_cfg_scale,
+                init_image,
+                strength,
+                output,
+                seed: cli.seed,
+                model_id,
+                enable_vae_slicing: cli.enable_vae_slicing,
+                enable_vae_tiling: cli.enable_vae_tiling,
+                vae_tile_size: cli.vae_tile_size,
+                vae_tile_stride: cli.vae_tile_stride,
+                enable_text_cache: cli.enable_text_cache,
+                streaming: cli.streaming,
+                upcast_attention: cli.upcast_attention,
+            };
+            let paths = generate::ModelPaths {
+                transformer_path: cli.transformer_path,
+                gguf_transformer_path: cli.gguf_transformer,
+                vae_path: cli.vae_path,
+                text_encoder_path: cli.text_encoder_path,
+                gguf_text_encoder_path: cli.gguf_text_encoder,
+                tokenizer_path: cli.tokenizer_path,
+            };
+            generate::run(args, paths, &device, dtype)
+        }
+
+        Command::Edit {
+            input_image,
+            prompt,
+            negative_prompt,
+            steps,
+            true_cfg_scale,
+            model_id,
+            height,
+            width,
+            max_resolution,
+            tiled_decode,
+            tile_size,
+            vision_encoder_path,
+            output,
+        } => {
+            let args = edit::EditArgs {
+                input_image,
+                prompt,
+                negative_prompt,
+                steps,
+                true_cfg_scale,
+                model_id,
+                height,
+                width,
+                max_resolution,
+                tiled_decode,
+                tile_size,
+                output,
+                seed: cli.seed,
+                streaming: cli.streaming,
+                upcast_attention: cli.upcast_attention,
+            };
+            let paths = edit::EditModelPaths {
+                transformer_path: cli.transformer_path,
+                gguf_transformer_path: cli.gguf_transformer,
+                vae_path: cli.vae_path,
+                text_encoder_path: cli.text_encoder_path,
+                gguf_text_encoder_path: cli.gguf_text_encoder,
+                vision_encoder_path,
+                gguf_vision_encoder_path: cli.gguf_vision_encoder,
+                tokenizer_path: cli.tokenizer_path,
+            };
+
+            edit::run(args, paths, &device, dtype)
+        }
+
+        Command::Inpaint {
+            input_image,
+            mask,
+            prompt,
+            negative_prompt,
+            steps,
+            true_cfg_scale,
+            output,
+            model_id,
+        } => {
+            let args = inpaint::InpaintArgs {
+                input_image,
+                mask,
+                prompt,
+                negative_prompt,
+                steps,
+                true_cfg_scale,
+                output,
+                model_id,
+                upcast_attention: cli.upcast_attention,
+            };
+            let paths = inpaint::InpaintModelPaths {
+                transformer_path: cli.transformer_path,
+                vae_path: cli.vae_path,
+                text_encoder_path: cli.text_encoder_path,
+                tokenizer_path: cli.tokenizer_path,
+            };
+            inpaint::run(args, paths, &device, dtype)
+        }
+
+        Command::Layered {
+            input_image,
+            prompt,
+            negative_prompt,
+            layers,
+            resolution,
+            steps,
+            true_cfg_scale,
+            output_dir,
+            model_id,
+        } => {
+            let args = layered::LayeredArgs {
+                input_image,
+                prompt,
+                negative_prompt,
+                layers,
+                resolution,
+                steps,
+                true_cfg_scale,
+                output_dir,
+                model_id,
+                upcast_attention: cli.upcast_attention,
+            };
+            let paths = layered::LayeredModelPaths {
+                transformer_path: cli.transformer_path,
+                vae_path: cli.vae_path,
+                text_encoder_path: cli.text_encoder_path,
+                tokenizer_path: cli.tokenizer_path,
+            };
+            layered::run(args, paths, &device, dtype)
+        }
+
+        Command::Controlnet {
+            prompt,
+            negative_prompt,
+            control_image,
+            height,
+            width,
+            steps,
+            true_cfg_scale,
+            controlnet_scale,
+            controlnet_path,
+            output,
+            model_id,
+        } => {
+            let args = controlnet::ControlnetArgs {
+                prompt,
+                negative_prompt,
+                control_image,
+                height,
+                width,
+                steps,
+                true_cfg_scale,
+                controlnet_scale,
+                output,
+                model_id,
+                upcast_attention: cli.upcast_attention,
+            };
+            let paths = controlnet::ControlnetModelPaths {
+                transformer_path: cli.transformer_path,
+                controlnet_path,
+                vae_path: cli.vae_path,
+                text_encoder_path: cli.text_encoder_path,
+                tokenizer_path: cli.tokenizer_path,
+            };
+            controlnet::run(args, paths, &device, dtype)
+        }
+    }
+}
