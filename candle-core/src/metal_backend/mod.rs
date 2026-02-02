@@ -1,7 +1,7 @@
 //! Implementation of Backend traits for Metal
 //!
 use crate::backend::{BackendDevice, BackendStorage};
-use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
+use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvDepthwise1D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::{
@@ -951,6 +951,57 @@ impl BackendStorage for MetalStorage {
         let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
+    }
+
+    fn conv1d_depthwise(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_layout: &Layout,
+        params: &ParamsConvDepthwise1D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let name = match self.dtype {
+            DType::F32 => "depthwise_conv1d_f32",
+            DType::F16 => "depthwise_conv1d_f16",
+            DType::BF16 => "depthwise_conv1d_bf16",
+            dtype => crate::bail!("Metal depthwise conv1d {dtype:?} not implemented"),
+        };
+
+        let l_out = params.l_out();
+        let dst_el = params.b_size * params.channels * l_out;
+        let output = device.new_buffer(dst_el, self.dtype, "depthwise_conv1d")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("depthwise_conv1d");
+
+        candle_metal_kernels::call_depthwise_conv1d(
+            &device.device,
+            &encoder,
+            &device.kernels,
+            name,
+            params.b_size,
+            params.channels,
+            params.l_in,
+            params.k_size,
+            params.stride,
+            params.padding,
+            params.dilation,
+            &self.buffer,
+            layout.start_offset() * self.dtype.size_in_bytes(),
+            &kernel.buffer,
+            kernel_layout.start_offset() * kernel.dtype.size_in_bytes(),
+            &output,
+        )
+        .map_err(MetalError::from)?;
+        drop(encoder);
+
+        Ok(Self {
+            buffer: output,
+            device,
+            count: dst_el,
+            dtype: self.dtype,
+        })
     }
 
     fn conv_transpose1d(

@@ -28,6 +28,28 @@ impl ParamsConv1D {
     }
 }
 
+/// Parameters for depthwise conv1d (groups == channels, c_in_per_group == 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamsConvDepthwise1D {
+    pub(crate) b_size: usize,
+    pub(crate) channels: usize,
+    pub(crate) l_in: usize,
+    pub(crate) k_size: usize,
+    pub(crate) padding: usize,
+    pub(crate) stride: usize,
+    pub(crate) dilation: usize,
+}
+
+impl ParamsConvDepthwise1D {
+    pub(crate) fn l_out(&self) -> usize {
+        (self.l_in + 2 * self.padding - self.dilation * (self.k_size - 1) - 1) / self.stride + 1
+    }
+
+    pub(crate) fn out_dims(&self) -> Vec<usize> {
+        vec![self.b_size, self.channels, self.l_out()]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConvTranspose1D {
     pub(crate) b_size: usize,
@@ -192,6 +214,18 @@ impl Tensor {
         };
         if groups == 1 {
             self.conv1d_single_group(kernel, &params)
+        } else if groups == c_in && c_in_k == 1 {
+            // Depthwise convolution: use optimized single-dispatch path
+            let dw_params = crate::conv::ParamsConvDepthwise1D {
+                b_size,
+                channels: c_in,
+                l_in,
+                k_size,
+                padding,
+                stride,
+                dilation,
+            };
+            self.conv1d_depthwise(kernel, &dw_params)
         } else {
             let blocks = self.chunk(groups, 1)?;
             let kernel = kernel.chunk(groups, 0)?;
@@ -202,6 +236,28 @@ impl Tensor {
                 .collect::<Result<Vec<_>>>()?;
             Tensor::cat(&blocks, 1)
         }
+    }
+
+    fn conv1d_depthwise(
+        &self,
+        kernel: &Self,
+        params: &ParamsConvDepthwise1D,
+    ) -> Result<Self> {
+        let storage = self.storage().conv1d_depthwise(
+            self.layout(),
+            &kernel.storage(),
+            kernel.layout(),
+            params,
+        )?;
+        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::Conv1D {
+            arg,
+            kernel,
+            padding: params.padding,
+            stride: params.stride,
+            dilation: params.dilation,
+        });
+        let out_dims = params.out_dims();
+        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
     }
 
     fn conv_transpose1d_single_group(

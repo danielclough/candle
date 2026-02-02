@@ -662,6 +662,70 @@ COL2IM1D_OP(uint32_t, col2im1d_u32)
 COL2IM1D_OP(bfloat, col2im1d_bf16)
 #endif
 
+// Depthwise conv1d: each channel is convolved independently with its own kernel.
+// src: (b_size, channels, l_in) - contiguous
+// k:   (channels, 1, k_size) - contiguous
+// dst: (b_size, channels, l_out) - contiguous
+// One thread per output element.
+template <typename T, typename A>
+METAL_FUNC void depthwise_conv1d(
+    constant size_t &b_size,
+    constant size_t &channels,
+    constant size_t &l_in,
+    constant size_t &l_out,
+    constant size_t &k_size,
+    constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &dilation,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    if (tid >= b_size * channels * l_out) {
+        return;
+    }
+    const size_t b_idx = tid / (channels * l_out);
+    const size_t c_idx = (tid / l_out) % channels;
+    const size_t out_x = tid % l_out;
+
+    const size_t src_offset = b_idx * channels * l_in + c_idx * l_in;
+    const size_t k_offset = c_idx * k_size;
+
+    A sum = 0;
+    for (size_t ki = 0; ki < k_size; ++ki) {
+        const int in_x = (int)(out_x * stride) + (int)(ki * dilation) - (int)padding;
+        if (in_x >= 0 && in_x < (int)l_in) {
+            sum += static_cast<A>(src[src_offset + in_x]) * static_cast<A>(k[k_offset + ki]);
+        }
+    }
+    dst[tid] = static_cast<T>(sum);
+}
+
+#define DEPTHWISE_CONV1D_OP(TYPENAME, TYPEACC, FN_NAME) \
+kernel void FN_NAME( \
+    constant size_t &b_size, \
+    constant size_t &channels, \
+    constant size_t &l_in, \
+    constant size_t &l_out, \
+    constant size_t &k_size, \
+    constant size_t &stride, \
+    constant size_t &padding, \
+    constant size_t &dilation, \
+    device const TYPENAME *src, \
+    device const TYPENAME *k, \
+    device TYPENAME *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) { \
+    depthwise_conv1d<TYPENAME, TYPEACC>(b_size, channels, l_in, l_out, k_size, stride, padding, dilation, src, k, dst, tid); \
+}
+
+DEPTHWISE_CONV1D_OP(float, float, depthwise_conv1d_f32)
+DEPTHWISE_CONV1D_OP(half, float, depthwise_conv1d_f16)
+#if defined(__HAVE_BFLOAT__)
+DEPTHWISE_CONV1D_OP(bfloat, float, depthwise_conv1d_bf16)
+#endif
+
 IM2COL1D_OP(float, im2col1d_f32)
 IM2COL1D_OP(half, im2col1d_f16)
 IM2COL1D_OP(uint8_t, im2col1d_u8)

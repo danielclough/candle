@@ -267,6 +267,55 @@ pub fn call_conv_transpose1d(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn call_depthwise_conv1d(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    b_size: usize,
+    channels: usize,
+    l_in: usize,
+    k_size: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    input: &Buffer,
+    input_offset: usize,
+    kernel: &Buffer,
+    kernel_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let l_out = (l_in + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+    let dst_el = b_size * channels * l_out;
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            b_size,
+            channels,
+            l_in,
+            l_out,
+            k_size,
+            stride,
+            padding,
+            dilation,
+            (input, input_offset),
+            (kernel, kernel_offset),
+            output
+        )
+    );
+    encoder.use_resource(input, MTLResourceUsage::Read);
+    encoder.use_resource(kernel, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 pub struct CallConvTranspose2dCfg<'a> {
     pub dilation: usize,
     pub stride: usize,

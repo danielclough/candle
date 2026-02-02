@@ -1880,6 +1880,56 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    fn conv1d_depthwise(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvDepthwise1D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let l_out = params.l_out();
+        let dst_el = params.b_size * params.channels * l_out;
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let inp_offset = l.start_offset();
+        let k_offset = kernel_l.start_offset();
+
+        macro_rules! dispatch_depthwise {
+            ($variant:ident, $rust_ty:ty) => {{
+                let func = device.get_or_load_func(
+                    &kernel_name::<$rust_ty>("depthwise_conv1d"),
+                    &kernels::CONV,
+                )?;
+                let out = unsafe { device.alloc::<$rust_ty>(dst_el)? };
+                let inp_slice = match &self.slice {
+                    S::$variant(s) => s.slice(inp_offset..),
+                    _ => unreachable!(),
+                };
+                let k_slice = match &kernel.slice {
+                    S::$variant(s) => s.slice(k_offset..),
+                    _ => unreachable!(),
+                };
+                let mut builder = func.builder();
+                barg!(builder, params.b_size, params.channels, params.l_in, l_out, params.k_size, params.stride, params.padding, params.dilation);
+                builder.arg(&inp_slice);
+                builder.arg(&k_slice);
+                builder.arg(&out);
+                unsafe { builder.launch(cfg) }.w()?;
+                S::$variant(out)
+            }};
+        }
+
+        use CudaStorageSlice as S;
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::BF16(_), S::BF16(_)) => dispatch_depthwise!(BF16, bf16),
+            (S::F16(_), S::F16(_)) => dispatch_depthwise!(F16, f16),
+            (S::F32(_), S::F32(_)) => dispatch_depthwise!(F32, f32),
+            (S::F64(_), S::F64(_)) => dispatch_depthwise!(F64, f64),
+            _ => crate::bail!("depthwise conv1d not supported for dtype {:?}", self.dtype),
+        };
+        Ok(Self { slice, device })
+    }
+
     fn conv_transpose1d(
         &self,
         l: &Layout,

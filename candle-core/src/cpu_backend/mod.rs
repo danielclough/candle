@@ -992,6 +992,48 @@ impl Map2 for Conv1D<'_> {
     }
 }
 
+struct Conv1DDepthwise<'a>(&'a crate::conv::ParamsConvDepthwise1D);
+
+impl Map2 for Conv1DDepthwise<'_> {
+    const OP: &'static str = "conv1d_depthwise";
+    fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+        let p = self.0;
+        let inp = &inp[inp_l.start_offset()..];
+        let k = &k[k_l.start_offset()..];
+        let (inp_s0, inp_s1, inp_s2) = crate::shape::dims3(inp_l.stride())?;
+        let (k_s0, _k_s1, k_s2) = crate::shape::dims3(k_l.stride())?;
+        let l_out = p.l_out();
+        let dst_elems = p.b_size * p.channels * l_out;
+        let dst = vec![T::zero(); dst_elems];
+
+        (0..p.channels).into_par_iter().for_each(|c_idx| {
+            let k_offset = c_idx * k_s0;
+            for b_idx in 0..p.b_size {
+                let dst_base = b_idx * p.channels * l_out + c_idx * l_out;
+                let inp_base = b_idx * inp_s0 + c_idx * inp_s1;
+                for out_x in 0..l_out {
+                    let mut sum = T::zero();
+                    for ki in 0..p.k_size {
+                        let in_x_s = p.stride * out_x + ki * p.dilation;
+                        if in_x_s >= p.padding && in_x_s < p.padding + p.l_in {
+                            let in_x = in_x_s - p.padding;
+                            let inp_val = inp[inp_base + in_x * inp_s2];
+                            let k_val = k[k_offset + ki * k_s2];
+                            sum += inp_val * k_val;
+                        }
+                    }
+                    let dst_p = dst.as_ptr();
+                    unsafe {
+                        let ptr = dst_p.add(dst_base + out_x) as *mut T;
+                        *ptr = sum;
+                    }
+                }
+            }
+        });
+        Ok(dst)
+    }
+}
+
 struct Im2Col1D {
     l_k: usize,
     stride: usize,
@@ -2762,6 +2804,16 @@ impl BackendStorage for CpuStorage {
         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
+    }
+
+    fn conv1d_depthwise(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvDepthwise1D,
+    ) -> Result<Self> {
+        Conv1DDepthwise(params).map(self, l, kernel, kernel_l)
     }
 
     fn conv_transpose1d(

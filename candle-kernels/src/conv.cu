@@ -633,6 +633,63 @@ __device__ void upsample_bilinear2d(
 }
 
 
+// Depthwise conv1d: each channel is convolved independently with its own kernel.
+// src: (b_size, channels, l_in) - contiguous
+// k:   (channels, 1, k_size) - contiguous
+// dst: (b_size, channels, l_out) - contiguous
+// One thread per output element.
+template <typename T, typename A>
+__device__ void depthwise_conv1d(
+    const size_t b_size,
+    const size_t channels,
+    const size_t l_in,
+    const size_t l_out,
+    const size_t k_size,
+    const size_t stride,
+    const size_t padding,
+    const size_t dilation,
+    const T *src,
+    const T *k,
+    T *dst
+) {
+    const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dst_i >= b_size * channels * l_out) {
+        return;
+    }
+    const size_t b_idx = dst_i / (channels * l_out);
+    const size_t c_idx = (dst_i / l_out) % channels;
+    const size_t out_x = dst_i % l_out;
+
+    const size_t src_offset = b_idx * channels * l_in + c_idx * l_in;
+    const size_t k_offset = c_idx * k_size;
+
+    A sum = 0;
+    for (size_t ki = 0; ki < k_size; ++ki) {
+        const int in_x = (int)(out_x * stride) + (int)(ki * dilation) - (int)padding;
+        if (in_x >= 0 && in_x < (int)l_in) {
+            sum += static_cast<A>(src[src_offset + in_x]) * static_cast<A>(k[k_offset + ki]);
+        }
+    }
+    dst[dst_i] = static_cast<T>(sum);
+}
+
+#define DEPTHWISE_CONV1D_OP(TYPENAME, TYPEACC, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const size_t b_size, \
+    const size_t channels, \
+    const size_t l_in, \
+    const size_t l_out, \
+    const size_t k_size, \
+    const size_t stride, \
+    const size_t padding, \
+    const size_t dilation, \
+    const TYPENAME *src, \
+    const TYPENAME *k, \
+    TYPENAME *dst \
+) { \
+    depthwise_conv1d<TYPENAME, TYPEACC>(b_size, channels, l_in, l_out, k_size, stride, padding, dilation, src, k, dst); \
+}
+
 #define CONV1D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t src_numel, \
@@ -802,6 +859,7 @@ extern "C" __global__ void FN_NAME(  \
 
 #if __CUDA_ARCH__ >= 800
 CONV1D_OP(__nv_bfloat16, float, conv1d_bf16)
+DEPTHWISE_CONV1D_OP(__nv_bfloat16, float, depthwise_conv1d_bf16)
 CONV2D_OP(__nv_bfloat16, float, conv2d_bf16)
 CONVT1D_OP(__nv_bfloat16, float, conv_transpose1d_bf16)
 CONVT2D_OP(__nv_bfloat16, float, conv_transpose2d_bf16)
@@ -828,6 +886,7 @@ COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 
 #if __CUDA_ARCH__ >= 530
 CONV1D_OP(__half, float, conv1d_f16)
+DEPTHWISE_CONV1D_OP(__half, float, depthwise_conv1d_f16)
 CONV2D_OP(__half, float, conv2d_f16)
 CONVT1D_OP(__half, float, conv_transpose1d_f16)
 CONVT2D_OP(__half, float, conv_transpose2d_f16)
@@ -844,6 +903,9 @@ CONV1D_OP(float, float, conv1d_f32)
 CONV1D_OP(double, double, conv1d_f64)
 CONV1D_OP(uint8_t, uint8_t, conv1d_u8)
 CONV1D_OP(uint32_t, uint32_t, conv1d_u32)
+
+DEPTHWISE_CONV1D_OP(float, float, depthwise_conv1d_f32)
+DEPTHWISE_CONV1D_OP(double, double, depthwise_conv1d_f64)
 
 CONV2D_OP(float, float, conv2d_f32)
 CONV2D_OP(double, double, conv2d_f64)

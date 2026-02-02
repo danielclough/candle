@@ -95,6 +95,16 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn conv1d_depthwise(
+        &self,
+        _: &Layout,
+        _: &Self,
+        _: &Layout,
+        _: &crate::conv::ParamsConvDepthwise1D,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn conv_transpose1d(
         &self,
         _l: &Layout,
